@@ -179,12 +179,12 @@ def _build_file_prompt(
     if hasattr(arch, 'api_contracts') and arch.api_contracts:
         lines = []
         for c in arch.api_contracts:
-            lock = "🔒" if c.get("auth_required") else "🔓"
+            lock = "🔒" if c.auth_required else "🔓"
             lines.append(
-                f"- {lock} {c.get('method')} {c.get('path')}\n"
-                f"  Description: {c.get('description')}\n"
-                f"  Request: {c.get('request')}\n"
-                f"  Response: {c.get('response')}"
+                f"- {lock} {c.method} {c.path}\n"
+                f"  Description: {c.description}\n"
+                f"  Request Body: {c.request_body}\n"
+                f"  Response Body: {c.response_body}"
             )
         contracts_str = "\n".join(lines)
     else:

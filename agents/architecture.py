@@ -30,7 +30,7 @@ import logging
 from typing import Any
 
 from .base import BaseAgent
-from core.state import ProjectState, ArchData, SRSData
+from core.state import ProjectState, ArchData, SRSData, APIContract
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ Requirements Specification (SRS).
   requirements imply, even if not explicitly stated.
 - Do NOT write SQL DDL, Dockerfiles, or source code.
 - API contracts: list every REST endpoint the backend must expose. \
-  Include a realistic request/response shape (field names + types as strings).
+  Include realistic request_body and response_body shapes (field names + types as strings).
 - Database schema overview: entity names + primary relationships only — no DDL.
 - Folder structure: monorepo directory tree as a plain multiline string.
 - Communication pattern: describe which services call which and via sync HTTP \
@@ -230,8 +230,8 @@ Requirements Specification (SRS).
       "path":          "<URL path>",
       "auth_required": true | false,
       "description":   "<what the endpoint does>",
-      "request":       { "<field>": "<type>", ... },
-      "response":      { "<field>": "<type>", ... }
+      "request_body":  { "<field>": "<type as string>", ... },
+      "response_body": { "<field>": "<type as string>", ... }
     },
     ...
   ],
@@ -299,28 +299,32 @@ def _as_list(value: object) -> list[str]:
     return [str(value)]
 
 
-def _validated_contracts(raw: Any) -> list[dict[str, Any]]:
+def _validated_contracts(raw: Any) -> list[APIContract]:
+    """Parse raw LLM output into a list of typed APIContract objects."""
     if not isinstance(raw, list):
         logger.warning("[ArchitectureAgent] api_contracts is not a list — ignoring.")
         return []
-    valid: list[dict[str, Any]] = []
+    valid: list[APIContract] = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             logger.warning("[ArchitectureAgent] contract[%d] is not a dict — skipped.", i)
             continue
-        if not all(k in item for k in ("method", "path", "description")):
+        if not all(k in item for k in ("method", "path")):
             logger.warning(
-                "[ArchitectureAgent] contract[%d] missing method/path/description — skipped.", i
+                "[ArchitectureAgent] contract[%d] missing method/path — skipped.", i
             )
             continue
-        valid.append({
-            "method":        str(item.get("method", "")).upper(),
-            "path":          str(item.get("path",   "")),
-            "auth_required": bool(item.get("auth_required", True)),
-            "description":   str(item.get("description", "")),
-            "request":       item.get("request",  {}),
-            "response":      item.get("response", {}),
-        })
+        # Normalise request/response field names — accept both old and new keys
+        req_body = item.get("request_body") or item.get("request", {})
+        res_body = item.get("response_body") or item.get("response", {})
+        valid.append(APIContract(
+            method        = str(item.get("method", "")).upper(),
+            path          = str(item.get("path",   "")),
+            auth_required = bool(item.get("auth_required", True)),
+            description   = str(item.get("description", "")),
+            request_body  = {str(k): str(v) for k, v in req_body.items()} if isinstance(req_body, dict) else {},
+            response_body = {str(k): str(v) for k, v in res_body.items()} if isinstance(res_body, dict) else {},
+        ))
     return valid
 
 
@@ -454,21 +458,22 @@ if __name__ == "__main__":
     # ── _validated_contracts ────────────────────────────────────────────────────
     raw_contracts = [
         {"method": "post", "path": "/auth/login",    "auth_required": False,
-         "description": "Login", "request": {"email": "str"}, "response": {"token": "str"}},
+         "description": "Login", "request_body": {"email": "str"}, "response_body": {"token": "str"}},
         {"method": "get",  "path": "/users/me",      "auth_required": True,
          "description": "Get me"},
-        # Missing required field — must be dropped
+        # Missing required field (no path) — must be dropped
         {"method": "delete", "description": "No path"},
         # Not a dict — must be dropped
         "bad_item",
     ]
     contracts = _validated_contracts(raw_contracts)
-    assert len(contracts) == 2,                         "FAIL: expected 2 valid contracts"
-    assert contracts[0]["method"] == "POST",            "FAIL: method should be uppercased"
-    assert contracts[0]["auth_required"] is False,      "FAIL: auth_required wrong"
-    assert "request"  in contracts[0],                  "FAIL: request field missing"
-    assert "response" in contracts[0],                  "FAIL: response field missing"
-    print("[PASS] _validated_contracts — 2 valid, bad items dropped, method uppercased")
+    assert len(contracts) == 2,                                 "FAIL: expected 2 valid contracts"
+    assert contracts[0].method == "POST",                       "FAIL: method should be uppercased"
+    assert contracts[0].auth_required is False,                 "FAIL: auth_required wrong"
+    assert contracts[0].request_body == {"email": "str"},       "FAIL: request_body wrong"
+    assert contracts[0].response_body == {"token": "str"},      "FAIL: response_body wrong"
+    assert contracts[1].request_body == {},                     "FAIL: missing request_body should default to {}"
+    print("[PASS] _validated_contracts — 2 valid APIContract objects, bad items dropped")
 
     # ── _parse_response: happy path ─────────────────────────────────────────────
     good_arch = json.dumps({
@@ -476,7 +481,7 @@ if __name__ == "__main__":
         "system_components":        ["API Server", "Frontend SPA", "PostgreSQL DB"],
         "api_contracts":            [
             {"method": "GET", "path": "/health", "auth_required": False,
-             "description": "Health check", "request": {}, "response": {"status": "str"}},
+             "description": "Health check", "request_body": {}, "response_body": {"status": "str"}},
         ],
         "database_schema_overview": "User -> Post -> Comment",
         "data_flow":                "Client -> API -> DB",

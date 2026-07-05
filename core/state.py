@@ -42,15 +42,25 @@ class SRSData(BaseModel):
     clarifying_questions: list[str] = Field(default_factory=list)   # raised if prompt is ambiguous
     is_complete: bool = False
 
+class APIContract(BaseModel):
+    """A single REST endpoint contract produced by the Architecture Agent."""
+    method:        str                        # HTTP verb: GET, POST, PUT, DELETE, PATCH
+    path:          str                        # URL path e.g. "/api/v1/boards"
+    auth_required: bool = True
+    description:   str = ""                   # what the endpoint does
+    request_body:  dict[str, str] = Field(default_factory=dict)   # field → type
+    response_body: dict[str, str] = Field(default_factory=dict)   # field → type
+
 class ArchData(BaseModel):
     """Output of the Architecture Agent."""
     tech_stack: dict[str, str] = Field(default_factory=dict)        # e.g. {"backend": "FastAPI", ...}
     system_components: list[str] = Field(default_factory=list)
     data_flow: str = ""
-    api_contracts: list[dict[str, Any]] = Field(default_factory=list)
+    api_contracts: list[APIContract] = Field(default_factory=list)
     database_schema_overview: str = ""
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths
+
  
 class Task(BaseModel):
     id: str

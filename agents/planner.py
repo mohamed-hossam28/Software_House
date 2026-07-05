@@ -32,6 +32,7 @@ from core.state import (
     TaskList,
     FileManifest,
     CodeManifest,
+    APIContract,
 )
 
 
@@ -173,19 +174,17 @@ def _fmt_components(components: list[str]) -> str:
     return "\n".join(f"  - {c}" for c in components) or "  (none)"
 
 
-def _fmt_api_contracts(contracts: list[dict[str, Any]]) -> str:
+def _fmt_api_contracts(contracts: list[APIContract]) -> str:
     if not contracts:
         return "  (none)"
     lines = []
     for c in contracts:
-        lock  = "🔒" if c.get("auth_required") else "🔓"
-        req   = str(c.get("request",  "{}"))
-        resp  = str(c.get("response", "{}"))
+        lock  = "🔒" if c.auth_required else "🔓"
         lines.append(
-            f"  {lock} {str(c.get('method','?')):7} {c.get('path','?')}\n"
-            f"         desc    : {c.get('description','')}\n"
-            f"         request : {req}\n"
-            f"         response: {resp}"
+            f"  {lock} {c.method:7} {c.path}\n"
+            f"         desc         : {c.description}\n"
+            f"         request_body : {c.request_body}\n"
+            f"         response_body: {c.response_body}"
         )
     return "\n".join(lines)
 
