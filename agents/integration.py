@@ -668,7 +668,8 @@ class IntegrationAgent(BaseAgent):
         try:
             prompt = USER_PROMPT_TEMPLATE.format(conflicts_json=json.dumps(conflicts, indent=2))
             resp = self.llm_call(prompt)
-            data = self.extract_json(resp.text)
+            from agents.schemas.integration import IntegrationSchema
+            data = self.extract_json_and_validate(resp.text, IntegrationSchema)
             return data.get("classifications", [])
         except Exception as exc:
             logger.error("[IntegrationAgent] Phase 2 LLM call failed: %s", exc)

@@ -321,14 +321,15 @@ class BackendAgent(BaseAgent):
 
         # Parse JSON from raw response
         try:
-            data = self.extract_json(raw_response)
+            from agents.schemas.backend import BackendSchema
+            data = self.extract_json_and_validate(raw_response, BackendSchema)
         except Exception as exc:
             logger.error(
-                "[BackendAgent] JSON parse failed for %s: %s — raw response (first 500 chars): %s",
+                "[BackendAgent] JSON parse/validation failed for %s: %s — raw response (first 500 chars): %s",
                 filepath, exc, raw_response[:500] if raw_response else "(empty)",
             )
             with lock:
-                state.log_error(self.name, f"JSON parse failed for {filepath}: {exc}")
+                state.log_error(self.name, f"JSON parse/validation failed for {filepath}: {exc}")
             return
 
         code = data.get("code", "").strip()
@@ -443,6 +444,8 @@ class BackendAgent(BaseAgent):
 # ║  run: python agents/backend.py                                              ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s — %(message)s")
     print("\n" + "=" * 60)
     print("BackendAgent — Local tests")
     print("=" * 60)
@@ -484,7 +487,7 @@ if __name__ == "__main__":
             # Verify system_prompt contains the custom tech stack name
             assert "Express.js (Node.js)" in system_prompt, f"Expected Express.js (Node.js) in system_prompt: {system_prompt}"
             # Check which file is being built and return appropriate response
-            if "backend/app/models/user.py" in user_message:
+            if "models/user.py" in user_message.split("---")[-1]:
                 mock_data = {
                     "code": "class User:\n    def __init__(self, name: str):\n        self.name = name\n",
                     "classes": [

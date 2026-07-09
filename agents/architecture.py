@@ -366,10 +366,11 @@ class ArchitectureAgent(BaseAgent):
     # ── response parser ──────────────────────────────────────────────────────────
     def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
         try:
-            data: dict[str, Any] = self.extract_json(raw)
-        except ValueError as exc:
-            logger.error("[ArchitectureAgent] JSON parse failed: %s", exc)
-            state.log_error(self.name, f"JSON parse error: {exc}")
+            from agents.schemas.architecture import ArchitectureSchema
+            data: dict[str, Any] = self.extract_json_and_validate(raw, ArchitectureSchema)
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] JSON parse/validation failed: %s", exc)
+            state.log_error(self.name, f"JSON parse/validation error: {exc}")
             return state
 
         # ── validate required keys ───────────────────────────────────────────────

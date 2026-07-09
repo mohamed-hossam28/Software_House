@@ -316,12 +316,13 @@ class FrontendAgent(BaseAgent):
 
         # Parse JSON
         try:
-            data = self.extract_json(raw)
+            from agents.schemas.frontend import FrontendSchema
+            data = self.extract_json_and_validate(raw, FrontendSchema)
         except Exception as exc:
             snippet = raw[:500] if raw else "(empty)"
-            logger.error("[FrontendAgent] JSON parse failed for %s: %s | raw: %s", filepath, exc, snippet)
+            logger.error("[FrontendAgent] JSON parse/validation failed for %s: %s | raw: %s", filepath, exc, snippet)
             with lock:
-                state.log_error(self.name, f"JSON parse failed for {filepath}: {exc}")
+                state.log_error(self.name, f"JSON parse/validation failed for {filepath}: {exc}")
             return
 
         code = data.get("code", "").strip()
@@ -439,6 +440,15 @@ if __name__ == "__main__":
     load_dotenv()
     if "open_router_api" in os.environ and not os.environ.get("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = os.environ["open_router_api"]
+    if "gimini_api" in os.environ:
+        if not os.environ.get("GOOGLE_API_KEY"):
+            os.environ["GOOGLE_API_KEY"] = os.environ["gimini_api"]
+        if not os.environ.get("GEMINI_API_KEY"):
+            os.environ["GEMINI_API_KEY"] = os.environ["gimini_api"]
+    if "qrok_api" in os.environ and not os.environ.get("GROQ_API_KEY"):
+        os.environ["GROQ_API_KEY"] = os.environ["qrok_api"]
+    if "nvidia_api" in os.environ and not os.environ.get("NVIDIA_API_KEY"):
+        os.environ["NVIDIA_API_KEY"] = os.environ["nvidia_api"]
 
     from core.state import (
         ProjectState, Task, TaskList, FileManifest, CodeManifest,

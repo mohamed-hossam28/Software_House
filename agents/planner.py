@@ -337,10 +337,11 @@ class PlannerAgent(BaseAgent):
     # ── Response parser ──────────────────────────────────────────────────────────
     def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
         try:
-            raw_list: list[Any] = self.extract_json_list(raw)
-        except ValueError as exc:
-            logger.error("[PlannerAgent] JSON parse failed: %s", exc)
-            state.log_error(self.name, f"JSON parse error: {exc}")
+            from agents.schemas.planner import TaskSchema
+            raw_list: list[Any] = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
+        except Exception as exc:
+            logger.error("[PlannerAgent] JSON parse/validation failed: %s", exc)
+            state.log_error(self.name, f"JSON parse/validation error: {exc}")
             return state
 
         tasks, warnings = _validate_tasks(raw_list)

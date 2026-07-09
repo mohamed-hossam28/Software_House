@@ -15,32 +15,41 @@ import os
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MODEL="openai/gpt-oss-120b:free"
-DEFAULT_MAX_TOKENS = 8192
-DEFAULT_RETRIES    = 3
-DEFAULT_BACKOFF    = 2.0   # seconds, doubles each retry
+from core.config import settings
+
+DEFAULT_MODEL = settings.model_name
+DEFAULT_MAX_TOKENS = settings.default_max_tokens or 8192
+DEFAULT_RETRIES    = settings.default_retries or 3
+DEFAULT_BACKOFF    = settings.default_backoff or 2.0 
 
 class BaseAgent(ABC):
     def __init__(
         self,
-        model:str=DEFAULT_MODEL,
-        max_tokens:int=DEFAULT_MAX_TOKENS,
-        max_retries:int=DEFAULT_RETRIES,
-        backoff:float=DEFAULT_BACKOFF,
-        temperature:float=0.2,
-        provider:    BaseLLMProvider | None = None, 
-        
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_retries: int = DEFAULT_RETRIES,
+        retries: int | None = None,
+        backoff: float = DEFAULT_BACKOFF,
+        temperature: float = 0.2,
+        provider: BaseLLMProvider | str | None = None,
     ):
         """Initialize the base agent."""
-        self.model=model
-        self.max_tokens=max_tokens
-        self.max_retries=max_retries
-        self.backoff=backoff
-        self.temperature=temperature
-        # Extract the provider prefix from the model string (e.g. "openai/gpt-4o" → "openai")
-        provider_name    = model.split("/")[0]
-        self.provider    = provider or llmFactory.get(provider_name)
+        self.model = model
+        self.max_tokens = max_tokens
+        self.max_retries = retries if retries is not None else max_retries
+        self.backoff = backoff
+        self.temperature = temperature
         
+        if isinstance(provider, str):
+            provider_name = provider.lower().strip()
+            self.provider = llmFactory.get(provider_name)
+        elif provider is not None:
+            self.provider = provider
+        else:
+            provider_name = self.model.split("/")[0] if "/" in self.model else settings.default_provider
+            if provider_name not in llmFactory.available():
+                provider_name = settings.default_provider
+            self.provider = llmFactory.get(provider_name)
 
     @property
     def name(self)->str:
@@ -110,41 +119,103 @@ class BaseAgent(ABC):
         return state
 
 
-        # ── Parsing helpers ────────────────────────
- 
+    # ── JSON helpers ──────────────────────────────────────────────────
+
     @staticmethod
-    def extract_json(text: str) -> dict[str, Any]:
+    def _strip_fences(text: str) -> str:
+        """Remove markdown code fences (```json ... ```) and return inner content."""
+        fenced = re.search(r"```(?:json)?\s*([\s\S]+?)```", text)
+        return fenced.group(1) if fenced else text
+
+    @staticmethod
+    def _extract_raw_json(text: str, bracket: str = "{") -> str:
+        """
+        Extract the first balanced JSON object or array from *text*.
+
+        Uses a bracket-counting scan instead of a greedy regex so that
+        `{"a":1} some trailing text {"b":2}` correctly returns `{"a":1}`.
+        """
+        open_b  = bracket
+        close_b = "}" if bracket == "{" else "]"
+        start   = text.find(open_b)
+        if start == -1:
+            kind = "object" if bracket == "{" else "array"
+            raise ValueError(f"No JSON {kind} found in response:\n{text[:300]}")
+
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == open_b:
+                depth += 1
+            elif ch == close_b:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+        # Unbalanced — return from start to end and let the parser try
+        return text[start:]
+
+    @staticmethod
+    def _try_parse(raw: str, expect_type: type):
+        """
+        Try json.loads first, then json_repair.loads.
+        Returns the parsed object or raises ValueError.
+        """
+        import json_repair
+
+        # 1. Strict parse
+        try:
+            result = json.loads(raw)
+            if isinstance(result, expect_type):
+                return result
+        except Exception:
+            pass
+
+        # 2. json_repair
+        try:
+            result = json_repair.loads(raw)
+            if isinstance(result, expect_type):
+                return result
+        except Exception:
+            pass
+
+        type_name = "dict" if expect_type is dict else "list"
+        raise ValueError(f"Failed to parse JSON as {type_name}:\n{raw[:300]}")
+
+    # ── Public extraction methods ─────────────────────────────────────
+
+    @classmethod
+    def extract_json(cls, text: str) -> dict[str, Any]:
         """
         Safely extract the first JSON object from a model response.
         Handles markdown code fences (```json ... ```) gracefully.
         """
-        # Strip markdown fences
-        fenced = re.search(r"```(?:json)?\s*([\s\S]+?)```", text)
-        if fenced:
-            text = fenced.group(1)
- 
-        # Find first {...}
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise ValueError(f"No JSON object found in response:\n{text[:300]}")
- 
-        return json.loads(match.group())
- 
-    @staticmethod
-    def extract_json_list(text: str) -> list[Any]:
+        text = cls._strip_fences(text)
+        raw  = cls._extract_raw_json(text, "{")
+        return cls._try_parse(raw, dict)
+
+    @classmethod
+    def extract_json_list(cls, text: str) -> list[Any]:
         """
         Safely extract the first JSON array from a model response.
         """
-        fenced = re.search(r"```(?:json)?\s*([\s\S]+?)```", text)
-        if fenced:
-            text = fenced.group(1)
- 
-        match = re.search(r"\[[\s\S]*\]", text)
-        if not match:
-            raise ValueError(f"No JSON array found in response:\n{text[:300]}")
- 
-        return json.loads(match.group())
- 
+        text = cls._strip_fences(text)
+        raw  = cls._extract_raw_json(text, "[")
+        return cls._try_parse(raw, list)
+
     @staticmethod
     def extract_section(text: str, tag: str) -> str:
         """
@@ -156,6 +227,132 @@ class BaseAgent(ABC):
         if not match:
             raise ValueError(f"<{tag}> section not found in response.")
         return match.group(1).strip()
- 
 
-                    
+    # ── Validation helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_data(data: Any, schema_cls: Any, is_list: bool) -> Any:
+        """
+        Run Pydantic validation on parsed data.
+        Returns the validated/coerced Python object(s).
+        """
+        if is_list:
+            if not isinstance(data, list):
+                raise ValueError("Expected a list, got " + str(type(data)))
+            validated = []
+            for item in data:
+                if hasattr(schema_cls, "model_validate"):
+                    obj = schema_cls.model_validate(item)
+                else:
+                    obj = schema_cls(**item)
+                validated.append(obj.model_dump() if hasattr(obj, "model_dump") else item)
+            return validated
+        else:
+            if not isinstance(data, dict):
+                raise ValueError("Expected a dictionary, got " + str(type(data)))
+            if hasattr(schema_cls, "model_validate"):
+                obj = schema_cls.model_validate(data)
+            else:
+                obj = schema_cls(**data)
+            return obj.model_dump() if hasattr(obj, "model_dump") else data
+
+    def _repair_json_via_llm(self, json_fragment: str, schema_cls: Any) -> str:
+        """
+        Send **only** the JSON fragment (not the full LLM prose) to the
+        model for repair, together with the expected schema so the model
+        knows what structure to preserve.
+        """
+        schema_hint = ""
+        if hasattr(schema_cls, "model_json_schema"):
+            try:
+                schema_hint = (
+                    "\n\nExpected JSON schema:\n"
+                    + json.dumps(schema_cls.model_json_schema(), indent=2)
+                )
+            except Exception:
+                pass
+
+        repair_prompt = (
+            "The following JSON is invalid or does not match the expected schema.\n\n"
+            "Repair it so it becomes valid JSON matching the schema.\n\n"
+            "Rules:\n"
+            "- Do NOT change the meaning.\n"
+            "- Do NOT add new information.\n"
+            "- Only fix syntax errors and missing/misnamed fields.\n"
+            "- Return ONLY the corrected JSON, no explanation.\n"
+            f"{schema_hint}\n\n"
+            f"{json_fragment}"
+        )
+
+        logger.info("[%s] Sending JSON fragment to LLM for repair…", self.name)
+        try:
+            response = self.provider.complete(
+                system_prompt="You are a helpful assistant that repairs JSON syntax.",
+                user_message=repair_prompt,
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=0.1,
+            )
+            return response.text
+        except Exception as exc:
+            logger.error("[%s] LLM JSON repair call failed: %s", self.name, exc)
+            return json_fragment
+
+    def extract_json_and_validate(
+        self, text: str, schema_cls: Any, is_list: bool = False
+    ) -> Any:
+        """
+        Three-stage extraction pipeline:
+
+        1. **Parse + validate** — json.loads / json_repair on the raw text.
+        2. **Local repair + validate** — re-run json_repair on just the
+           extracted substring (handles truncated brackets, trailing commas).
+        3. **LLM repair + validate** — send the JSON fragment (not the full
+           response) to the model with the target schema for correction.
+
+        Returns the validated (and pydantic-coerced) data.
+        """
+        bracket   = "[" if is_list else "{"
+        extractor = self.extract_json_list if is_list else self.extract_json
+
+        # ── Stage 1: direct parse ────────────────────────────────────
+        try:
+            parsed = extractor(text)
+            return self._validate_data(parsed, schema_cls, is_list)
+        except Exception as stage1_exc:
+            logger.warning(
+                "[%s] Stage 1 (direct parse) failed: %s", self.name, stage1_exc
+            )
+
+        # ── Stage 2: local repair on raw substring ───────────────────
+        raw_fragment = ""
+        try:
+            stripped = self._strip_fences(text)
+            raw_fragment = self._extract_raw_json(stripped, bracket)
+        except Exception:
+            raw_fragment = text  # fallback — let json_repair try the whole thing
+
+        import json_repair
+        try:
+            repaired_local = json_repair.loads(raw_fragment)
+            if not isinstance(repaired_local, (dict, list)):
+                raise ValueError("json_repair returned unexpected type")
+            return self._validate_data(repaired_local, schema_cls, is_list)
+        except Exception as stage2_exc:
+            logger.warning(
+                "[%s] Stage 2 (local repair) failed: %s", self.name, stage2_exc
+            )
+
+        # ── Stage 3: LLM repair (send only the JSON fragment) ───────
+        repaired_text = self._repair_json_via_llm(raw_fragment, schema_cls)
+        try:
+            parsed_repaired = extractor(repaired_text)
+            result = self._validate_data(parsed_repaired, schema_cls, is_list)
+            logger.info("[%s] Stage 3 (LLM repair) succeeded.", self.name)
+            return result
+        except Exception as stage3_exc:
+            logger.error(
+                "[%s] All 3 repair stages failed. Final error: %s",
+                self.name, stage3_exc,
+            )
+            raise stage3_exc

@@ -2,7 +2,6 @@ import logging
 from .base import BaseAgent
 from core.state import ProjectState, SRSData
 
-
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
@@ -65,11 +64,12 @@ class RequirementsAgent(BaseAgent):
     def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
         
         try:
-            data=self.extract_json(raw)
+            from agents.schemas.requirements import RequirementsSchema
+            data = self.extract_json_and_validate(raw, RequirementsSchema)
             
-        except ValueError as exc:
-            logger.error("[RequirementsAgent] JSON parse failed: %s", exc)
-            state.log_error(self.name, f"JSON parse error: {exc}")
+        except Exception as exc:
+            logger.error("[RequirementsAgent] JSON parse/validation failed: %s", exc)
+            state.log_error(self.name, f"JSON parse/validation error: {exc}")
             return state
         
         clarifying_questions = _as_list(data.get("clarifying_questions", []))
@@ -187,7 +187,7 @@ def _as_list(value: object) -> list[str]:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 if __name__ == "__main__":
     import json
-
+    
     print("\n" + "=" * 60)
     print("RequirementsAgent — local smoke-test (no LLM call)")
     print("=" * 60)

@@ -367,14 +367,15 @@ class DatabaseAgent(BaseAgent):
 
         # Parse JSON response
         try:
-            data = self.extract_json(raw)
+            from agents.schemas.database import DatabaseSchema
+            data = self.extract_json_and_validate(raw, DatabaseSchema)
         except Exception as exc:
             snippet = raw[:500] if raw else "(empty)"
             logger.error(
-                "[DBAgent] JSON parse failed for %s: %s | raw: %s", filepath, exc, snippet
+                "[DBAgent] JSON parse/validation failed for %s: %s | raw: %s", filepath, exc, snippet
             )
             with lock:
-                state.log_error(self.name, f"JSON parse failed for {filepath}: {exc}")
+                state.log_error(self.name, f"JSON parse/validation failed for {filepath}: {exc}")
             return
 
         migration_code = data.get("migration_code", "").strip()
@@ -384,13 +385,34 @@ class DatabaseAgent(BaseAgent):
                 state.log_error(self.name, f"'migration_code' missing for {filepath}")
             return
 
-        manifest_data: dict = data.get("manifest", {})
+        manifest_data: dict = data.get("manifest") or {}
 
-        # Build <manifest> block to append to the migration file
-        manifest_block = _render_manifest_xml(manifest_data) if manifest_data else ""
-        full_content = (
-            migration_code + "\n\n" + manifest_block if manifest_block else migration_code
-        )
+        # Parse table schema from manifest into classes list to keep it in the state
+        classes: list[ClassName] = []
+        if manifest_data and "table_name" in manifest_data:
+            table_name = manifest_data["table_name"]
+            columns = manifest_data.get("columns", [])
+            args = []
+            for col in columns:
+                col_name = col.get("name", "")
+                col_type = col.get("type", "unknown")
+                default_val = ""
+                if col.get("primary_key"):
+                    col_type += " (PK)"
+                if col.get("foreign_key"):
+                    col_type += f" (FK -> {col['foreign_key']})"
+                if col.get("nullable"):
+                    default_val = "NULL"
+                args.append(Argument(
+                    name=col_name,
+                    type=col_type,
+                    default=default_val
+                ))
+            classes.append(ClassName(
+                name=table_name,
+                arguments=args,
+                docstring=f"Table schema for {table_name}"
+            ))
 
         # Parse optional helper function metadata
         functions: list[FunctionName] = []
@@ -406,9 +428,9 @@ class DatabaseAgent(BaseAgent):
             except Exception as e:
                 logger.warning("[DBAgent] Function metadata parse error: %s", e)
 
-        # Write migration file to disk
+        # Write migration file to disk (only write code)
         try:
-            _write_to_disk(filepath, full_content)
+            _write_to_disk(filepath, migration_code)
         except Exception as exc:
             logger.error("[DBAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:
@@ -417,8 +439,8 @@ class DatabaseAgent(BaseAgent):
 
         # Thread-safe state update
         with lock:
-            state.generated_code.database[filepath] = full_content
-            state.code_manifest.mark_written(filepath, classes=[], functions=functions)
+            state.generated_code.database[filepath] = migration_code
+            state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
             task.status = "done"
             state.metrics.total_tokens_used += 0  # tokens tracked in _call_with_system
             state.metrics.total_llm_calls += 1
@@ -584,9 +606,12 @@ if __name__ == "__main__":
     assert result.code_manifest.files[fm.filepath].written, "File not marked written"
     assert fm.filepath in result.generated_code.database, "Code not in generated_code.database"
     assert "CREATE TABLE" in result.generated_code.database[fm.filepath]
-    assert "<manifest>" in result.generated_code.database[fm.filepath]
+    written_fm = result.code_manifest.files[fm.filepath]
+    assert len(written_fm.classes) == 1, "Expected table class in manifest classes"
+    assert written_fm.classes[0].name == "users", "Table name mismatch"
+    assert len(written_fm.classes[0].arguments) == 4, "Columns count mismatch"
     assert not result.errors, f"Unexpected errors: {result.errors}"
-    print("[PASS] DatabaseAgent mock run — migration written, manifest block present, no errors")
+    print("[PASS] DatabaseAgent mock run — migration written, manifest in state classes, no errors")
 
     # Cleanup
     import shutil
