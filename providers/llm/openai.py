@@ -1,4 +1,5 @@
 from .base import BaseLLMProvider,LLMResponse
+import os
 
 class OpenAIProvider(BaseLLMProvider):
     def __init__(self, api_key: str | None = None):
@@ -9,9 +10,16 @@ class OpenAIProvider(BaseLLMProvider):
             raise ImportError(
                 "openai package not installed. Run: pip install openai"
             )
+        from core.config import settings
+        key = (
+            api_key 
+            or (settings.api_key if settings.default_provider.lower().strip() == "openai" else None)
+            or os.environ.get("OPENAI_API_KEY") 
+            or os.environ.get("open_router_api")
+        )
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key=api_key
+            api_key=key
         )
 
     

@@ -7,6 +7,8 @@ _REGISTRY: dict[str, str] = {
     "anthropic": "providers.llm.anthropic.AnthropicProvider",
     "openai":    "providers.llm.openai.OpenAIProvider",
     "gemini":    "providers.llm.gemini.GeminiProvider",
+    "glm":       "providers.llm.glm.GLMProvider",
+    "nara":      "providers.llm.nara_router.NaraRouterProvider",
 }
  
  
@@ -18,7 +20,7 @@ class LLMFactory:
         Returns an instantiated LLM provider.
  
         Args:
-            provider_name:  one of "anthropic", "openai", "gemini"
+            provider_name:  one of "anthropic", "openai", "gemini", "glm", "nara"
             api_key:        optional — if None, each provider reads from env
  
         Raises:

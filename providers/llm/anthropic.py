@@ -1,13 +1,19 @@
 import anthropic
- 
+import os 
 from providers.llm.base import BaseLLMProvider, LLMResponse
  
  
 class AnthropicProvider(BaseLLMProvider):
  
     def __init__(self, api_key: str | None = None):
+        from core.config import settings
         # api_key=None → SDK reads ANTHROPIC_API_KEY from environment automatically
-        self.client = anthropic.Anthropic(api_key=api_key)
+        key = (
+            api_key 
+            or (settings.api_key if settings.default_provider.lower().strip() == "anthropic" else None)
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        self.client = anthropic.Anthropic(api_key=key)
  
     @property
     def provider_name(self) -> str:

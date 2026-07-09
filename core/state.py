@@ -251,6 +251,8 @@ class ProjectState(BaseModel):
     project_id:str=""
     project_name:str=""
     status:ProjectStatus=ProjectStatus.PENDING
+    max_clarfication_rounds: int = 3
+    clarfication_rounds: int = 0
 
     # agents outputs
 
