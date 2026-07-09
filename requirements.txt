@@ -29,9 +29,12 @@ redis==8.0.1
 
 # ── Data Validation ────────────────────────────
 pydantic==2.13.4
+pydantic-settings==2.14.2
 
 # ── Observability ──────────────────────────────
 langsmith==0.9.5
 
 # ── Config ─────────────────────────────────────
 python-dotenv==1.2.2
+
+json-repair==0.61.2
