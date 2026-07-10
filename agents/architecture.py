@@ -1,32 +1,25 @@
 """
 agents/architecture.py
 ──────────────────────
-Architecture Agent — runs directly after the Requirements Agent.
+Architecture Agent — parallel 3-round execution via ThreadPoolExecutor.
 
-Input:  ProjectState.requirements  (SRSData — fully populated)
-Output: ProjectState.architecture  (ArchData — fully populated)
+ROUND 1 (fully independent — run in parallel)
+  ├── Call A: tech_stack
+  ├── Call B: system_components
+  └── Call C: db_schema_overview
 
-Tech-stack resolution priority (highest → lowest):
-  1. Explicit tech mentioned in SRS constraints / assumptions
-  2. User preferences from the persistent store  (TechStackStore — stub until store is built)
-  3. Sensible defaults per layer
+ROUND 2 (depends on Round 1 — run in parallel)
+  ├── Call D: api_contracts       (needs tech_stack + system_components)
+  └── Call E: security_requirements (needs tech_stack)
 
-What it DOES produce:
-  • Tech stack decision + rationale
-  • System component list (services)
-  • API contract surface (method, path, auth, request / response shape)
-  • Database schema overview  (entity names + key relationships — no DDL)
-  • Folder structure          (monorepo layout — no actual file contents)
-  • Communication pattern     (sync REST / async events / which services talk to which)
-  • Security requirements     (auth strategy, RBAC, encryption, rate limiting)
-
-What it does NOT produce:
-  • Actual source code        → engineering agents
-  • Detailed SQL / migrations → Database agent
-  • Dockerfiles / CI config   → DevOps agent
+ROUND 3 (depends on Round 2 — single call)
+  └── Call F: data_flow           (needs api_contracts + system_components)
 """
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, Future
+from threading import Lock
 from typing import Any
 
 from .base import BaseAgent
@@ -34,8 +27,9 @@ from core.state import ProjectState, ArchData, SRSData, APIContract
 
 logger = logging.getLogger(__name__)
 
+MAX_PARALLEL_CALLS = 3
 
-# ── Default tech stack (fallback when store + SRS provide no preference) ────────
+# ── Default tech stack ──────────────────────────────────────────────────────────
 DEFAULT_TECH_STACK: dict[str, str] = {
     "backend":  "FastAPI (Python 3.12)",
     "frontend": "React 18 + TypeScript",
@@ -192,91 +186,6 @@ class TechStackResolver:
         return stack
 
 
-# ── System prompt (generic — tech stack is injected per-run in the user prompt) ─
-SYSTEM_PROMPT = """\
-You are a principal software architect with 20+ years of experience designing \
-production-grade, cloud-native systems.
-
-Your job is to produce a complete system architecture document from a Software \
-Requirements Specification (SRS).
-
-## Rules
-- Respond with a SINGLE valid JSON object — no prose outside the JSON.
-- Follow the exact schema below. Every field is REQUIRED.
-- Use ONLY the tech stack listed in the ## Resolved Tech Stack section of the \
-  user message. Do not substitute or add technologies.
-- Be exhaustive: derive every component, endpoint, and relationship that the \
-  requirements imply, even if not explicitly stated.
-- Do NOT write SQL DDL, Dockerfiles, or source code.
-- API contracts: list every REST endpoint the backend must expose. \
-  Include realistic request_body and response_body shapes (field names + types as strings).
-- Database schema overview: entity names + primary relationships only — no DDL.
-- Folder structure: monorepo directory tree as a plain multiline string.
-- Communication pattern: describe which services call which and via sync HTTP \
-  or async events.
-- Security requirements: auth strategy, RBAC roles, data encryption, \
-  rate limiting, CORS policy, secrets management.
-
-## JSON schema
-{
-  "tech_stack": {
-    "<layer>": "<technology + version>",
-    ...
-  },
-  "system_components": ["<ServiceName: one-line description>", ...],
-  "api_contracts": [
-    {
-      "method":        "<HTTP verb>",
-      "path":          "<URL path>",
-      "auth_required": true | false,
-      "description":   "<what the endpoint does>",
-      "request_body":  { "<field>": "<type as string>", ... },
-      "response_body": { "<field>": "<type as string>", ... }
-    },
-    ...
-  ],
-  "database_schema_overview": "<multiline string: entity → related entities>",
-  "data_flow":               "<multiline string: communication pattern between services>",
-  "deployment_strategy":     "<multiline string: folder structure + infra topology>",
-  "security_requirements":   ["<requirement statement>", ...]
-}
-"""
-
-# ── User prompt template ─────────────────────────────────────────────────────────
-USER_PROMPT_TEMPLATE = """\
-## Resolved Tech Stack
-(Use these technologies exactly — they reflect the user's stated preferences \
-and/or organisation defaults.)
-
-{tech_stack_table}
-
----
-
-## Software Requirements Specification
-
-### Functional Requirements
-{functional_requirements}
-
-### Non-Functional Requirements
-{non_functional_requirements}
-
-### Constraints
-{constraints}
-
-### Assumptions
-{assumptions}
-
-### Out of Scope
-{out_of_scope}
-
----
-
-Using the SRS and tech stack above, produce the full architecture JSON.
-Remember: JSON only — no explanations outside the object.
-```json
-"""
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────────
 def _bullet_list(items: list[str]) -> str:
     if not items:
@@ -328,6 +237,84 @@ def _validated_contracts(raw: Any) -> list[APIContract]:
     return valid
 
 
+def _srs_block(srs: SRSData) -> str:
+    """Format the SRS into a reusable prompt block."""
+    return (
+        "## Software Requirements Specification\n\n"
+        "### Functional Requirements\n"
+        f"{_bullet_list(srs.functional_requirements)}\n\n"
+        "### Non-Functional Requirements\n"
+        f"{_bullet_list(srs.non_functional_requirements)}\n\n"
+        "### Constraints\n"
+        f"{_bullet_list(srs.constraints)}\n\n"
+        "### Assumptions\n"
+        f"{_bullet_list(srs.assumptions)}\n\n"
+        "### Out of Scope\n"
+        f"{_bullet_list(srs.out_of_scope)}\n"
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  Per-call system / user prompts                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+_BASE_SYSTEM = (
+    "You are a principal software architect with 20+ years of experience "
+    "designing production-grade, cloud-native systems.\n"
+    "Respond with a SINGLE valid JSON object — no prose outside the JSON."
+)
+
+# ── Round 1 prompts ──────────────────────────────────────────────────────────
+
+TECH_STACK_SYSTEM = _BASE_SYSTEM + """
+Your task: decide the backend, frontend, database, cache, and infrastructure
+technologies for a project described in the SRS below.
+Return JSON: {"tech_stack": {"<layer>": "<technology + version>", ...}}
+Use ONLY the resolved tech stack provided when available; fill gaps with best choices.
+"""
+
+SYSTEM_COMPONENTS_SYSTEM = _BASE_SYSTEM + """
+Your task: list every high-level service/component the system needs
+(e.g. AuthService, BoardService, NotificationService, APIGateway, etc.).
+Be exhaustive — derive every component the SRS implies.
+Return JSON: {"system_components": ["<ServiceName: one-line description>", ...]}
+"""
+
+DB_SCHEMA_SYSTEM = _BASE_SYSTEM + """
+Your task: produce a database schema overview — entity names and their primary
+relationships. NO DDL, NO SQL — just entity names and how they relate.
+Return JSON: {"database_schema_overview": "<multiline string: entity → related entities>"}
+"""
+
+# ── Round 2 prompts ──────────────────────────────────────────────────────────
+
+API_CONTRACTS_SYSTEM = _BASE_SYSTEM + """
+Your task: list every REST API endpoint the backend must expose.
+Tag each endpoint with an owner_component from the system_components list.
+Include realistic request_body and response_body shapes (field names + types as strings).
+Return JSON:
+{"api_contracts": [
+  {"method":"<HTTP verb>","path":"<URL>","auth_required":true|false,
+   "description":"<what it does>","owner_component":"<ServiceName>",
+   "request_body":{"<field>":"<type>"},"response_body":{"<field>":"<type>"}}
+]}
+"""
+
+SECURITY_SYSTEM = _BASE_SYSTEM + """
+Your task: define security requirements — auth strategy, RBAC roles, data
+encryption, rate limiting, CORS policy, secrets management.
+Return JSON: {"security_requirements": ["<requirement statement>", ...]}
+"""
+
+# ── Round 3 prompts ──────────────────────────────────────────────────────────
+
+DATA_FLOW_SYSTEM = _BASE_SYSTEM + """
+Your task: describe the communication/data-flow pattern between services.
+Which services call which, sync REST vs async events, message queues, etc.
+Return JSON: {"data_flow": "<multiline string: communication pattern>"}
+"""
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  ArchitectureAgent                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -336,86 +323,234 @@ class ArchitectureAgent(BaseAgent):
     Reads the completed SRS from ProjectState.requirements and writes a fully
     populated ArchData into ProjectState.architecture.
 
-    Tech stack is resolved at call-time via TechStackResolver so every run
-    reflects the latest user preferences from the store.
+    Executes 6 focused LLM calls across 3 dependency-resolved rounds
+    using ThreadPoolExecutor with a Lock on shared state.
     """
 
     @property
     def system_prompt(self) -> str:
-        return SYSTEM_PROMPT
+        return _BASE_SYSTEM
 
-    # ── prompt builder ───────────────────────────────────────────────────────────
+    # ── unused (run is overridden) ───────────────────────────────────────────
     def _build_prompt(self, state: ProjectState) -> str:
-        # Resolve tech stack fresh on every run
-        resolved_stack = TechStackResolver.resolve(state)
-        logger.info(
-            "[ArchitectureAgent] resolved tech stack: %s",
-            resolved_stack,
-        )
+        raise NotImplementedError("_build_prompt unused; run() is overridden.")
 
-        srs = state.requirements
-        return USER_PROMPT_TEMPLATE.format(
-            tech_stack_table           = _tech_stack_table(resolved_stack),
-            functional_requirements    = _bullet_list(srs.functional_requirements),
-            non_functional_requirements= _bullet_list(srs.non_functional_requirements),
-            constraints                = _bullet_list(srs.constraints),
-            assumptions                = _bullet_list(srs.assumptions),
-            out_of_scope               = _bullet_list(srs.out_of_scope),
-        )
-
-    # ── response parser ──────────────────────────────────────────────────────────
     def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
+        raise NotImplementedError("_parse_response unused; run() is overridden.")
+
+    # ── LLM helper with custom system prompt ─────────────────────────────────
+    def _call_with_system(self, system: str, user: str) -> str:
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.provider.complete(
+                    system_prompt=system,
+                    user_message=user,
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+                return response.text
+            except Exception as exc:
+                logger.warning(
+                    "[ArchitectureAgent] LLM attempt %d/%d failed: %s",
+                    attempt, self.max_retries, exc,
+                )
+                if attempt == self.max_retries:
+                    raise
+                time.sleep(self.backoff * attempt)
+        raise RuntimeError("Unreachable")
+
+    # ── Individual sub-call workers ──────────────────────────────────────────
+
+    def _call_tech_stack(self, srs_text: str, stack_table: str,
+                         results: dict, lock: Lock, state: ProjectState) -> None:
+        prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{srs_text}\n```json\n"
         try:
-            from agents.schemas.architecture import ArchitectureSchema
-            data: dict[str, Any] = self.extract_json_and_validate(raw, ArchitectureSchema)
+            from agents.schemas.architecture import TechStackSchema
+            raw = self._call_with_system(TECH_STACK_SYSTEM, prompt)
+            data = self.extract_json_and_validate(raw, TechStackSchema)
+            with lock:
+                results["tech_stack"] = data.get("tech_stack", {})
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ tech_stack complete")
         except Exception as exc:
-            logger.error("[ArchitectureAgent] JSON parse/validation failed: %s", exc)
-            state.log_error(self.name, f"JSON parse/validation error: {exc}")
-            return state
+            logger.error("[ArchitectureAgent] tech_stack failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"tech_stack sub-call failed: {exc}")
 
-        # ── validate required keys ───────────────────────────────────────────────
-        required_keys = {
-            "tech_stack",
-            "system_components",
-            "api_contracts",
-            "database_schema_overview",
-            "data_flow",
-            "deployment_strategy",
-            "security_requirements",
-        }
-        missing = required_keys - data.keys()
-        if missing:
-            msg = f"LLM response is missing required architecture keys: {missing}"
-            logger.error("[ArchitectureAgent] %s", msg)
-            state.log_error(self.name, msg)
-            return state
+    def _call_system_components(self, srs_text: str,
+                                results: dict, lock: Lock, state: ProjectState) -> None:
+        try:
+            from agents.schemas.architecture import SystemComponentsSchema
+            raw = self._call_with_system(SYSTEM_COMPONENTS_SYSTEM, srs_text + "\n```json\n")
+            data = self.extract_json_and_validate(raw, SystemComponentsSchema)
+            with lock:
+                results["system_components"] = data.get("system_components", [])
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ system_components complete")
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] system_components failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"system_components sub-call failed: {exc}")
 
-        # ── re-resolve stack to guard against LLM drift ─────────────────────────
-        # The LLM might still hallucinate its own tech choices despite the prompt;
-        # we overwrite the returned tech_stack with the authoritatively resolved one.
+    def _call_db_schema(self, srs_text: str,
+                        results: dict, lock: Lock, state: ProjectState) -> None:
+        try:
+            from agents.schemas.architecture import DbSchemaOverviewSchema
+            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n")
+            data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema)
+            with lock:
+                results["database_schema_overview"] = data.get("database_schema_overview", "")
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ db_schema_overview complete")
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] db_schema_overview failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"db_schema_overview sub-call failed: {exc}")
+
+    def _call_api_contracts(self, srs_text: str, tech_stack: dict, components: list,
+                            results: dict, lock: Lock, state: ProjectState) -> None:
+        context = (
+            f"## Tech Stack\n{_tech_stack_table(tech_stack)}\n\n"
+            f"## System Components\n" +
+            "\n".join(f"- {c}" for c in components) + "\n\n" +
+            srs_text + "\n```json\n"
+        )
+        try:
+            from agents.schemas.architecture import APIContractsSchema
+            raw = self._call_with_system(API_CONTRACTS_SYSTEM, context)
+            data = self.extract_json_and_validate(raw, APIContractsSchema)
+            with lock:
+                results["api_contracts"] = data.get("api_contracts", [])
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ api_contracts complete")
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] api_contracts failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"api_contracts sub-call failed: {exc}")
+
+    def _call_security(self, srs_text: str, tech_stack: dict,
+                       results: dict, lock: Lock, state: ProjectState) -> None:
+        context = f"## Tech Stack\n{_tech_stack_table(tech_stack)}\n\n{srs_text}\n```json\n"
+        try:
+            from agents.schemas.architecture import SecurityRequirementsSchema
+            raw = self._call_with_system(SECURITY_SYSTEM, context)
+            data = self.extract_json_and_validate(raw, SecurityRequirementsSchema)
+            with lock:
+                results["security_requirements"] = data.get("security_requirements", [])
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ security_requirements complete")
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] security_requirements failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"security_requirements sub-call failed: {exc}")
+
+    def _call_data_flow(self, srs_text: str, components: list, contracts: list,
+                        results: dict, lock: Lock, state: ProjectState) -> None:
+        contracts_summary = "\n".join(
+            f"- {c.get('method','?')} {c.get('path','?')} — {c.get('description','')}"
+            if isinstance(c, dict) else f"- {c}"
+            for c in contracts[:30]
+        ) or "(none)"
+        context = (
+            f"## System Components\n" +
+            "\n".join(f"- {c}" for c in components) + "\n\n" +
+            f"## API Contracts (summary)\n{contracts_summary}\n\n" +
+            srs_text + "\n```json\n"
+        )
+        try:
+            from agents.schemas.architecture import DataFlowSchema
+            raw = self._call_with_system(DATA_FLOW_SYSTEM, context)
+            data = self.extract_json_and_validate(raw, DataFlowSchema)
+            with lock:
+                results["data_flow"] = data.get("data_flow", "")
+                state.metrics.total_llm_calls += 1
+            logger.info("[ArchitectureAgent] ✓ data_flow complete")
+        except Exception as exc:
+            logger.error("[ArchitectureAgent] data_flow failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"data_flow sub-call failed: {exc}")
+
+    # ── Main execution ───────────────────────────────────────────────────────
+    def run(self, state: ProjectState) -> ProjectState:  # type: ignore[override]
+        state.mark_agent_start(self.name)
+        t0 = time.perf_counter()
+
+        # Resolve tech stack deterministically (no LLM needed)
         authoritative_stack = TechStackResolver.resolve(state)
-        merged_stack = {**data.get("tech_stack", {}), **authoritative_stack}
+        stack_table = _tech_stack_table(authoritative_stack)
+        srs_text = _srs_block(state.requirements)
 
-        # ── fold security_requirements into deployment_strategy ──────────────────
-        # ArchData has no dedicated security field; append it as a labelled block
-        # so the Security and DevOps agents can parse it from state later.
+        logger.info("[ArchitectureAgent] resolved tech stack: %s", authoritative_stack)
+
+        results: dict[str, Any] = {}
+        state_lock = Lock()
+
+        # ── ROUND 1: tech_stack, system_components, db_schema (parallel) ─────
+        logger.info("[ArchitectureAgent] ── Round 1/3 (3 parallel calls) ──")
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
+            futures: list[Future] = [
+                pool.submit(self._call_tech_stack, srs_text, stack_table,
+                            results, state_lock, state),
+                pool.submit(self._call_system_components, srs_text,
+                            results, state_lock, state),
+                pool.submit(self._call_db_schema, srs_text,
+                            results, state_lock, state),
+            ]
+            for f in futures:
+                f.result()
+
+        # Merge authoritative stack over LLM-returned stack
+        merged_stack = {**results.get("tech_stack", {}), **authoritative_stack}
+        results["tech_stack"] = merged_stack
+
+        # ── ROUND 2: api_contracts, security_requirements (parallel) ─────────
+        logger.info("[ArchitectureAgent] ── Round 2/3 (2 parallel calls) ──")
+        time.sleep(1)  # small delay between rounds to respect rate limits
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
+            futures = [
+                pool.submit(self._call_api_contracts, srs_text,
+                            merged_stack,
+                            results.get("system_components", []),
+                            results, state_lock, state),
+                pool.submit(self._call_security, srs_text,
+                            merged_stack,
+                            results, state_lock, state),
+            ]
+            for f in futures:
+                f.result()
+
+        # ── ROUND 3: data_flow (single call) ────────────────────────────────
+        logger.info("[ArchitectureAgent] ── Round 3/3 (1 call) ──")
+        time.sleep(1)
+        self._call_data_flow(
+            srs_text,
+            results.get("system_components", []),
+            results.get("api_contracts", []),
+            results, state_lock, state,
+        )
+
+        # ── Assemble ArchData ────────────────────────────────────────────────
         security_block = "\n\n## Security Requirements\n" + "\n".join(
-            f"  - {r}" for r in _as_list(data.get("security_requirements", []))
+            f"  - {r}" for r in _as_list(results.get("security_requirements", []))
         )
 
         state.architecture = ArchData(
             tech_stack               = merged_stack,
-            system_components        = _as_list(data["system_components"]),
-            api_contracts            = _validated_contracts(data["api_contracts"]),
-            database_schema_overview = str(data["database_schema_overview"]).strip(),
-            data_flow                = str(data["data_flow"]).strip(),
-            deployment_strategy      = str(data["deployment_strategy"]).strip()
-                                       + security_block,
+            system_components        = _as_list(results.get("system_components", [])),
+            api_contracts            = _validated_contracts(results.get("api_contracts", [])),
+            database_schema_overview = str(results.get("database_schema_overview", "")).strip(),
+            data_flow                = str(results.get("data_flow", "")).strip(),
+            deployment_strategy      = security_block,
             diagrams                 = [],
         )
 
+        duration = time.perf_counter() - t0
+        state.metrics.agent_durations[self.name] = round(duration, 3)
         logger.info(
-            "[ArchitectureAgent] architecture complete — %d components, %d endpoints.",
+            "[ArchitectureAgent] architecture complete in %.2fs — "
+            "%d components, %d endpoints.",
+            duration,
             len(state.architecture.system_components),
             len(state.architecture.api_contracts),
         )
@@ -475,41 +610,6 @@ if __name__ == "__main__":
     assert contracts[0].response_body == {"token": "str"},      "FAIL: response_body wrong"
     assert contracts[1].request_body == {},                     "FAIL: missing request_body should default to {}"
     print("[PASS] _validated_contracts — 2 valid APIContract objects, bad items dropped")
-
-    # ── _parse_response: happy path ─────────────────────────────────────────────
-    good_arch = json.dumps({
-        "tech_stack":               {"backend": "FastAPI", "frontend": "React"},
-        "system_components":        ["API Server", "Frontend SPA", "PostgreSQL DB"],
-        "api_contracts":            [
-            {"method": "GET", "path": "/health", "auth_required": False,
-             "description": "Health check", "request_body": {}, "response_body": {"status": "str"}},
-        ],
-        "database_schema_overview": "User -> Post -> Comment",
-        "data_flow":                "Client -> API -> DB",
-        "deployment_strategy":      "Docker Compose",
-        "security_requirements":    ["JWT auth", "HTTPS only"],
-    })
-
-    agent = ArchitectureAgent.__new__(ArchitectureAgent)
-    state2 = ProjectState(project_id="t2", project_name="t2")
-    state2.requirements = SRSData(
-        raw_prompt="Build a blog.", functional_requirements=["Users can post"],
-        non_functional_requirements=[], constraints=[], assumptions=[],
-        out_of_scope=[], is_complete=True,
-    )
-    state2 = agent._parse_response(state2, f"```json\n{good_arch}\n```")
-
-    assert len(state2.architecture.system_components) == 3
-    assert len(state2.architecture.api_contracts) == 1
-    assert "Security Requirements" in state2.architecture.deployment_strategy
-    print("[PASS] _parse_response — happy path: arch complete, security block appended")
-
-    # ── _parse_response: missing keys ───────────────────────────────────────────
-    bad_arch = json.dumps({"tech_stack": {}, "system_components": []})
-    state3 = ProjectState(project_id="t3", project_name="t3")
-    state3 = agent._parse_response(state3, bad_arch)
-    assert len(state3.errors) > 0, "FAIL: missing keys should log error"
-    print("[PASS] _parse_response — missing keys: error logged, state unchanged")
 
     print("\n" + "=" * 60)
     print("All ArchitectureAgent smoke-tests PASSED")
