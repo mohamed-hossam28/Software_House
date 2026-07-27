@@ -44,9 +44,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 except ImportError:
-    from base import BaseAgent
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 
 from core.state import (
     ProjectState,
@@ -189,15 +189,14 @@ def resolve_db_stages(tasks: list[Task]) -> list[list[Task]]:
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
-def _fmt_manifest_context(manifest: CodeManifest, skip_path: str) -> str:
+def _fmt_manifest_context(manifest: CodeManifest, skip_path: str, task: Task | None = None) -> str:
+    dep_files = filter_manifest_by_dependencies(manifest, skip_path, task)
     entries = []
-    for path, fm in manifest.files.items():
-        if path == skip_path:
-            continue
+    for path, fm in dep_files.items():
         status = "written" if fm.written else "pending"
         exports = ", ".join(fm.exports) or "(none)"
         entries.append(f"- `{path}` ({status})\n  Purpose: {fm.purpose}\n  Exports: {exports}")
-    return "\n\n".join(entries) or "No other files in manifest."
+    return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
 def _build_file_prompt(
@@ -223,7 +222,20 @@ def _build_file_prompt(
             written_tables.append(f"- `{path}` exports: {', '.join(m.exports) or '(none)'}")
     written_str = "\n".join(written_tables) or "None yet."
 
-    manifest_ctx = _fmt_manifest_context(manifest, filepath)
+    manifest_ctx = _fmt_manifest_context(manifest, filepath, task)
+
+    # Filter API contracts for DB context (e.g., table schemas matching API endpoints)
+    raw_contracts = getattr(arch, 'api_contracts', []) or []
+    rel_contracts = filter_api_contracts_by_relevance(
+        raw_contracts,
+        filepath=filepath,
+        purpose=purpose,
+        task_title=task.title if task else "",
+    )
+    contracts_lines = []
+    for c in rel_contracts:
+        contracts_lines.append(f"- {c.method} {c.path}: {c.description}")
+    contracts_str = "\n".join(contracts_lines) if contracts_lines else "No relevant API contracts."
 
     depends_str = ", ".join(task.depends_on) if task.depends_on else "(none)"
 
@@ -244,10 +256,13 @@ def _build_file_prompt(
 ## Architecture — Data Flow (for index hints)
 {getattr(arch, 'data_flow', 'No data flow information provided.')}
 
+## Relevant API Contracts
+{contracts_str}
+
 ## Already Written Database Files (available for FK references)
 {written_str}
 
-## Full Project Code Manifest (other files)
+## Project Code Manifest (Dependencies)
 {manifest_ctx}
 
 ---

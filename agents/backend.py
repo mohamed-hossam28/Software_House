@@ -32,10 +32,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 
 from core.state import (
     ProjectState,
@@ -136,17 +136,18 @@ def _build_file_prompt(
     filepath: str,
     manifest: CodeManifest,
     arch: Any,
+    task: Task | None = None,
 ) -> str:
     """Builds a highly descriptive prompt for the LLM to implement a single backend file."""
     file_manifest = manifest.files.get(filepath)
     if not file_manifest:
         raise ValueError(f"File {filepath} not found in manifest.")
         
-    # Format other files in the manifest so the model knows what exports exist
+    # 1. Filter manifest to only actual depends_on files
+    dep_files = filter_manifest_by_dependencies(manifest, filepath, task)
+
     manifest_entries = []
-    for path, fm in manifest.files.items():
-        if path == filepath:
-            continue
+    for path, fm in dep_files.items():
         status = "written" if fm.written else "pending"
         exports_str = ", ".join(fm.exports) or "(none)"
         manifest_entries.append(
@@ -154,11 +155,11 @@ def _build_file_prompt(
             f"  Purpose: {fm.purpose}\n"
             f"  Exports: {exports_str}"
         )
-    manifest_str = "\n".join(manifest_entries) or "No other files in manifest."
+    manifest_str = "\n".join(manifest_entries) or "No relevant dependency files in manifest."
 
     # Format details of already written files
     written_summaries = []
-    for path, fm in manifest.files.items():
+    for path, fm in dep_files.items():
         if not fm.written:
             continue
         summaries = []
@@ -172,14 +173,21 @@ def _build_file_prompt(
         written_summaries.append(
             f"File `{path}`:\n" + ("\n".join(summaries) or "    (No class/function details)")
         )
-    written_str = "\n\n".join(written_summaries) or "No files have been written yet."
+    written_str = "\n\n".join(written_summaries) or "No relevant dependent modules written yet."
 
-    # Format API contracts
+    # 2. Filter API contracts to only relevant endpoints
     contracts_str = ""
-    if hasattr(arch, 'api_contracts') and arch.api_contracts:
+    raw_contracts = getattr(arch, 'api_contracts', []) or []
+    rel_contracts = filter_api_contracts_by_relevance(
+        raw_contracts,
+        filepath=filepath,
+        purpose=file_manifest.purpose,
+        task_title=task.title if task else "",
+    )
+    if rel_contracts:
         lines = []
-        for c in arch.api_contracts:
-            lock = "🔒" if c.auth_required else "🔓"
+        for c in rel_contracts:
+            lock = "🔒" if getattr(c, 'auth_required', False) else "🔓"
             lines.append(
                 f"- {lock} {c.method} {c.path}\n"
                 f"  Description: {c.description}\n"
@@ -188,7 +196,7 @@ def _build_file_prompt(
             )
         contracts_str = "\n".join(lines)
     else:
-        contracts_str = "No API contracts specified."
+        contracts_str = "No relevant API contracts specified."
 
     # Tech stack
     tech_stack_str = ""
@@ -307,7 +315,7 @@ class BackendAgent(BaseAgent):
 
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
         with lock:
-            user_prompt = _build_file_prompt(filepath, manifest, state.architecture)
+            user_prompt = _build_file_prompt(filepath, manifest, state.architecture, task=task)
             backend_tech = "FastAPI (Python 3.12)"
             if hasattr(state.architecture, 'tech_stack') and state.architecture.tech_stack:
                 backend_tech = state.architecture.tech_stack.get("backend", backend_tech)

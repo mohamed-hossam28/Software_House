@@ -31,9 +31,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 except ImportError:
-    from base import BaseAgent
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
 
 from core.state import (
     ProjectState,
@@ -134,11 +134,22 @@ def resolve_frontend_stages(tasks: list[Task]) -> list[list[Task]]:
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  Prompt builder                                                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-def _fmt_contracts(contracts: list[APIContract]) -> str:
-    if not contracts:
+def _fmt_contracts(
+    contracts: list[APIContract],
+    filepath: str = "",
+    purpose: str = "",
+    task_title: str = "",
+) -> str:
+    rel_contracts = filter_api_contracts_by_relevance(
+        contracts,
+        filepath=filepath,
+        purpose=purpose,
+        task_title=task_title,
+    )
+    if not rel_contracts:
         return "  (none)"
     lines = []
-    for c in contracts:
+    for c in rel_contracts:
         lock = "🔒" if c.auth_required else "🔓"
         lines.append(
             f"  {lock} {c.method:7} {c.path}\n"
@@ -149,11 +160,10 @@ def _fmt_contracts(contracts: list[APIContract]) -> str:
     return "\n".join(lines)
 
 
-def _fmt_manifest(manifest: CodeManifest, skip_path: str) -> str:
+def _fmt_manifest(manifest: CodeManifest, skip_path: str, task: Task | None = None) -> str:
+    dep_files = filter_manifest_by_dependencies(manifest, skip_path, task)
     entries = []
-    for path, fm in manifest.files.items():
-        if path == skip_path:
-            continue
+    for path, fm in dep_files.items():
         status = "written" if fm.written else "pending"
         exports = ", ".join(fm.exports) or "(none)"
         entry = [f"- `{path}` ({status})\n  Purpose: {fm.purpose}\n  Exports: {exports}"]
@@ -165,7 +175,7 @@ def _fmt_manifest(manifest: CodeManifest, skip_path: str) -> str:
                 args = ", ".join(f"{a.name}: {a.type}" for a in fn.arguments)
                 entry.append(f"    function {fn.name}({args}): {fn.docstring}")
         entries.append("\n".join(entry))
-    return "\n\n".join(entries) or "No other files in manifest."
+    return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
 def _build_file_prompt(
@@ -173,14 +183,20 @@ def _build_file_prompt(
     manifest: CodeManifest,
     arch: Any,
     frontend_tech: str,
+    task: Task | None = None,
 ) -> str:
     fm = manifest.files.get(filepath)
     if not fm:
         raise ValueError(f"File '{filepath}' not found in CodeManifest.")
 
     tech_table = "\n".join(f"  {k}: {v}" for k, v in arch.tech_stack.items()) if arch.tech_stack else "  (none)"
-    contracts  = _fmt_contracts(arch.api_contracts)
-    manifest_s = _fmt_manifest(manifest, filepath)
+    contracts  = _fmt_contracts(
+        arch.api_contracts or [],
+        filepath=filepath,
+        purpose=fm.purpose,
+        task_title=task.title if task else "",
+    )
+    manifest_s = _fmt_manifest(manifest, filepath, task)
     is_style   = any(filepath.endswith(ext) for ext in (".css", ".scss", ".sass", ".less"))
 
     style_note = ""
@@ -300,7 +316,7 @@ class FrontendAgent(BaseAgent):
             )
             sys_prompt  = _build_system_prompt(frontend_tech)
             user_prompt = _build_file_prompt(
-                filepath, state.code_manifest, state.architecture, frontend_tech
+                filepath, state.code_manifest, state.architecture, frontend_tech, task=task
             )
 
         # LLM call (outside lock — blocking I/O)

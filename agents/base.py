@@ -11,6 +11,8 @@ from providers.llm.llmFactory import LLMFactory as llmFactory
 
 from core.state import ProjectState
 import os
+from difflib import SequenceMatcher
+
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,82 @@ DEFAULT_MAX_TOKENS = settings.default_max_tokens or 8192
 DEFAULT_RETRIES    = settings.default_retries or 3
 DEFAULT_BACKOFF    = settings.default_backoff or 2.0 
 
+####################Filters####################
+
+def filter_manifest_by_dependencies(
+    manifest: Any,
+    filepath: str,
+    task: Any = None,
+) -> dict[str, Any]:
+    """
+    Filter CodeManifest to only include files that the given file/task actually depends on.
+    """
+    if not hasattr(manifest, "files") or not manifest.files:
+        return {}
+
+    fm = manifest.files.get(filepath)
+    if not fm:
+        return {}
+
+    dep_task_ids = set(task.depends_on) if (task and hasattr(task, "depends_on") and task.depends_on) else set()
+
+    filtered: dict[str, Any] = {}
+
+    if dep_task_ids:
+        for path, file_m in manifest.files.items():
+            if path == filepath:
+                continue
+            if getattr(file_m, "task_id", None) in dep_task_ids or path in dep_task_ids:
+                filtered[path] = file_m
+
+    if not filtered:
+        target_token = os.path.basename(filepath).split('.')[0].lower()
+        for path, file_m in manifest.files.items():
+            if path == filepath:
+                continue
+            path_token = os.path.basename(path).split('.')[0].lower()
+            if getattr(file_m, "written", False) or (path_token and (path_token in target_token or target_token in path_token)):
+                filtered[path] = file_m
+
+    return filtered
+
+
+def filter_api_contracts_by_relevance(
+    contracts: list[Any],
+    filepath: str,
+    purpose: str = "",
+    task_title: str = "",
+    top_k: int = 5,
+) -> list[Any]:
+    """Filter and rank API contracts by relevance score."""
+    
+    if not contracts:
+        return []
+    
+    if len(contracts) <= top_k:
+        return contracts
+    
+    search_text = f"{filepath} {purpose} {task_title}".lower()
+    
+    def score_contract(contract: Any) -> float:
+        if isinstance(contract, dict):
+            c_text = f"{contract.get('path', '')} {contract.get('description', '')}".lower()
+        else:
+            c_text = f"{getattr(contract, 'path', '')} {getattr(contract, 'description', '')}".lower()
+        
+        # Use sequence matching for fuzzy similarity
+        return SequenceMatcher(None, search_text, c_text).ratio()
+    
+    # Sort by score descending
+    scored = sorted(contracts, key=score_contract, reverse=True)
+    
+    # Return top K with score > threshold
+    threshold = 0.2
+    filtered = [c for c in scored if score_contract(c) >= threshold]
+    
+    return filtered[:top_k] if filtered else scored[:top_k]
+
+####################BaseAgent##########################
 class BaseAgent(ABC):
     def __init__(
         self,
