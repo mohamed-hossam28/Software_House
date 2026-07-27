@@ -69,6 +69,13 @@ def pick_latest_agent(current: str, update: str) -> str:
     return update if update else current
 
 
+def merge_completed_task_ids(a: Any, b: Any) -> set[str]:
+    """Merge set of completed task IDs across parallel node updates."""
+    set_a = set(a) if isinstance(a, (set, list, tuple)) else set()
+    set_b = set(b) if isinstance(b, (set, list, tuple)) else set()
+    return set_a | set_b
+
+
 
 
 ################ Enum Values######################################################################  
@@ -329,11 +336,11 @@ class ProjectState(BaseModel):
     # ── Supporting layers (parallel-safe via reducers) ──────────────────────
     artifacts: dict[str, str] = Field(default_factory=dict)        # label -> filepath
 
-    # Annotated + reducer: parallel nodes' metrics/errors/current_agent are merged, not overwritten
     metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
     memory_refs: MemoryPointers = Field(default_factory=MemoryPointers)
 
-    # ── Error tracking (parallel-safe via reducer) ─────────────────────────
+    # ── Error tracking & completed tasks (parallel-safe via reducers) ───────
+    completed_task_ids: Annotated[set[str], merge_completed_task_ids] = Field(default_factory=set)
     errors: Annotated[list[dict[str, str]], merge_errors] = Field(default_factory=list)     # [{agent, message, ts}]
     current_agent: Annotated[str, pick_latest_agent] = ""
 

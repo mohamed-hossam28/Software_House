@@ -439,7 +439,7 @@ class DatabaseAgent(BaseAgent):
         with lock:
             state.generated_code.database[filepath] = migration_code
             state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
-            task.status = "done"
+            state.completed_task_ids.add(task.id)
             state.metrics.total_tokens_used += 0  # tokens tracked in _call_with_system
             state.metrics.total_llm_calls += 1
 

@@ -377,7 +377,7 @@ class BackendAgent(BaseAgent):
         with lock:
             state.generated_code.backend[filepath] = code
             state.code_manifest.mark_written(filepath, classes, functions)
-            task.status = "done"
+            state.completed_task_ids.add(task.id)
 
         logger.info("[BackendAgent] Successfully wrote and summarized %s", filepath)
 

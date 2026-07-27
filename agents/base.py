@@ -174,6 +174,14 @@ class BaseAgent(ABC):
                     diff["current_agent"] = after_dict["current_agent"]
                 continue
 
+            if key == "completed_task_ids":
+                b_ids = set(before_dict.get("completed_task_ids") or [])
+                a_ids = set(after_dict.get("completed_task_ids") or [])
+                new_ids = a_ids - b_ids
+                if new_ids:
+                    diff["completed_task_ids"] = list(new_ids)
+                continue
+
             if before_dict[key] != after_dict[key]:
                 diff[key] = after_dict[key]
 

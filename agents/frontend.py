@@ -363,7 +363,7 @@ class FrontendAgent(BaseAgent):
         with lock:
             state.generated_code.frontend[filepath] = code
             state.code_manifest.mark_written(filepath, classes, functions)
-            task.status = "done"
+            state.completed_task_ids.add(task.id)
 
         logger.info("[FrontendAgent] ✓ %s", filepath)
 
