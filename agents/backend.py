@@ -234,10 +234,15 @@ Respond with a single valid JSON object containing "code", "classes", and "funct
     return user_prompt
 
 
+OUTPUT_DIR = "output"
+
 def write_code_to_disk(filepath: str, code: str) -> None:
-    """Safely writes the generated code to the project directory."""
+    """Safely writes the generated code to the project output directory."""
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    abs_path = os.path.join(root_dir, filepath)
+    rel = filepath.lstrip("/").lstrip("\\")
+    if not rel.startswith(OUTPUT_DIR + "/") and not rel.startswith(OUTPUT_DIR + "\\") and rel != OUTPUT_DIR:
+        rel = os.path.join(OUTPUT_DIR, rel)
+    abs_path = os.path.join(root_dir, rel)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(code)
@@ -255,7 +260,7 @@ class BackendAgent(BaseAgent):
     def system_prompt(self) -> str:
         return "You are an expert backend engineer."
 
-    def _call_with_system(self, system: str, user: str) -> str:
+    def _call_with_system(self, system: str, user: str, agent_name: str = "backend") -> str:
         """
         Variant of llm_call() that accepts a dedicated system prompt.
         Retries up to self.max_retries with exponential back-off.
@@ -263,12 +268,10 @@ class BackendAgent(BaseAgent):
         """
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.provider.complete(
+                response = self.llm_call(
+                    prompt=user,
                     system_prompt=system,
-                    user_message=user,
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
+                    agent_name=agent_name,
                 )
                 return response.text
             except Exception as exc:
@@ -312,7 +315,7 @@ class BackendAgent(BaseAgent):
 
         # Call the LLM
         try:
-            raw_response = self._call_with_system(sys_prompt, user_prompt)
+            raw_response = self._call_with_system(sys_prompt, user_prompt, agent_name=f"be-{task.id}")
         except Exception as exc:
             logger.error("[BackendAgent] LLM call failed for %s after retries: %s", filepath, exc)
             with lock:
@@ -378,14 +381,16 @@ class BackendAgent(BaseAgent):
 
         logger.info("[BackendAgent] Successfully wrote and summarized %s", filepath)
 
-    def run(self, state: ProjectState) -> ProjectState:  # type: ignore[override]
-        state.mark_agent_start(self.name)
+    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
+        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
+        before = ps.model_copy(deep=True)
+        ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
 
-        be_tasks = state.tasks.by_agent("backend")
+        be_tasks = ps.tasks.by_agent("backend")
         if not be_tasks:
             logger.info("[BackendAgent] No backend tasks to execute.")
-            return state
+            return self._compute_diff(before, ps)
 
         logger.info("[BackendAgent] Sorting and staging %d backend tasks ...", len(be_tasks))
         stages = resolve_backend_stages(be_tasks)
@@ -394,8 +399,6 @@ class BackendAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            # Rate-limit protection: pause between stages so the API isn't
-            # hammered back-to-back.  Skip the delay before the first stage.
             if idx > 0:
                 logger.info("[BackendAgent] Waiting 2s between stages to respect API rate limits ...")
                 time.sleep(2)
@@ -405,30 +408,28 @@ class BackendAgent(BaseAgent):
                 idx + 1, len(stages), len(stage)
             )
 
-            # Cap workers to MAX_PARALLEL_CALLS
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
                 for task in stage:
                     task.status = "in_progress"
                     futures.append(
-                        pool.submit(self._process_task, task, state, state_lock)
+                        pool.submit(self._process_task, task, ps, state_lock)
                     )
 
-                # Wait for all futures in this stage to complete
                 for future in futures:
                     try:
                         future.result()
                     except Exception as exc:
                         logger.error("[BackendAgent] Task execution raised exception: %s", exc)
-                        state.log_error(self.name, f"Task execution error: {exc}")
+                        ps.log_error(self.name, f"Task execution error: {exc}")
 
-            state.metrics.total_llm_calls += len(stage)
+            ps.metrics.total_llm_calls += len(stage)
 
         duration = time.perf_counter() - t0
-        state.metrics.agent_durations[self.name] = round(duration, 3)
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
 
         # Log summary
-        unwritten = state.code_manifest.unwritten()
+        unwritten = ps.code_manifest.unwritten()
         be_unwritten = [m for m in unwritten if m.agent == "backend"]
         logger.info(
             "[BackendAgent] Done in %.2fs. Written: %d backend files. Unwritten remaining: %d.",
@@ -436,7 +437,7 @@ class BackendAgent(BaseAgent):
             len(be_tasks) - len(be_unwritten),
             len(be_unwritten)
         )
-        return state
+        return self._compute_diff(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

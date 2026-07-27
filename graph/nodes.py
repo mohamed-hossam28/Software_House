@@ -24,11 +24,82 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────────
+
+def _state_from_dict(state: dict | ProjectState) -> ProjectState:
+    """Reconstruct a ProjectState from a graph state dict or return as-is if already ProjectState."""
+    if isinstance(state, ProjectState):
+        return state
+    return ProjectState(**state)
+
+
+def _diff(before: ProjectState, after: ProjectState) -> dict:
+    """
+    Compare two ProjectState snapshots and return only the fields that changed.
+
+    This is the core of the diff-based refactoring: each node returns only
+    the keys it actually modified, so LangGraph never sees conflicting
+    values for the same key from parallel nodes.
+
+    For Annotated/reducer fields (metrics, errors, current_agent), we return
+    only the *delta* so the reducer can merge correctly:
+      - metrics: return a PerformanceMetrics with only the NEW counts/durations
+      - errors: return only the NEW error entries (appended by the agent)
+      - current_agent: return the new value (pick_latest_agent reducer handles it)
+    """
+    before_dict = before.model_dump(mode="json")
+    after_dict = after.model_dump(mode="json")
+
+    diff = {}
+    for key in after_dict:
+        if key == "metrics":
+            # Return the delta so the merge_performance_metrics reducer sums correctly
+            before_m = before_dict["metrics"]
+            after_m = after_dict["metrics"]
+            delta_tokens = after_m["total_tokens_used"] - before_m["total_tokens_used"]
+            delta_calls = after_m["total_llm_calls"] - before_m["total_llm_calls"]
+            # New or changed durations only
+            new_durations = {
+                k: v for k, v in after_m["agent_durations"].items()
+                if before_m["agent_durations"].get(k) != v
+            }
+            if delta_tokens or delta_calls or new_durations:
+                from core.state import PerformanceMetrics
+                diff["metrics"] = PerformanceMetrics(
+                    total_tokens_used=delta_tokens,
+                    total_llm_calls=delta_calls,
+                    agent_durations=new_durations,
+                )
+            continue
+
+        if key == "errors":
+            # Return only NEW errors so the merge_errors reducer appends them
+            new_errors = after_dict["errors"][len(before_dict["errors"]):]
+            if new_errors:
+                diff["errors"] = new_errors
+            continue
+
+        if key == "current_agent":
+            if after_dict["current_agent"] != before_dict["current_agent"]:
+                diff["current_agent"] = after_dict["current_agent"]
+            continue
+
+        # For all other fields, include only if changed
+        if before_dict[key] != after_dict[key]:
+            diff[key] = after_dict[key]
+
+    return diff
+
+
 # ── Node Definitions ─────────────────────────────────────────────────────────
 
-def requirements_node(state: ProjectState) -> ProjectState:
+# ── Node Definitions ─────────────────────────────────────────────────────────
+
+def requirements_node(state: dict) -> dict:
     """
     Requirements node: runs the RequirementsAgent to generate the SRS.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running RequirementsAgent...")
     agent = RequirementsAgent(
@@ -41,72 +112,74 @@ def requirements_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def human_clarifying_questions_node(state: ProjectState) -> ProjectState:
+def human_clarifying_questions_node(state: dict) -> dict:
     """
     Human-in-the-loop node: handles clarifying questions raised by the RequirementsAgent.
     If running in an interactive terminal, prompts the user via stdin.
     Otherwise, pauses execution and waits for external input/resolution.
+    Returns only the fields that changed.
     """
-    if not state.hitl or state.hitl.is_resolved:
-        return state
+    ps = _state_from_dict(state)
 
-    state.clarfication_rounds += 1
+    if not ps.hitl or ps.hitl.is_resolved:
+        return {}
+
+    before = ps.model_copy(deep=True)
+
+    ps.clarfication_rounds += 1
 
     print("\n" + "=" * 60)
-    print(f"HUMAN INPUT REQUIRED (Agent: {state.hitl.raised_by})")
-    print(f"Reason: {state.hitl.reason}")
+    print(f"HUMAN INPUT REQUIRED (Agent: {ps.hitl.raised_by})")
+    print(f"Reason: {ps.hitl.reason}")
     print("=" * 60)
 
     # Check if we are in an interactive console
     if sys.stdin.isatty():
         answers = []
-        for idx, q in enumerate(state.hitl.questions):
-            print(f"\n[Question {idx + 1}/{len(state.hitl.questions)}]: {q}")
+        for idx, q in enumerate(ps.hitl.questions):
+            print(f"\n[Question {idx + 1}/{len(ps.hitl.questions)}]: {q}")
             ans = input("Answer: ").strip()
             while not ans:
                 ans = input("Answer cannot be empty. Please enter a valid response: ").strip()
             answers.append(ans)
 
-        state.resume(answers)
+        ps.resume(answers)
 
         # Append Q&A context to the requirements raw prompt for the agent's re-run
         q_a_block = "\n\n## Clarifying Q&A:\n"
-        for q, a in zip(state.hitl.questions, answers):
+        for q, a in zip(ps.hitl.questions, answers):
             q_a_block += f"- **Question**: {q}\n  **Answer**: {a}\n"
-        state.requirements.raw_prompt += q_a_block
+        ps.requirements.raw_prompt += q_a_block
 
         print("\n" + "=" * 60)
         print("Answers successfully recorded. Resuming graph execution...")
         print("=" * 60 + "\n")
     else:
         logger.warning("[GraphNode] Non-interactive environment detected. Graph execution paused.")
-        # If mock answers environment variable is present, resolve automatically (useful for testing)
         mock_answers_env = os.getenv("MOCK_HITL_ANSWERS")
         if mock_answers_env:
             try:
                 answers = json.loads(mock_answers_env)
-                state.resume(answers)
+                ps.resume(answers)
                 logger.info("[GraphNode] HITL resolved using MOCK_HITL_ANSWERS env var.")
             except Exception as e:
-                # Fallback to default answers
-                answers = ["Yes, proceed with defaults."] * len(state.hitl.questions)
-                state.resume(answers)
+                answers = ["Yes, proceed with defaults."] * len(ps.hitl.questions)
+                ps.resume(answers)
                 logger.info(f"[GraphNode] HITL resolved using fallback defaults due to error: {e}")
         else:
-            # Under LangGraph, to pause/interrupt execution, we can raise a NodeInterrupt
             try:
                 from langgraph.errors import NodeInterrupt
-                raise NodeInterrupt(f"Awaiting human response for questions: {state.hitl.questions}")
+                raise NodeInterrupt(f"Awaiting human response for questions: {ps.hitl.questions}")
             except ImportError:
-                # If running in a context where NodeInterrupt is not imported, we just log and return
                 logger.info("[GraphNode] Langsmith/Langgraph NodeInterrupt not available. Waiting...")
 
-    return state
+    return _diff(before, ps)
 
 
-def architecture_node(state: ProjectState) -> ProjectState:
+def architecture_node(state: dict) -> dict:
     """
     Architecture node: runs the ArchitectureAgent to generate design specs and API contracts.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running ArchitectureAgent...")
     agent = ArchitectureAgent(
@@ -119,9 +192,10 @@ def architecture_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def planner_node(state: ProjectState) -> ProjectState:
+def planner_node(state: dict) -> dict:
     """
     Planner node: runs the PlannerAgent to decompose the design into prioritized files and tasks.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running PlannerAgent...")
     agent = PlannerAgent(
@@ -134,9 +208,10 @@ def planner_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def database_node(state: ProjectState) -> ProjectState:
+def database_node(state: dict) -> dict:
     """
     Database node: runs the DatabaseAgent to generate SQL and schema structures.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running DatabaseAgent...")
     agent = DatabaseAgent(
@@ -149,9 +224,10 @@ def database_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def backend_node(state: ProjectState) -> ProjectState:
+def backend_node(state: dict) -> dict:
     """
     Backend node: runs the BackendAgent to generate backend endpoint logic.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running BackendAgent...")
     agent = BackendAgent(
@@ -164,9 +240,10 @@ def backend_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def frontend_node(state: ProjectState) -> ProjectState:
+def frontend_node(state: dict) -> dict:
     """
     Frontend node: runs the FrontendAgent to generate user interface components and styling.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running FrontendAgent...")
     agent = FrontendAgent(
@@ -179,9 +256,10 @@ def frontend_node(state: ProjectState) -> ProjectState:
     return agent.run(state)
 
 
-def integration_node(state: ProjectState) -> ProjectState:
+def integration_node(state: dict) -> dict:
     """
     Integration node: runs the IntegrationAgent to cross-verify files, API contracts, and resolve conflicts.
+    Receives full state dict, returns only changed fields as dict.
     """
     logger.info("[GraphNode] Running IntegrationAgent...")
     agent = IntegrationAgent(
@@ -192,5 +270,3 @@ def integration_node(state: ProjectState) -> ProjectState:
         backoff=settings.default_backoff,
     )
     return agent.run(state)
-
-

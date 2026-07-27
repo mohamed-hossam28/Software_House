@@ -297,6 +297,13 @@ def check_type_consistency(field: str, expected_type: str, code: str) -> Optiona
     return None
 
 
+def _normalize_output_path(filepath: str) -> str:
+    rel = filepath.lstrip("/").lstrip("\\")
+    if not rel.startswith("output/") and not rel.startswith("output\\") and rel != "output":
+        return f"output/{rel}"
+    return rel
+
+
 def get_file_code(filepath: str, fm: FileManifest, state: ProjectState) -> str:
     code = ""
     if fm.agent == "backend":
@@ -309,7 +316,7 @@ def get_file_code(filepath: str, fm: FileManifest, state: ProjectState) -> str:
         code = state.generated_code.devops.get(filepath, "")
 
     if not code:
-        abs_path = os.path.join(_root_dir, filepath)
+        abs_path = os.path.join(_root_dir, _normalize_output_path(filepath))
         if os.path.exists(abs_path):
             try:
                 with open(abs_path, "r", encoding="utf-8") as f:
@@ -698,7 +705,7 @@ class IntegrationAgent(BaseAgent):
             fm = state.code_manifest.files.get(filepath)
             agent = fm.agent if fm else ("backend" if "backend" in filepath else "frontend")
 
-            abs_path = os.path.join(_root_dir, filepath)
+            abs_path = os.path.join(_root_dir, _normalize_output_path(filepath))
 
             if action == "create_file":
                 content = fix.get("replacement_content", "")
@@ -776,12 +783,14 @@ class IntegrationAgent(BaseAgent):
 
     # ── Main Execution ────────────────────────────────────────────────────────
 
-    def run(self, state: ProjectState) -> ProjectState:
-        state.mark_agent_start(self.name)
+    def run(self, state: dict | ProjectState) -> dict[str, Any]:
+        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
+        before = ps.model_copy(deep=True)
+        ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
 
         logger.info("[IntegrationAgent] Starting Phase 1 checks…")
-        conflicts = self._run_deterministic_checks(state)
+        conflicts = self._run_deterministic_checks(ps)
 
         if conflicts:
             logger.info("[IntegrationAgent] Phase 1 found %d conflicts. Running Phase 2 LLM call…", len(conflicts))
@@ -789,41 +798,38 @@ class IntegrationAgent(BaseAgent):
 
             if classifications:
                 logger.info("[IntegrationAgent] Applying auto-fixes…")
-                applied = self._apply_fixes(state, classifications, conflicts)
+                applied = self._apply_fixes(ps, classifications, conflicts)
                 if applied:
                     logger.info("[IntegrationAgent] Re-running deterministic checks post-fixes…")
-                    # Clear temp variables
-                    for fm in state.code_manifest.files.values():
+                    for fm in ps.code_manifest.files.values():
                         if hasattr(fm, "_resolved_imports"):
                             delattr(fm, "_resolved_imports")
-                    conflicts = self._run_deterministic_checks(state)
+                    conflicts = self._run_deterministic_checks(ps)
 
-        # Clear temp variables
-        for fm in state.code_manifest.files.values():
+        for fm in ps.code_manifest.files.values():
             if hasattr(fm, "_resolved_imports"):
                 delattr(fm, "_resolved_imports")
 
-        # Set final integration status
         merged = len(conflicts) == 0
         conflict_strings = [
             f"[{c.get('type', 'MISMATCH').upper()}] File: {c.get('filepath')} (task: {c.get('task_id')}) | Expected: {c.get('expected')} | Actual: {c.get('actual')} | Reason: {c.get('reason')}"
             for c in conflicts
         ]
 
-        state.integration = IntegrationStatus(
+        ps.integration = IntegrationStatus(
             merged=merged,
             conflicts=conflict_strings,
-            unified_entry_point="output/frontend/index.html" if "output/frontend/index.html" in state.code_manifest.files else ""
+            unified_entry_point="output/frontend/index.html" if "output/frontend/index.html" in ps.code_manifest.files else ""
         )
 
         duration = time.perf_counter() - t0
-        state.metrics.agent_durations[self.name] = round(duration, 3)
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
 
         logger.info(
             "[IntegrationAgent] Done in %.2fs. Merged: %s. Remaining conflicts: %d.",
             duration, merged, len(conflicts)
         )
-        return state
+        return self._compute_diff(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

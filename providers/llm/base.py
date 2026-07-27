@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 @dataclass
 class LLMResponse:
@@ -30,5 +31,7 @@ class BaseLLMProvider(ABC):
         model:         str,
         max_tokens:    int   = 8192,
         temperature:   float = 0.2,
+        stream:        bool  = False,
+        chunk_callback: Optional[Callable[[str], None]] = None,
     )->LLMResponse:
         pass 

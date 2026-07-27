@@ -339,15 +339,13 @@ class ArchitectureAgent(BaseAgent):
         raise NotImplementedError("_parse_response unused; run() is overridden.")
 
     # ── LLM helper with custom system prompt ─────────────────────────────────
-    def _call_with_system(self, system: str, user: str) -> str:
+    def _call_with_system(self, system: str, user: str, agent_name: str = "") -> str:
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.provider.complete(
+                response = self.llm_call(
+                    prompt=user,
                     system_prompt=system,
-                    user_message=user,
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
+                    agent_name=agent_name or self.name,
                 )
                 return response.text
             except Exception as exc:
@@ -367,7 +365,7 @@ class ArchitectureAgent(BaseAgent):
         prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{srs_text}\n```json\n"
         try:
             from agents.schemas.architecture import TechStackSchema
-            raw = self._call_with_system(TECH_STACK_SYSTEM, prompt)
+            raw = self._call_with_system(TECH_STACK_SYSTEM, prompt, "arch-tech")
             data = self.extract_json_and_validate(raw, TechStackSchema)
             with lock:
                 results["tech_stack"] = data.get("tech_stack", {})
@@ -382,7 +380,7 @@ class ArchitectureAgent(BaseAgent):
                                 results: dict, lock: Lock, state: ProjectState) -> None:
         try:
             from agents.schemas.architecture import SystemComponentsSchema
-            raw = self._call_with_system(SYSTEM_COMPONENTS_SYSTEM, srs_text + "\n```json\n")
+            raw = self._call_with_system(SYSTEM_COMPONENTS_SYSTEM, srs_text + "\n```json\n", "arch-components")
             data = self.extract_json_and_validate(raw, SystemComponentsSchema)
             with lock:
                 results["system_components"] = data.get("system_components", [])
@@ -397,7 +395,7 @@ class ArchitectureAgent(BaseAgent):
                         results: dict, lock: Lock, state: ProjectState) -> None:
         try:
             from agents.schemas.architecture import DbSchemaOverviewSchema
-            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n")
+            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n", "arch-db")
             data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema)
             with lock:
                 results["database_schema_overview"] = data.get("database_schema_overview", "")
@@ -418,7 +416,7 @@ class ArchitectureAgent(BaseAgent):
         )
         try:
             from agents.schemas.architecture import APIContractsSchema
-            raw = self._call_with_system(API_CONTRACTS_SYSTEM, context)
+            raw = self._call_with_system(API_CONTRACTS_SYSTEM, context, "arch-api")
             data = self.extract_json_and_validate(raw, APIContractsSchema)
             with lock:
                 results["api_contracts"] = data.get("api_contracts", [])
@@ -434,7 +432,7 @@ class ArchitectureAgent(BaseAgent):
         context = f"## Tech Stack\n{_tech_stack_table(tech_stack)}\n\n{srs_text}\n```json\n"
         try:
             from agents.schemas.architecture import SecurityRequirementsSchema
-            raw = self._call_with_system(SECURITY_SYSTEM, context)
+            raw = self._call_with_system(SECURITY_SYSTEM, context, "arch-security")
             data = self.extract_json_and_validate(raw, SecurityRequirementsSchema)
             with lock:
                 results["security_requirements"] = data.get("security_requirements", [])
@@ -460,7 +458,7 @@ class ArchitectureAgent(BaseAgent):
         )
         try:
             from agents.schemas.architecture import DataFlowSchema
-            raw = self._call_with_system(DATA_FLOW_SYSTEM, context)
+            raw = self._call_with_system(DATA_FLOW_SYSTEM, context, "arch-dataflow")
             data = self.extract_json_and_validate(raw, DataFlowSchema)
             with lock:
                 results["data_flow"] = data.get("data_flow", "")
@@ -472,14 +470,17 @@ class ArchitectureAgent(BaseAgent):
                 state.log_error(self.name, f"data_flow sub-call failed: {exc}")
 
     # ── Main execution ───────────────────────────────────────────────────────
-    def run(self, state: ProjectState) -> ProjectState:  # type: ignore[override]
-        state.mark_agent_start(self.name)
+    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
+        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
+        before = ps.model_copy(deep=True)
+
+        ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
 
         # Resolve tech stack deterministically (no LLM needed)
-        authoritative_stack = TechStackResolver.resolve(state)
+        authoritative_stack = TechStackResolver.resolve(ps)
         stack_table = _tech_stack_table(authoritative_stack)
-        srs_text = _srs_block(state.requirements)
+        srs_text = _srs_block(ps.requirements)
 
         logger.info("[ArchitectureAgent] resolved tech stack: %s", authoritative_stack)
 
@@ -491,11 +492,11 @@ class ArchitectureAgent(BaseAgent):
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures: list[Future] = [
                 pool.submit(self._call_tech_stack, srs_text, stack_table,
-                            results, state_lock, state),
+                            results, state_lock, ps),
                 pool.submit(self._call_system_components, srs_text,
-                            results, state_lock, state),
+                            results, state_lock, ps),
                 pool.submit(self._call_db_schema, srs_text,
-                            results, state_lock, state),
+                            results, state_lock, ps),
             ]
             for f in futures:
                 f.result()
@@ -512,10 +513,10 @@ class ArchitectureAgent(BaseAgent):
                 pool.submit(self._call_api_contracts, srs_text,
                             merged_stack,
                             results.get("system_components", []),
-                            results, state_lock, state),
+                            results, state_lock, ps),
                 pool.submit(self._call_security, srs_text,
                             merged_stack,
-                            results, state_lock, state),
+                            results, state_lock, ps),
             ]
             for f in futures:
                 f.result()
@@ -527,7 +528,7 @@ class ArchitectureAgent(BaseAgent):
             srs_text,
             results.get("system_components", []),
             results.get("api_contracts", []),
-            results, state_lock, state,
+            results, state_lock, ps,
         )
 
         # ── Assemble ArchData ────────────────────────────────────────────────
@@ -535,7 +536,7 @@ class ArchitectureAgent(BaseAgent):
             f"  - {r}" for r in _as_list(results.get("security_requirements", []))
         )
 
-        state.architecture = ArchData(
+        ps.architecture = ArchData(
             tech_stack               = merged_stack,
             system_components        = _as_list(results.get("system_components", [])),
             api_contracts            = _validated_contracts(results.get("api_contracts", [])),
@@ -546,15 +547,15 @@ class ArchitectureAgent(BaseAgent):
         )
 
         duration = time.perf_counter() - t0
-        state.metrics.agent_durations[self.name] = round(duration, 3)
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
         logger.info(
             "[ArchitectureAgent] architecture complete in %.2fs — "
             "%d components, %d endpoints.",
             duration,
-            len(state.architecture.system_components),
-            len(state.architecture.api_contracts),
+            len(ps.architecture.system_components),
+            len(ps.architecture.api_contracts),
         )
-        return state
+        return self._compute_diff(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

@@ -33,15 +33,21 @@ JSON schema:
 USER_PROMPT_TEMPLATE = """\
 ## User Project Prompt
 {raw_prompt}
- 
+
 ## RAG Context (relevant prior projects / templates)
 {rag_context}
- 
-## Instructions
-Analyze the prompt above and produce the SRS JSON.
-Remember: respond with JSON only.
-```json
 
+## Instructions
+Analyze the project prompt above and produce the complete SRS JSON object.
+Ensure your response includes all required keys:
+- functional_requirements (List of specific user features/actions)
+- non_functional_requirements (List of performance, security, reliability attributes)
+- constraints (List of technical or business limits)
+- assumptions (List of working assumptions)
+- out_of_scope (List of excluded features)
+- clarifying_questions (List of questions ONLY if critical missing details exist; empty list if clear)
+
+Respond strictly with valid JSON only.
 """
  
 

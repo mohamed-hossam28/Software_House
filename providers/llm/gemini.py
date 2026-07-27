@@ -3,6 +3,7 @@ from providers.llm.base import BaseLLMProvider, LLMResponse
 from google import genai 
 # pyrefly: ignore [missing-import]
 from google.genai import types
+from typing import Callable, Optional
 
 class GeminiProvider(BaseLLMProvider):
  
@@ -21,7 +22,10 @@ class GeminiProvider(BaseLLMProvider):
             or os.environ.get("GEMINI_API_KEY") 
             or os.environ.get("gemini_api")
         )
-        self.client = genai.Client(api_key=key)
+        self.client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=180_000),  # 180s in ms
+        )
  
     @property
     def provider_name(self) -> str:
@@ -34,20 +38,44 @@ class GeminiProvider(BaseLLMProvider):
         model:         str   = "gemini-2.0-flash",
         max_tokens:    int   = 8192,
         temperature:   float = 0.2,
+        stream:        bool  = False,
+        chunk_callback: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
  
         actual_model = model
         if actual_model.startswith("gemini/"):
             actual_model = actual_model[len("gemini/"):]
 
+        config = types.GenerateContentConfig(
+            system_instruction = system_prompt,
+            max_output_tokens  = max_tokens,
+            temperature        = temperature,
+        )
+
+        if stream:
+            chunks: list[str] = []
+            for chunk in self.client.models.generate_content_stream(
+                model    = actual_model,
+                contents = user_message,
+                config   = config,
+            ):
+                if chunk.text:
+                    chunks.append(chunk.text)
+                    if chunk_callback:
+                        chunk_callback(chunk.text)
+
+            return LLMResponse(
+                text          = "".join(chunks),
+                input_tokens  = 0,
+                output_tokens = 0,
+                model         = actual_model,
+                provider      = self.provider_name,
+            )
+
         response = self.client.models.generate_content(
             model    = actual_model,
             contents = user_message,
-            config   = types.GenerateContentConfig(
-                system_instruction = system_prompt,
-                max_output_tokens  = max_tokens,
-                temperature        = temperature,
-            ),
+            config   = config,
         )
  
         usage = response.usage_metadata

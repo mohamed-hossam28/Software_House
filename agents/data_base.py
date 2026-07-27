@@ -307,15 +307,13 @@ class DatabaseAgent(BaseAgent):
 
     # ── LLM wrapper ───────────────────────────────────────────────────────────
 
-    def _call_with_system(self, system: str, user: str) -> str:
+    def _call_with_system(self, system: str, user: str, agent_name: str = "database") -> str:
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = self.provider.complete(
+                resp = self.llm_call(
+                    prompt=user,
                     system_prompt=system,
-                    user_message=user,
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
+                    agent_name=agent_name,
                 )
                 return resp.text
             except Exception as exc:
@@ -358,7 +356,7 @@ class DatabaseAgent(BaseAgent):
 
         # LLM call (outside lock — blocking I/O)
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt)
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"db-{task.id}")
         except Exception as exc:
             logger.error("[DBAgent] LLM call failed for %s: %s", filepath, exc)
             with lock:
@@ -449,14 +447,18 @@ class DatabaseAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def run(self, state: ProjectState) -> ProjectState:  # type: ignore[override]
-        state.mark_agent_start(self.name)
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
+        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
+        before = ps.model_copy(deep=True)
+        ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
 
-        db_tasks = state.tasks.by_agent("database")
+        db_tasks = ps.tasks.by_agent("database")
         if not db_tasks:
             logger.info("[DBAgent] No database tasks — nothing to do.")
-            return state
+            return self._compute_diff(before, ps)
 
         logger.info("[DBAgent] Resolving stages for %d database tasks …", len(db_tasks))
         stages = resolve_db_stages(db_tasks)
@@ -478,7 +480,7 @@ class DatabaseAgent(BaseAgent):
                 futures: list[Future] = []
                 for task in stage:
                     task.status = "in_progress"
-                    futures.append(pool.submit(self._process_task, task, state, state_lock))
+                    futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
                 for future in futures:
                     try:
@@ -486,19 +488,19 @@ class DatabaseAgent(BaseAgent):
                     except Exception as exc:
                         logger.error("[DBAgent] Unhandled task exception: %s", exc)
                         with state_lock:
-                            state.log_error(self.name, f"Task exception: {exc}")
+                            ps.log_error(self.name, f"Task exception: {exc}")
 
         duration = time.perf_counter() - t0
-        state.metrics.agent_durations[self.name] = round(duration, 3)
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
 
-        unwritten = [m for m in state.code_manifest.unwritten() if m.agent == "database"]
+        unwritten = [m for m in ps.code_manifest.unwritten() if m.agent == "database"]
         logger.info(
             "[DBAgent] Done in %.2fs. Written: %d  Unwritten: %d.",
             duration,
             len(db_tasks) - len(unwritten),
             len(unwritten),
         )
-        return state
+        return self._compute_diff(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

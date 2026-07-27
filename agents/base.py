@@ -75,30 +75,131 @@ class BaseAgent(ABC):
 
 
     ##LLM CALL
-    def llm_call(self, prompt: str) -> LLMResponse:
+    def llm_call(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        agent_name: Optional[str] = None,
+    ) -> LLMResponse:
+        import sys
+        from threading import Lock
 
-        return self.provider.complete(
-            system_prompt = self.system_prompt,
-            user_message  = prompt,
-            model         = self.model,
-            max_tokens    = self.max_tokens,
-            temperature   = self.temperature,
-        )
+        sys_prompt = system_prompt if system_prompt is not None else self.system_prompt
+        prefix = agent_name if agent_name is not None else self.name
+
+        class LineBufferedPrinter:
+            _print_lock = Lock()
+            def __init__(self, prefix: str):
+                self.prefix = prefix
+                self.buffer = ""
+            def __call__(self, chunk: str):
+                self.buffer += chunk
+                while "\n" in self.buffer:
+                    line, self.buffer = self.buffer.split("\n", 1)
+                    with LineBufferedPrinter._print_lock:
+                        sys.stdout.write(f"[{self.prefix}] {line}\n")
+                        sys.stdout.flush()
+            def flush(self):
+                if self.buffer:
+                    with LineBufferedPrinter._print_lock:
+                        sys.stdout.write(f"[{self.prefix}] {self.buffer}\n")
+                        sys.stdout.flush()
+                    self.buffer = ""
+
+        printer = LineBufferedPrinter(prefix)
+
+        try:
+            response = self.provider.complete(
+                system_prompt = sys_prompt,
+                user_message  = prompt,
+                model         = self.model,
+                max_tokens    = self.max_tokens,
+                temperature   = self.temperature,
+                stream        = True,
+                chunk_callback = printer,
+            )
+        except TypeError as e:
+            if "unexpected keyword argument" in str(e) or "complete() got" in str(e):
+                response = self.provider.complete(
+                    system_prompt = sys_prompt,
+                    user_message  = prompt,
+                    model         = self.model,
+                    max_tokens    = self.max_tokens,
+                    temperature   = self.temperature,
+                )
+            else:
+                raise
+        printer.flush()
+        return response
 
 
-    def run(self,state:ProjectState)->ProjectState:
-        """Run the agent."""
-        state.mark_agent_start(self.name)
-        prompt=self._build_prompt(state)
-        t0=time.perf_counter()
+    @staticmethod
+    def _compute_diff(before: ProjectState, after: ProjectState) -> dict[str, Any]:
+        """
+        Compare two ProjectState snapshots and return only the fields that changed as a dict.
 
-        for attempt in range(1,self.max_retries+1):
+        For Annotated/reducer fields (metrics, errors, current_agent), returns
+        only the delta so LangGraph reducers merge correctly.
+        """
+        from core.state import PerformanceMetrics
+
+        before_dict = before.model_dump(mode="json")
+        after_dict = after.model_dump(mode="json")
+
+        diff: dict[str, Any] = {}
+        for key in after_dict:
+            if key == "metrics":
+                bm = before_dict["metrics"]
+                am = after_dict["metrics"]
+                dt = am["total_tokens_used"] - bm["total_tokens_used"]
+                dc = am["total_llm_calls"] - bm["total_llm_calls"]
+                nd = {k: v for k, v in am["agent_durations"].items()
+                      if bm["agent_durations"].get(k) != v}
+                if dt or dc or nd:
+                    diff["metrics"] = PerformanceMetrics(
+                        total_tokens_used=dt,
+                        total_llm_calls=dc,
+                        agent_durations=nd,
+                    ).model_dump(mode="json")
+                continue
+
+            if key == "errors":
+                new_errors = after_dict["errors"][len(before_dict["errors"]):]
+                if new_errors:
+                    diff["errors"] = new_errors
+                continue
+
+            if key == "current_agent":
+                if after_dict["current_agent"] != before_dict["current_agent"]:
+                    diff["current_agent"] = after_dict["current_agent"]
+                continue
+
+            if before_dict[key] != after_dict[key]:
+                diff[key] = after_dict[key]
+
+        return diff
+
+
+    def run(self, state: dict | ProjectState) -> dict[str, Any]:
+        """
+        Run the agent.
+        Accepts the full state (dict or ProjectState) as input.
+        Returns a dict containing ONLY the changed/wanted fields.
+        """
+        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
+        before = ps.model_copy(deep=True)
+
+        ps.mark_agent_start(self.name)
+        prompt = self._build_prompt(ps)
+        t0 = time.perf_counter()
+
+        for attempt in range(1, self.max_retries + 1):
             try:
-                response =self.llm_call(prompt)
-                state.metrics.total_tokens_used += response.total_tokens
-                state.metrics.total_llm_calls   += 1
- 
-                state = self._parse_response(state, response.text)
+                response = self.llm_call(prompt)
+                ps.metrics.total_tokens_used += response.total_tokens
+                ps.metrics.total_llm_calls   += 1
+
+                ps = self._parse_response(ps, response.text)
                 break
 
             except Exception as exc:
@@ -106,17 +207,16 @@ class BaseAgent(ABC):
                     "[%s] attempt %d/%d failed: %s",
                     self.name, attempt, self.max_retries, exc,
                 )
-                if attempt==self.max_retries:
+                if attempt == self.max_retries:
                     logger.error("[%s] all retries exhausted.", self.name)
-                    state.log_error(self.name,str(exc))
-                    
+                    ps.log_error(self.name, str(exc))
                 else:
-                    time.sleep(self.backoff*attempt)
+                    time.sleep(self.backoff * attempt)
 
         duration = time.perf_counter() - t0
-        state.metrics.agent_durations[self.name] = round(duration, 3)
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
         logger.info("[%s] finished in %.2fs via %s", self.name, duration, self.provider.provider_name)
-        return state
+        return self._compute_diff(before, ps)
 
 
     # ── JSON helpers ──────────────────────────────────────────────────

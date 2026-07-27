@@ -4,12 +4,69 @@ core/state.py
 Single source of truth for the entire pipeline.
 Every agent reads from and writes to a typed subset of ProjectState.
 LangGraph passes this object through every node boundary and checkpoints it automatically.
+
+Parallel-safe design:
+  Each graph node returns ONLY the state keys it changed (a "diff dict").
+  Shared keys (metrics, errors) use custom reducer functions so that
+  LangGraph can merge outputs from parallel nodes without conflicts.
 """
 
 from pydantic import BaseModel, Field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Annotated
 from datetime import datetime
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Reducer functions for parallel-safe state merging
+# ────────────────────────────────────────────────────────────────────────────────
+
+def merge_performance_metrics(
+    current: Any,
+    update: Any,
+) -> Any:
+    """
+    Merge two PerformanceMetrics or dict instances.
+
+    Additive fields (total_tokens_used, total_llm_calls) are summed.
+    agent_durations dicts are merged (update overwrites per-agent key).
+    """
+    def _get_val(obj: Any, key: str, default: Any = 0) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    current_tokens = _get_val(current, "total_tokens_used", 0)
+    update_tokens = _get_val(update, "total_tokens_used", 0)
+
+    current_calls = _get_val(current, "total_llm_calls", 0)
+    update_calls = _get_val(update, "total_llm_calls", 0)
+
+    current_durations = _get_val(current, "agent_durations", {}) or {}
+    update_durations = _get_val(update, "agent_durations", {}) or {}
+
+    res = PerformanceMetrics(
+        total_tokens_used=current_tokens + update_tokens,
+        total_llm_calls=current_calls + update_calls,
+        agent_durations={**current_durations, **update_durations},
+    )
+
+    if isinstance(current, dict) or isinstance(update, dict):
+        return res.model_dump()
+    return res
+
+
+def merge_errors(
+    current: list[dict[str, str]],
+    update: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Append new errors from the update to the current list."""
+    return current + update
+
+
+def pick_latest_agent(current: str, update: str) -> str:
+    """Pick the most recent agent name (last writer wins)."""
+    return update if update else current
 
 
 
@@ -269,14 +326,16 @@ class ProjectState(BaseModel):
     ## human in the loop  
     hitl: Optional[HITLRequest]=None
     
-    # ── Supporting layers ──────────────────────
+    # ── Supporting layers (parallel-safe via reducers) ──────────────────────
     artifacts: dict[str, str] = Field(default_factory=dict)        # label -> filepath
-    metrics: PerformanceMetrics = Field(default_factory=PerformanceMetrics)
+
+    # Annotated + reducer: parallel nodes' metrics/errors/current_agent are merged, not overwritten
+    metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
     memory_refs: MemoryPointers = Field(default_factory=MemoryPointers)
 
-    # ── Error tracking ─────────────────────────
-    errors: list[dict[str, str]] = Field(default_factory=list)     # [{agent, message, ts}]
-    current_agent: str = ""
+    # ── Error tracking (parallel-safe via reducer) ─────────────────────────
+    errors: Annotated[list[dict[str, str]], merge_errors] = Field(default_factory=list)     # [{agent, message, ts}]
+    current_agent: Annotated[str, pick_latest_agent] = ""
 
     # ── Helpers ───────────────────────────────
     def log_error(self, agent: str, message: str) -> None:
@@ -291,7 +350,7 @@ class ProjectState(BaseModel):
         self.metrics.agent_durations.setdefault(agent, 0.0)
  
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump()
+        return self.model_dump(mode="json")
 
     ####################### human in the loop methods ##############################################################
     def pause(self, raised_by: str, questions: list[str], reason: str = "") -> None:

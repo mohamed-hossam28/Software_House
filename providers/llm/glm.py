@@ -1,5 +1,6 @@
 from providers.llm.base import BaseLLMProvider, LLMResponse
 import os
+from typing import Callable, Optional
 
 class GLMProvider(BaseLLMProvider):
     def __init__(self, api_key: str | None = None):
@@ -22,7 +23,7 @@ class GLMProvider(BaseLLMProvider):
         self.client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1",
             api_key=nvidia_key,
-            # timeout=180.0
+            timeout=180.0,
         )
 
     @property
@@ -36,8 +37,38 @@ class GLMProvider(BaseLLMProvider):
         model:         str   = "z-ai/glm-5.2",
         max_tokens:    int   = 8192,
         temperature:   float = 0.2,
+        stream:        bool  = False,
+        chunk_callback: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         
+        if stream:
+            chunks: list[str] = []
+            stream_resp = self.client.chat.completions.create(
+                model       = model,
+                max_tokens  = max_tokens,
+                temperature = temperature,
+                stream      = True,
+                messages    = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+            )
+            for chunk in stream_resp:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    chunks.append(delta.content)
+                    if chunk_callback:
+                        chunk_callback(delta.content)
+
+            full_text = "".join(chunks)
+            return LLMResponse(
+                text          = full_text,
+                input_tokens  = 0,
+                output_tokens = 0,
+                model         = model,
+                provider      = self.provider_name,
+            )
+
         response = self.client.chat.completions.create(
             model       = model,
             max_tokens  = max_tokens,

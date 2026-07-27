@@ -1,6 +1,8 @@
 import os
 import sys
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
 
 # Force workspace root on sys.path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +38,7 @@ workflow.add_node("integration", integration_node)
 # Add Edges
 workflow.add_edge(START, "requirements")
 
-# Route conditionally after requirements node
+# Route conditionally after requirements node (to human if needed, else to architecture)
 workflow.add_conditional_edges(
     "requirements",
     route_after_requirements,
@@ -49,17 +51,21 @@ workflow.add_conditional_edges(
 # Loop back from human clarifying node to requirements for re-evaluation
 workflow.add_edge("human", "requirements")
 
-# Standard linear stages after architecture
+# Architecture routes to planner
 workflow.add_edge("architecture", "planner")
+
+# Planner routes to backend, frontend, and database in parallel
+workflow.add_edge("planner", "backend")
+workflow.add_edge("planner", "frontend")
 workflow.add_edge("planner", "database")
 
-# Sequential execution of engineering and integration
-workflow.add_edge("database", "backend")
-workflow.add_edge("backend", "frontend")
+# Engineering agents merge into integration
+workflow.add_edge("backend", "integration")
 workflow.add_edge("frontend", "integration")
+workflow.add_edge("database", "integration")
+
 workflow.add_edge("integration", END)
 
-from langgraph.checkpoint.memory import MemorySaver
 
 memory = MemorySaver()
 
