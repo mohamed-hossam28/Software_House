@@ -277,18 +277,18 @@ _BASE_SYSTEM = (
 
 # ── Round 1 prompts ──────────────────────────────────────────────────────────
 
-TECH_STACK_SYSTEM = _BASE_SYSTEM + """
-Your task: decide the backend, frontend, database, cache, and infrastructure
-technologies for a project described in the SRS below.
-Return JSON: {"tech_stack": {"<layer>": "<technology + version>", ...}}
-Use ONLY the resolved tech stack provided when available; fill gaps with best choices.
-"""
+CORE_ARCH_SYSTEM = _BASE_SYSTEM + """
+Your tasks for the given software requirement specification (SRS):
+1. Decide the backend, frontend, database, cache, and infrastructure technologies. Use the resolved baseline stack when available; fill gaps with best choices.
+2. List every high-level service/component the system needs (e.g. AuthService, BoardService, NotificationService, APIGateway, etc.). Be exhaustive.
+3. Define security requirements (auth strategy, RBAC roles, data encryption, rate limiting, CORS policy, secrets management).
 
-SYSTEM_COMPONENTS_SYSTEM = _BASE_SYSTEM + """
-Your task: list every high-level service/component the system needs
-(e.g. AuthService, BoardService, NotificationService, APIGateway, etc.).
-Be exhaustive — derive every component the SRS implies.
-Return JSON: {"system_components": ["<ServiceName: one-line description>", ...]}
+Return JSON:
+{
+  "tech_stack": {"<layer>": "<technology + version>", ...},
+  "system_components": ["<ServiceName: one-line description>", ...],
+  "security_requirements": ["<requirement statement>", ...]
+}
 """
 
 DB_SCHEMA_SYSTEM = _BASE_SYSTEM + """
@@ -297,7 +297,7 @@ relationships. NO DDL, NO SQL — just entity names and how they relate.
 Return JSON: {"database_schema_overview": "<multiline string: entity → related entities>"}
 """
 
-# ── Round 2 prompts ──────────────────────────────────────────────────────────
+# ── Round 2 prompt ───────────────────────────────────────────────────────────
 
 API_CONTRACTS_SYSTEM = _BASE_SYSTEM + """
 Your task: list every REST API endpoint the backend must expose.
@@ -311,12 +311,6 @@ Return JSON:
 ]}
 """
 
-SECURITY_SYSTEM = _BASE_SYSTEM + """
-Your task: define security requirements — auth strategy, RBAC roles, data
-encryption, rate limiting, CORS policy, secrets management.
-Return JSON: {"security_requirements": ["<requirement statement>", ...]}
-"""
-
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  ArchitectureAgent                                                          ║
@@ -326,8 +320,9 @@ class ArchitectureAgent(BaseAgent):
     Reads the completed SRS from ProjectState.requirements and writes a fully
     populated ArchData into ProjectState.architecture.
 
-    Executes 5 focused LLM calls across 2 dependency-resolved rounds
-    using ThreadPoolExecutor with a Lock on shared state.
+    Executes 3 focused LLM calls across 2 dependency-resolved rounds:
+      Round 1 (2 parallel calls): Call A (Core Architecture: tech stack + components + security), Call B (DB Schema Overview)
+      Round 2 (1 call): Call C (API Contracts, using output of Round 1)
     """
 
     @property
@@ -363,36 +358,23 @@ class ArchitectureAgent(BaseAgent):
 
     # ── Individual sub-call workers ──────────────────────────────────────────
 
-    def _call_tech_stack(self, srs_text: str, stack_table: str,
-                         results: dict, lock: Lock, state: ProjectState) -> None:
+    def _call_core_architecture(self, srs_text: str, stack_table: str,
+                                 results: dict, lock: Lock, state: ProjectState) -> None:
         prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{srs_text}\n```json\n"
         try:
-            from agents.schemas.architecture import TechStackSchema
-            raw = self._call_with_system(TECH_STACK_SYSTEM, prompt, "arch-tech")
-            data = self.extract_json_and_validate(raw, TechStackSchema)
+            from agents.schemas.architecture import CoreArchitectureSchema
+            raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core")
+            data = self.extract_json_and_validate(raw, CoreArchitectureSchema)
             with lock:
                 results["tech_stack"] = data.get("tech_stack", {})
-                state.metrics.total_llm_calls += 1
-            logger.info("[ArchitectureAgent] ✓ tech_stack complete")
-        except Exception as exc:
-            logger.error("[ArchitectureAgent] tech_stack failed: %s", exc)
-            with lock:
-                state.log_error(self.name, f"tech_stack sub-call failed: {exc}")
-
-    def _call_system_components(self, srs_text: str,
-                                results: dict, lock: Lock, state: ProjectState) -> None:
-        try:
-            from agents.schemas.architecture import SystemComponentsSchema
-            raw = self._call_with_system(SYSTEM_COMPONENTS_SYSTEM, srs_text + "\n```json\n", "arch-components")
-            data = self.extract_json_and_validate(raw, SystemComponentsSchema)
-            with lock:
                 results["system_components"] = data.get("system_components", [])
+                results["security_requirements"] = data.get("security_requirements", [])
                 state.metrics.total_llm_calls += 1
-            logger.info("[ArchitectureAgent] ✓ system_components complete")
+            logger.info("[ArchitectureAgent] ✓ core_architecture complete (tech_stack, system_components, security)")
         except Exception as exc:
-            logger.error("[ArchitectureAgent] system_components failed: %s", exc)
+            logger.error("[ArchitectureAgent] core_architecture failed: %s", exc)
             with lock:
-                state.log_error(self.name, f"system_components sub-call failed: {exc}")
+                state.log_error(self.name, f"core_architecture sub-call failed: {exc}")
 
     def _call_db_schema(self, srs_text: str,
                         results: dict, lock: Lock, state: ProjectState) -> None:
@@ -429,22 +411,6 @@ class ArchitectureAgent(BaseAgent):
             with lock:
                 state.log_error(self.name, f"api_contracts sub-call failed: {exc}")
 
-    def _call_security(self, srs_summary_text: str, tech_stack: dict,
-                       results: dict, lock: Lock, state: ProjectState) -> None:
-        context = f"{srs_summary_text}\n```json\n"
-        try:
-            from agents.schemas.architecture import SecurityRequirementsSchema
-            raw = self._call_with_system(SECURITY_SYSTEM, context, "arch-security")
-            data = self.extract_json_and_validate(raw, SecurityRequirementsSchema)
-            with lock:
-                results["security_requirements"] = data.get("security_requirements", [])
-                state.metrics.total_llm_calls += 1
-            logger.info("[ArchitectureAgent] ✓ security_requirements complete")
-        except Exception as exc:
-            logger.error("[ArchitectureAgent] security_requirements failed: %s", exc)
-            with lock:
-                state.log_error(self.name, f"security_requirements sub-call failed: {exc}")
-
     # ── Main execution ───────────────────────────────────────────────────────
     def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
         ps = state if isinstance(state, ProjectState) else ProjectState(**state)
@@ -463,13 +429,11 @@ class ArchitectureAgent(BaseAgent):
         results: dict[str, Any] = {}
         state_lock = Lock()
 
-        # ── ROUND 1: tech_stack, system_components, db_schema (parallel) ─────
-        logger.info("[ArchitectureAgent] ── Round 1/2 (3 parallel calls) ──")
+        # ── ROUND 1: Call A (Core Arch) + Call B (DB Schema) [Parallel] ───────
+        logger.info("[ArchitectureAgent] ── Round 1/2 (2 parallel calls: Core Arch & DB Schema) ──")
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures: list[Future] = [
-                pool.submit(self._call_tech_stack, srs_text, stack_table,
-                            results, state_lock, ps),
-                pool.submit(self._call_system_components, srs_text,
+                pool.submit(self._call_core_architecture, srs_text, stack_table,
                             results, state_lock, ps),
                 pool.submit(self._call_db_schema, srs_text,
                             results, state_lock, ps),
@@ -483,21 +447,17 @@ class ArchitectureAgent(BaseAgent):
 
         srs_summary_text = _srs_summary_block(ps.requirements, merged_stack)
 
-        # ── ROUND 2: api_contracts, security_requirements (parallel) ─────────
-        logger.info("[ArchitectureAgent] ── Round 2/2 (2 parallel calls) ──")
+        # ── ROUND 2: Call C (API Contracts) [Waits for Round 1] ───────────────
+        logger.info("[ArchitectureAgent] ── Round 2/2 (1 call: API Contracts) ──")
         time.sleep(1)  # small delay between rounds to respect rate limits
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
-            futures = [
-                pool.submit(self._call_api_contracts, srs_summary_text,
-                            merged_stack,
-                            results.get("system_components", []),
-                            results, state_lock, ps),
-                pool.submit(self._call_security, srs_summary_text,
-                            merged_stack,
-                            results, state_lock, ps),
-            ]
-            for f in futures:
-                f.result()
+        self._call_api_contracts(
+            srs_summary_text,
+            merged_stack,
+            results.get("system_components", []),
+            results,
+            state_lock,
+            ps,
+        )
 
         # ── Assemble ArchData ────────────────────────────────────────────────
         security_block = "\n\n## Security Requirements\n" + "\n".join(

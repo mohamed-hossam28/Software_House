@@ -27,9 +27,11 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent
+    from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 except ImportError:
-    from base import BaseAgent
+    from base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+
+from providers.llm.base import BaseLLMProvider
 
 from core.state import (
     ProjectState,
@@ -334,6 +336,26 @@ class IntegrationAgent(BaseAgent):
     """
     Validation and mechanical repairing agent for project code.
     """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_retries: int = DEFAULT_RETRIES,
+        retries: int | None = None,
+        backoff: float = DEFAULT_BACKOFF,
+        temperature: float = 0.0,
+        provider: BaseLLMProvider | str | None = None,
+    ):
+        super().__init__(
+            model=model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            retries=retries,
+            backoff=backoff,
+            temperature=temperature,
+            provider=provider,
+        )
 
     @property
     def system_prompt(self) -> str:
@@ -937,7 +959,7 @@ export const LoginPage = () => {
         if os.path.exists(abs_p):
             shutil.rmtree(abs_p, ignore_errors=True)
 
-    assert result.integration.merged, f"Expected clean integration merge, got conflicts: {result.integration.conflicts}"
-    assert "models.user" in result.generated_code.backend["backend/app/routes/auth.py"]
+    assert state.integration.merged, f"Expected clean integration merge, got conflicts: {state.integration.conflicts}"
+    assert "models.user" in state.generated_code.backend["backend/app/routes/auth.py"]
     print("[PASS] IntegrationAgent mock run — auto-fixed typo and re-verified successfully")
     print("=" * 60 + "\n")

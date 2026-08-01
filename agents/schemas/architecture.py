@@ -6,6 +6,11 @@ from typing import List, Dict, Any
 class TechStackSchema(BaseModel):
     tech_stack: Dict[str, str] = Field(default_factory=dict)
 
+class CoreArchitectureSchema(BaseModel):
+    tech_stack: Dict[str, str] = Field(default_factory=dict)
+    system_components: List[str] = Field(default_factory=list)
+    security_requirements: List[str] = Field(default_factory=list)
+
 class SystemComponentsSchema(BaseModel):
     system_components: List[str] = Field(default_factory=list)
 

@@ -1,5 +1,6 @@
 import logging
-from .base import BaseAgent
+from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+from providers.llm.base import BaseLLMProvider
 from core.state import ProjectState, SRSData
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,26 @@ Respond strictly with valid JSON only.
  
 
 class RequirementsAgent(BaseAgent):
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_retries: int = DEFAULT_RETRIES,
+        retries: int | None = None,
+        backoff: float = DEFAULT_BACKOFF,
+        temperature: float = 0.0,
+        provider: BaseLLMProvider | str | None = None,
+    ):
+        super().__init__(
+            model=model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            retries=retries,
+            backoff=backoff,
+            temperature=temperature,
+            provider=provider,
+        )
+
     @property
     def system_prompt(self)->str:
         return SYSTEM_PROMPT

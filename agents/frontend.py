@@ -20,6 +20,8 @@ Execution model:
 
 import os
 import sys
+import re
+import json as _json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -31,9 +33,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
 
 from core.state import (
     ProjectState,
@@ -277,6 +279,106 @@ class FrontendAgent(BaseAgent):
         raise RuntimeError("Unreachable")
 
     # ── Per-task worker (runs in thread pool) ─────────────────────────────────
+    def _build_batch_prompt(
+        self, tasks: list[Task], manifest: Any, arch: Any, frontend_tech: str
+    ) -> str:
+        """Compact batch prompt for 2-3 trivial frontend files — returns a JSON array."""
+        entries: list[str] = []
+        for task in tasks:
+            fm = manifest.by_task(task.id)
+            if not fm:
+                continue
+            exports = ", ".join(fm.exports) or "(none)"
+            entries.append(
+                f"### File: {fm.filepath}\n"
+                f"Purpose: {fm.purpose}\n"
+                f"Required Exports: {exports}"
+            )
+        batch_desc = "\n\n".join(entries)
+        return (
+            f"Generate the following {len(tasks)} trivial/boilerplate {frontend_tech} files.\n\n"
+            f"{batch_desc}\n\n"
+            "Return a JSON ARRAY (not object) — one element per file in the same order:\n"
+            '[{"filepath":"<path>","code":"<full source>","classes":[],"functions":[]}, ...]\n'
+            "```json\n"
+        )
+
+    def _process_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
+        """Single LLM call for a batch of trivial frontend files."""
+        with lock:
+            manifest = state.code_manifest
+            arch = state.architecture
+            frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch.tech_stack else "React 18 + TypeScript"
+            sys_prompt  = _build_system_prompt(frontend_tech)
+            user_prompt = self._build_batch_prompt(tasks, manifest, arch, frontend_tech)
+
+        filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
+        logger.info("[FrontendAgent] Batch trivial call: %s", filepaths)
+
+        try:
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="fe-batch")
+        except Exception as exc:
+            logger.error("[FrontendAgent] Batch LLM call failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"Batch LLM call failed: {exc}")
+            return
+
+        try:
+            text = raw.strip()
+            text = re.sub(r'^```[a-z]*\n?', '', text, flags=re.MULTILINE).strip().rstrip('`').strip()
+            m_arr = re.search(r'\[.*\]', text, re.DOTALL)
+            m_obj = re.search(r'\{.*\}', text, re.DOTALL)
+            if m_arr:
+                items: list[dict] = _json.loads(m_arr.group(0))
+            elif m_obj:
+                items = [_json.loads(m_obj.group(0))]
+            else:
+                items = _json.loads(text)
+            if not isinstance(items, list):
+                items = [items]
+        except Exception as exc:
+            logger.error("[FrontendAgent] Batch JSON parse failed: %s — raw: %s", exc, raw[:300])
+            with lock:
+                state.log_error(self.name, f"Batch JSON parse failed: {exc}")
+            return
+
+        for item, task in zip(items, tasks):
+            with lock:
+                fm = state.code_manifest.by_task(task.id)
+            if not fm:
+                continue
+            code = str(item.get("code", "")).strip()
+            if not code:
+                logger.warning("[FrontendAgent] Batch: empty code for %s", fm.filepath)
+                continue
+            classes: list[ClassName] = []
+            for c in item.get("classes", []):
+                try:
+                    args = [Argument(**a) for a in c.get("arguments", [])]
+                    classes.append(ClassName(name=c["name"], arguments=args, docstring=c.get("docstring", "")))
+                except Exception:
+                    pass
+            functions: list[FunctionName] = []
+            for f in item.get("functions", []):
+                try:
+                    args = [Argument(**a) for a in f.get("arguments", [])]
+                    functions.append(FunctionName(
+                        name=f["name"], arguments=args,
+                        return_type=f.get("return_type", "void"),
+                        docstring=f.get("docstring", ""),
+                    ))
+                except Exception:
+                    pass
+            try:
+                _write_to_disk(fm.filepath, code)
+            except Exception as exc:
+                logger.error("[FrontendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
+            with lock:
+                state.generated_code.frontend[fm.filepath] = code
+                state.code_manifest.mark_written(fm.filepath, classes, functions)
+                state.completed_task_ids.add(task.id)
+            logger.info("[FrontendAgent] ✓ batch trivial: %s", fm.filepath)
+
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
         """Generate code for one frontend file, write to disk, update manifest."""
         with lock:
@@ -391,14 +493,23 @@ class FrontendAgent(BaseAgent):
                 logger.info("[FrontendAgent] Sleeping 2s between stages (rate limit) …")
                 time.sleep(2)
 
+            # Split into trivial batches + non-trivial singles
+            trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
+            non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
+
             logger.info(
-                "[FrontendAgent] Stage %d/%d — %d task(s) in parallel …",
-                idx + 1, len(stages), len(stage),
+                "[FrontendAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d non-trivial",
+                idx + 1, len(stages), len(trivial), len(batches), len(non_trivial),
             )
 
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
-                for task in stage:
+                for batch in batches:
+                    for t in batch:
+                        t.status = "in_progress"
+                    futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
+                for task in non_trivial:
                     task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
@@ -409,7 +520,7 @@ class FrontendAgent(BaseAgent):
                         logger.error("[FrontendAgent] Unhandled task exception: %s", exc)
                         ps.log_error(self.name, f"Task exception: {exc}")
 
-            ps.metrics.total_llm_calls += len(stage)
+            ps.metrics.total_llm_calls += len(batches) + len(non_trivial)
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)
@@ -484,8 +595,7 @@ if __name__ == "__main__":
         def provider_name(self): return "mock"
         def complete(self, system_prompt, user_message, model, max_tokens=8192, temperature=0.2):
             assert "React 18 + TypeScript" in system_prompt, "tech stack missing from system prompt"
-            # Determine which file is being generated from the "File to Generate" header
-            is_css = user_message.startswith("## File to Generate\n- **Path**     : `output/frontend/global.css`")
+            is_css = "global.css" in user_message
             if is_css:
                 code = ":root { --color-primary: #3b82f6; }\n* { box-sizing: border-box; margin: 0; }"
                 payload = {"code": code, "classes": [], "functions": []}
@@ -495,7 +605,7 @@ if __name__ == "__main__":
                     "code": code, "classes": [],
                     "functions": [{"name": "LoginPage", "arguments": [], "return_type": "JSX.Element", "docstring": "Login page"}]
                 }
-            return LLMResponse(text=f"```json\n{_json.dumps(payload)}\n```",
+            return LLMResponse(text=f"```json\n{_json.dumps([payload])}\n```",
                                input_tokens=10, output_tokens=10, model="mock", provider="mock")
 
     state = ProjectState(project_id="fe-test", project_name="FE Test")

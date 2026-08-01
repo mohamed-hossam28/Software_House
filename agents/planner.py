@@ -17,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from typing import Any
 
-from .base import BaseAgent
+from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+from providers.llm.base import BaseLLMProvider
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract,
 )
@@ -271,6 +272,26 @@ class PlannerAgent(BaseAgent):
     and streaming enabled, then deterministic merge + validation.
     """
 
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_retries: int = DEFAULT_RETRIES,
+        retries: int | None = None,
+        backoff: float = DEFAULT_BACKOFF,
+        temperature: float = 0.0,
+        provider: BaseLLMProvider | str | None = None,
+    ):
+        super().__init__(
+            model=model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            retries=retries,
+            backoff=backoff,
+            temperature=temperature,
+            provider=provider,
+        )
+
     @property
     def system_prompt(self) -> str:
         return _BASE_SYSTEM
@@ -493,7 +514,7 @@ if __name__ == "__main__":
     ]
     mf = _build_manifest(test_tasks, test_raw)
     assert len(mf) == 2
-    assert mf["backend/app/models/user.py"].exports == ["User"]
+    assert mf["output/backend/app/models/user.py"].exports == ["User"]
     print("[PASS] _build_manifest — 2 entries with correct exports")
 
     # ── FileManifest / CodeManifest ─────────────────────────────────────────────

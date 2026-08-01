@@ -108,6 +108,7 @@ def requirements_node(state: dict) -> dict:
         max_tokens=settings.req_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.0,
     )
     return agent.run(state)
 
@@ -188,6 +189,7 @@ def architecture_node(state: dict) -> dict:
         max_tokens=settings.arch_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.0,
     )
     return agent.run(state)
 
@@ -204,6 +206,7 @@ def planner_node(state: dict) -> dict:
         max_tokens=settings.planner_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.0,
     )
     return agent.run(state)
 
@@ -220,6 +223,7 @@ def database_node(state: dict) -> dict:
         max_tokens=settings.db_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.2,
     )
     return agent.run(state)
 
@@ -236,6 +240,7 @@ def backend_node(state: dict) -> dict:
         max_tokens=settings.be_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.2,
     )
     return agent.run(state)
 
@@ -252,6 +257,7 @@ def frontend_node(state: dict) -> dict:
         max_tokens=settings.fe_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.2,
     )
     return agent.run(state)
 
@@ -268,6 +274,7 @@ def integration_node(state: dict) -> dict:
         max_tokens=settings.integration_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        temperature=0.0,
     )
     return agent.run(state)
 

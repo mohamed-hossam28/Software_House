@@ -100,6 +100,65 @@ def filter_api_contracts_by_relevance(
     
     return filtered[:top_k] if filtered else [c for _, c in scored[:top_k]]
 
+
+# ── Trivial-file classifier ───────────────────────────────────────────────────
+
+#: Filename patterns that are almost always trivial (< 20 lines, no bespoke logic)
+_TRIVIAL_NAMES = frozenset({
+    "__init__.py",
+    "index.ts", "index.tsx", "index.js", "index.jsx",  # barrel / re-export files
+    "types.ts", "types.tsx",                            # pure type declarations
+    "constants.ts", "constants.js",                     # constant modules
+    "config.py", "config.ts", "config.js",              # app config stubs
+    "settings.py",
+    "exceptions.py", "errors.py", "errors.ts",          # exception/error stubs
+    "utils.py",                                         # small utility stubs
+})
+
+_TRIVIAL_PATTERNS = (
+    "/__init__.py",
+    "/index.",          # barrel files under any directory
+    "/types.",
+    "/constants.",
+    "/exceptions.",
+    "/errors.",
+    "/config.",
+    "/settings.",
+)
+
+TRIVIAL_BATCH_SIZE = 3  # max files per batch LLM call
+
+
+def is_trivial_file(task: Any, manifest: Any) -> bool:
+    """
+    Returns True if a task maps to a file that is "trivial":
+      - A known boilerplate pattern (init, barrel, config, types, constants, errors)
+      - OR fewer than 3 planned exports in the manifest
+    Trivial files will be batched together into a single LLM call.
+    """
+    if not hasattr(manifest, "files"):
+        return False
+    fm = getattr(manifest, "by_task", lambda _: None)(task.id)
+    if fm is None:
+        return False
+
+    filepath = getattr(fm, "filepath", "")
+    exports  = getattr(fm, "exports", []) or []
+    basename = os.path.basename(filepath).lower()
+
+    # Explicit name match
+    if basename in _TRIVIAL_NAMES:
+        return True
+    # Suffix pattern match
+    for pattern in _TRIVIAL_PATTERNS:
+        if pattern in filepath.lower():
+            return True
+    # Export count
+    if len(exports) < 3:
+        return True
+    return False
+
+
 ####################BaseAgent##########################
 class BaseAgent(ABC):
     def __init__(

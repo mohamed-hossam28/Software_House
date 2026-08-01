@@ -32,6 +32,7 @@ Rules enforced (see system prompt):
 import os
 import sys
 import json
+import json as _json
 import logging
 import time
 import re
@@ -44,9 +45,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
+    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance
+    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
 
 from core.state import (
     ProjectState,
@@ -200,19 +201,6 @@ def _build_file_prompt(
 
     manifest_ctx = _fmt_manifest_context(manifest, filepath, task)
 
-    # Filter API contracts for DB context (e.g., table schemas matching API endpoints)
-    raw_contracts = getattr(arch, 'api_contracts', []) or []
-    rel_contracts = filter_api_contracts_by_relevance(
-        raw_contracts,
-        filepath=filepath,
-        purpose=purpose,
-        task_title=task.title if task else "",
-    )
-    contracts_lines = []
-    for c in rel_contracts:
-        contracts_lines.append(f"- {c.method} {c.path}: {c.description}")
-    contracts_str = "\n".join(contracts_lines) if contracts_lines else "No relevant API contracts."
-
     depends_str = ", ".join(task.depends_on) if task.depends_on else "(none)"
 
     return f"""\
@@ -228,9 +216,6 @@ def _build_file_prompt(
 
 ## Architecture — Database Schema Overview
 {getattr(arch, 'database_schema_overview', 'No schema overview provided.')}
-
-## Relevant API Contracts
-{contracts_str}
 
 ## Already Written Database Files (available for FK references)
 {written_str}
@@ -313,6 +298,115 @@ class DatabaseAgent(BaseAgent):
                     raise
                 time.sleep(self.backoff * attempt)
         raise RuntimeError("Unreachable")
+
+    # ── Trivial batch worker ──────────────────────────────────────────────────
+
+    def _build_batch_prompt(self, tasks: list[Task], manifest: Any, arch: Any, db_tech: str) -> str:
+        """Compact batch prompt for 2-3 trivial DB migration files — returns a JSON array."""
+        entries: list[str] = []
+        for task in tasks:
+            fm = manifest.by_task(task.id)
+            if not fm:
+                continue
+            exports = ", ".join(fm.exports) or "(none)"
+            entries.append(
+                f"### File: {fm.filepath}\n"
+                f"Purpose: {fm.purpose}\n"
+                f"Required Exports: {exports}"
+            )
+        batch_desc = "\n\n".join(entries)
+        return (
+            f"Generate the following {len(tasks)} trivial/boilerplate {db_tech} migration files.\n\n"
+            f"{batch_desc}\n\n"
+            "Return a JSON ARRAY (not object) — one element per file in the same order:\n"
+            '[{"filepath":"<path>","migration_code":"<full SQL/migration>","manifest":{},"functions":[]}, ...]\n'
+            "```json\n"
+        )
+
+    def _process_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
+        """Single LLM call for a batch of trivial DB migration files."""
+        with lock:
+            manifest = state.code_manifest
+            arch = state.architecture
+            db_tech = arch.tech_stack.get("database", "PostgreSQL") if arch.tech_stack else "PostgreSQL"
+            sys_prompt  = _build_system_prompt(db_tech)
+            user_prompt = self._build_batch_prompt(tasks, manifest, arch, db_tech)
+
+        filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
+        logger.info("[DBAgent] Batch trivial call: %s", filepaths)
+
+        try:
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="db-batch")
+        except Exception as exc:
+            logger.error("[DBAgent] Batch LLM call failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"Batch LLM call failed: {exc}")
+            return
+
+        try:
+            text = raw.strip()
+            text = re.sub(r'^```[a-z]*\n?', '', text, flags=re.MULTILINE).strip().rstrip('`').strip()
+            m_arr = re.search(r'\[.*\]', text, re.DOTALL)
+            m_obj = re.search(r'\{.*\}', text, re.DOTALL)
+            if m_arr:
+                items: list[dict] = _json.loads(m_arr.group(0))
+            elif m_obj:
+                items = [_json.loads(m_obj.group(0))]
+            else:
+                items = _json.loads(text)
+            if not isinstance(items, list):
+                items = [items]
+        except Exception as exc:
+            logger.error("[DBAgent] Batch JSON parse failed: %s — raw: %s", exc, raw[:300])
+            with lock:
+                state.log_error(self.name, f"Batch JSON parse failed: {exc}")
+            return
+
+        for item, task in zip(items, tasks):
+            with lock:
+                fm = state.code_manifest.by_task(task.id)
+            if not fm:
+                continue
+            code = str(item.get("migration_code", "")).strip()
+            if not code:
+                logger.warning("[DBAgent] Batch: empty migration_code for %s", fm.filepath)
+                continue
+            manifest_data: dict = item.get("manifest") or {}
+            classes: list[ClassName] = []
+            if manifest_data and "table_name" in manifest_data:
+                table_name = manifest_data["table_name"]
+                columns = manifest_data.get("columns", [])
+                args = []
+                for col in columns:
+                    col_name = col.get("name", "")
+                    col_type = col.get("type", "unknown")
+                    default_val = ""
+                    if col.get("primary_key"):
+                        col_type += " (PK)"
+                    if col.get("foreign_key"):
+                        col_type += f" (FK -> {col['foreign_key']})"
+                    if col.get("nullable"):
+                        default_val = "NULL"
+                    args.append(Argument(
+                        name=col_name,
+                        type=col_type,
+                        default=default_val
+                    ))
+                classes.append(ClassName(
+                    name=table_name,
+                    arguments=args,
+                    docstring=f"Table schema for {table_name}"
+                ))
+            try:
+                _write_to_disk(fm.filepath, code)
+            except Exception as exc:
+                logger.error("[DBAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
+            with lock:
+                state.generated_code.database[fm.filepath] = code
+                state.code_manifest.mark_written(fm.filepath, classes, [])
+                state.completed_task_ids.add(task.id)
+                state.metrics.total_llm_calls += 0  # counted at call site
+            logger.info("[DBAgent] ✓ batch trivial: %s", fm.filepath)
 
     # ── Per-task worker ───────────────────────────────────────────────────────
 
@@ -459,14 +553,23 @@ class DatabaseAgent(BaseAgent):
                 logger.info("[DBAgent] Waiting 2 s between stages (rate limit) …")
                 time.sleep(2)
 
+            # Split into trivial batches + non-trivial singles
+            trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
+            non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
+
             logger.info(
-                "[DBAgent] Stage %d/%d — %d task(s) in parallel …",
-                idx + 1, len(stages), len(stage),
+                "[DBAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d non-trivial",
+                idx + 1, len(stages), len(trivial), len(batches), len(non_trivial),
             )
 
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
-                for task in stage:
+                for batch in batches:
+                    for t in batch:
+                        t.status = "in_progress"
+                    futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
+                for task in non_trivial:
                     task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
@@ -477,6 +580,8 @@ class DatabaseAgent(BaseAgent):
                         logger.error("[DBAgent] Unhandled task exception: %s", exc)
                         with state_lock:
                             ps.log_error(self.name, f"Task exception: {exc}")
+
+            ps.metrics.total_llm_calls += len(batches) + len(non_trivial)
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)
@@ -565,7 +670,7 @@ if __name__ == "__main__":
                 "functions": [],
             }
             return LLMResponse(
-                text=f"```json\n{json.dumps(payload)}\n```",
+                text=f"```json\n{json.dumps([payload])}\n```",
                 input_tokens=50,
                 output_tokens=100,
                 model="mock",
