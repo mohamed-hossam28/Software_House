@@ -97,31 +97,7 @@ Generate a complete, runnable database migration file AND a structured manifest 
 11. The manifest export section must list the exact table name and exact column names
     + types — this is what the Backend model-writing step reads to build SQLAlchemy models.
 
-## Response Format
-Return a single JSON object with exactly these keys:
-
-{{
-  "migration_code": "<complete migration SQL or Python/Alembic script>",
-  "manifest": {{
-    "table_name": "<exact table name>",
-    "columns": [
-      {{"name": "<col>", "type": "<SQL type>", "nullable": <bool>, "primary_key": <bool>,
-        "foreign_key": "<table.col or null>"}}
-    ],
-    "indexes": ["<col_name>", ...],
-    "exports": ["<table_name>"],
-    "suggested_additions": []
-  }},
-  "functions": [
-    {{
-      "name": "<helper function name if any>",
-      "arguments": [{{"name": "<p>", "type": "<t>", "default": ""}}],
-      "return_type": "<type>",
-      "docstring": "<description>"
-    }}
-  ]
-}}
-
+Return JSON: {{"migration_code":"<full script>","manifest":{{"table_name":"<tbl>","columns":[{{"name":"<col>","type":"<type>","nullable":true|false,"primary_key":true|false,"foreign_key":"<table.col or null>"}}],"indexes":["<col>"],"exports":["<tbl>"],"suggested_additions":[]}},"functions":[{{"name":"<func>","arguments":[{{"name":"<p>","type":"<t>","default":""}}],"return_type":"<t>","docstring":"<desc>"}}]}}
 No prose outside the JSON object.
 """
 
@@ -252,9 +228,6 @@ def _build_file_prompt(
 
 ## Architecture — Database Schema Overview
 {getattr(arch, 'database_schema_overview', 'No schema overview provided.')}
-
-## Architecture — Data Flow (for index hints)
-{getattr(arch, 'data_flow', 'No data flow information provided.')}
 
 ## Relevant API Contracts
 {contracts_str}
@@ -618,16 +591,16 @@ if __name__ == "__main__":
     state.code_manifest = CodeManifest(files={fm.filepath: fm})
 
     agent = DatabaseAgent(provider=MockLLM())
-    result = agent.run(state)
+    agent.run(state)
 
-    assert result.code_manifest.files[fm.filepath].written, "File not marked written"
-    assert fm.filepath in result.generated_code.database, "Code not in generated_code.database"
-    assert "CREATE TABLE" in result.generated_code.database[fm.filepath]
-    written_fm = result.code_manifest.files[fm.filepath]
+    assert state.code_manifest.files[fm.filepath].written, "File not marked written"
+    assert fm.filepath in state.generated_code.database, "Code not in generated_code.database"
+    assert "CREATE TABLE" in state.generated_code.database[fm.filepath]
+    written_fm = state.code_manifest.files[fm.filepath]
     assert len(written_fm.classes) == 1, "Expected table class in manifest classes"
     assert written_fm.classes[0].name == "users", "Table name mismatch"
     assert len(written_fm.classes[0].arguments) == 4, "Columns count mismatch"
-    assert not result.errors, f"Unexpected errors: {result.errors}"
+    assert not state.errors, f"Unexpected errors: {state.errors}"
     print("[PASS] DatabaseAgent mock run — migration written, manifest in state classes, no errors")
 
     # Cleanup

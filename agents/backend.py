@@ -69,31 +69,7 @@ Your job is to generate the complete source code for a backend file and its mani
 6. Follow the API contracts exactly (HTTP methods, paths, request/response models).
 7. Write clean, idiomatic code utilizing features of {backend_tech}.
 8. Include robust error handling and return appropriate error responses / HTTP status codes for {backend_tech}.
-9. Do not hardcode secrets. Read from environment variables.
-
-## Schema:
-{{
-  "code": "<string: complete file contents>",
-  "classes": [
-    {{
-      "name": "<class name>",
-      "arguments": [
-        {{ "name": "<param name>", "type": "<param type>", "default": "<default value or empty>" }}
-      ],
-      "docstring": "<brief description>"
-    }}
-  ],
-  "functions": [
-    {{
-      "name": "<function name>",
-      "arguments": [
-        {{ "name": "<param name>", "type": "<param type>", "default": "<default value or empty>" }}
-      ],
-      "return_type": "<return type as string>",
-      "docstring": "<brief description>"
-    }}
-  ]
-}}
+Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"docstring":"<desc>"}}],"functions":[{{"name":"<func name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"return_type":"<type>","docstring":"<desc>"}}]}}
 """
 
 
@@ -567,15 +543,15 @@ if __name__ == "__main__":
     
     # Check if files written to local disk (mock files)
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    assert os.path.exists(os.path.join(root_dir, "backend/app/models/user.py"))
-    assert os.path.exists(os.path.join(root_dir, "backend/app/routes/auth.py"))
+    target_p1 = os.path.join(root_dir, "output/backend/app/models/user.py")
+    target_p2 = os.path.join(root_dir, "output/backend/app/routes/auth.py")
+    assert os.path.exists(target_p1) or os.path.exists(os.path.join(root_dir, "backend/app/models/user.py"))
+    assert os.path.exists(target_p2) or os.path.exists(os.path.join(root_dir, "backend/app/routes/auth.py"))
 
     # Cleanup mock files from disk
-    try:
-        os.remove(os.path.join(root_dir, "backend/app/models/user.py"))
-        os.remove(os.path.join(root_dir, "backend/app/routes/auth.py"))
-    except Exception:
-        pass
+    import shutil
+    shutil.rmtree(os.path.join(root_dir, "output/backend"), ignore_errors=True)
+    shutil.rmtree(os.path.join(root_dir, "backend"), ignore_errors=True)
 
     print("[PASS] BackendAgent mock integration test succeeded.")
     print("=" * 60 + "\n")

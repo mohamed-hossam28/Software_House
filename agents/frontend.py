@@ -76,25 +76,7 @@ Generate the COMPLETE source code for a single frontend file plus its manifest m
 7. Use {frontend_tech} idioms and best practices throughout.
 8. Do not hardcode secrets; read from environment variables or config files.
 
-## Response schema
-{{
-  "code": "<complete file source>",
-  "classes": [
-    {{
-      "name": "<class / component name>",
-      "arguments": [{{"name": "<prop>", "type": "<type>", "default": ""}}],
-      "docstring": "<what it does>"
-    }}
-  ],
-  "functions": [
-    {{
-      "name": "<function / hook name>",
-      "arguments": [{{"name": "<param>", "type": "<type>", "default": ""}}],
-      "return_type": "<return type>",
-      "docstring": "<what it does>"
-    }}
-  ]
-}}
+Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"docstring":"<desc>"}}],"functions":[{{"name":"<func name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"return_type":"<type>","docstring":"<desc>"}}]}}
 """
 
 
@@ -543,13 +525,13 @@ if __name__ == "__main__":
     })
 
     agent = FrontendAgent(provider=MockLLM())
-    result = agent.run(state)
+    agent.run(state)
 
-    assert result.code_manifest.files["output/frontend/global.css"].written
-    assert result.code_manifest.files["output/frontend/pages/LoginPage.tsx"].written
-    assert "LoginPage" in result.code_manifest.files["output/frontend/pages/LoginPage.tsx"].functions[0].name
-    assert ":root" in result.generated_code.frontend["output/frontend/global.css"]
-    assert not result.errors, f"Unexpected errors: {result.errors}"
+    assert state.code_manifest.files["output/frontend/global.css"].written
+    assert state.code_manifest.files["output/frontend/pages/LoginPage.tsx"].written
+    assert "LoginPage" in state.code_manifest.files["output/frontend/pages/LoginPage.tsx"].functions[0].name
+    assert ":root" in state.generated_code.frontend["output/frontend/global.css"]
+    assert not state.errors, f"Unexpected errors: {state.errors}"
     print("[PASS] FrontendAgent mock run — both files written, CSS present, no errors")
 
     # Cleanup test output dirs

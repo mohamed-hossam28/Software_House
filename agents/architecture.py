@@ -238,7 +238,7 @@ def _validated_contracts(raw: Any) -> list[APIContract]:
 
 
 def _srs_block(srs: SRSData) -> str:
-    """Format the SRS into a reusable prompt block."""
+    """Format the full SRS into a reusable prompt block for Round 1 calls."""
     return (
         "## Software Requirements Specification\n\n"
         "### Functional Requirements\n"
@@ -251,6 +251,17 @@ def _srs_block(srs: SRSData) -> str:
         f"{_bullet_list(srs.assumptions)}\n\n"
         "### Out of Scope\n"
         f"{_bullet_list(srs.out_of_scope)}\n"
+    )
+
+
+def _srs_summary_block(srs: SRSData, stack: dict[str, str]) -> str:
+    """Format a condensed SRS summary (functional requirements + tech stack) for Round 2 & 3 calls to minimize token usage."""
+    return (
+        "## Requirements & Tech Stack Summary\n\n"
+        "### Functional Requirements\n"
+        f"{_bullet_list(srs.functional_requirements)}\n\n"
+        "### Tech Stack\n"
+        f"{_tech_stack_table(stack)}\n"
     )
 
 
@@ -306,14 +317,6 @@ encryption, rate limiting, CORS policy, secrets management.
 Return JSON: {"security_requirements": ["<requirement statement>", ...]}
 """
 
-# ── Round 3 prompts ──────────────────────────────────────────────────────────
-
-DATA_FLOW_SYSTEM = _BASE_SYSTEM + """
-Your task: describe the communication/data-flow pattern between services.
-Which services call which, sync REST vs async events, message queues, etc.
-Return JSON: {"data_flow": "<multiline string: communication pattern>"}
-"""
-
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  ArchitectureAgent                                                          ║
@@ -323,7 +326,7 @@ class ArchitectureAgent(BaseAgent):
     Reads the completed SRS from ProjectState.requirements and writes a fully
     populated ArchData into ProjectState.architecture.
 
-    Executes 6 focused LLM calls across 3 dependency-resolved rounds
+    Executes 5 focused LLM calls across 2 dependency-resolved rounds
     using ThreadPoolExecutor with a Lock on shared state.
     """
 
@@ -406,13 +409,12 @@ class ArchitectureAgent(BaseAgent):
             with lock:
                 state.log_error(self.name, f"db_schema_overview sub-call failed: {exc}")
 
-    def _call_api_contracts(self, srs_text: str, tech_stack: dict, components: list,
+    def _call_api_contracts(self, srs_summary_text: str, tech_stack: dict, components: list,
                             results: dict, lock: Lock, state: ProjectState) -> None:
         context = (
-            f"## Tech Stack\n{_tech_stack_table(tech_stack)}\n\n"
             f"## System Components\n" +
             "\n".join(f"- {c}" for c in components) + "\n\n" +
-            srs_text + "\n```json\n"
+            srs_summary_text + "\n```json\n"
         )
         try:
             from agents.schemas.architecture import APIContractsSchema
@@ -427,9 +429,9 @@ class ArchitectureAgent(BaseAgent):
             with lock:
                 state.log_error(self.name, f"api_contracts sub-call failed: {exc}")
 
-    def _call_security(self, srs_text: str, tech_stack: dict,
+    def _call_security(self, srs_summary_text: str, tech_stack: dict,
                        results: dict, lock: Lock, state: ProjectState) -> None:
-        context = f"## Tech Stack\n{_tech_stack_table(tech_stack)}\n\n{srs_text}\n```json\n"
+        context = f"{srs_summary_text}\n```json\n"
         try:
             from agents.schemas.architecture import SecurityRequirementsSchema
             raw = self._call_with_system(SECURITY_SYSTEM, context, "arch-security")
@@ -442,32 +444,6 @@ class ArchitectureAgent(BaseAgent):
             logger.error("[ArchitectureAgent] security_requirements failed: %s", exc)
             with lock:
                 state.log_error(self.name, f"security_requirements sub-call failed: {exc}")
-
-    def _call_data_flow(self, srs_text: str, components: list, contracts: list,
-                        results: dict, lock: Lock, state: ProjectState) -> None:
-        contracts_summary = "\n".join(
-            f"- {c.get('method','?')} {c.get('path','?')} — {c.get('description','')}"
-            if isinstance(c, dict) else f"- {c}"
-            for c in contracts[:30]
-        ) or "(none)"
-        context = (
-            f"## System Components\n" +
-            "\n".join(f"- {c}" for c in components) + "\n\n" +
-            f"## API Contracts (summary)\n{contracts_summary}\n\n" +
-            srs_text + "\n```json\n"
-        )
-        try:
-            from agents.schemas.architecture import DataFlowSchema
-            raw = self._call_with_system(DATA_FLOW_SYSTEM, context, "arch-dataflow")
-            data = self.extract_json_and_validate(raw, DataFlowSchema)
-            with lock:
-                results["data_flow"] = data.get("data_flow", "")
-                state.metrics.total_llm_calls += 1
-            logger.info("[ArchitectureAgent] ✓ data_flow complete")
-        except Exception as exc:
-            logger.error("[ArchitectureAgent] data_flow failed: %s", exc)
-            with lock:
-                state.log_error(self.name, f"data_flow sub-call failed: {exc}")
 
     # ── Main execution ───────────────────────────────────────────────────────
     def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
@@ -488,7 +464,7 @@ class ArchitectureAgent(BaseAgent):
         state_lock = Lock()
 
         # ── ROUND 1: tech_stack, system_components, db_schema (parallel) ─────
-        logger.info("[ArchitectureAgent] ── Round 1/3 (3 parallel calls) ──")
+        logger.info("[ArchitectureAgent] ── Round 1/2 (3 parallel calls) ──")
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures: list[Future] = [
                 pool.submit(self._call_tech_stack, srs_text, stack_table,
@@ -505,31 +481,23 @@ class ArchitectureAgent(BaseAgent):
         merged_stack = {**results.get("tech_stack", {}), **authoritative_stack}
         results["tech_stack"] = merged_stack
 
+        srs_summary_text = _srs_summary_block(ps.requirements, merged_stack)
+
         # ── ROUND 2: api_contracts, security_requirements (parallel) ─────────
-        logger.info("[ArchitectureAgent] ── Round 2/3 (2 parallel calls) ──")
+        logger.info("[ArchitectureAgent] ── Round 2/2 (2 parallel calls) ──")
         time.sleep(1)  # small delay between rounds to respect rate limits
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures = [
-                pool.submit(self._call_api_contracts, srs_text,
+                pool.submit(self._call_api_contracts, srs_summary_text,
                             merged_stack,
                             results.get("system_components", []),
                             results, state_lock, ps),
-                pool.submit(self._call_security, srs_text,
+                pool.submit(self._call_security, srs_summary_text,
                             merged_stack,
                             results, state_lock, ps),
             ]
             for f in futures:
                 f.result()
-
-        # ── ROUND 3: data_flow (single call) ────────────────────────────────
-        logger.info("[ArchitectureAgent] ── Round 3/3 (1 call) ──")
-        time.sleep(1)
-        self._call_data_flow(
-            srs_text,
-            results.get("system_components", []),
-            results.get("api_contracts", []),
-            results, state_lock, ps,
-        )
 
         # ── Assemble ArchData ────────────────────────────────────────────────
         security_block = "\n\n## Security Requirements\n" + "\n".join(
@@ -541,7 +509,6 @@ class ArchitectureAgent(BaseAgent):
             system_components        = _as_list(results.get("system_components", [])),
             api_contracts            = _validated_contracts(results.get("api_contracts", [])),
             database_schema_overview = str(results.get("database_schema_overview", "")).strip(),
-            data_flow                = str(results.get("data_flow", "")).strip(),
             deployment_strategy      = security_block,
             diagrams                 = [],
         )

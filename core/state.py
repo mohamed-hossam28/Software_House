@@ -119,7 +119,6 @@ class ArchData(BaseModel):
     """Output of the Architecture Agent."""
     tech_stack: dict[str, str] = Field(default_factory=dict)        # e.g. {"backend": "FastAPI", ...}
     system_components: list[str] = Field(default_factory=list)
-    data_flow: str = ""
     api_contracts: list[APIContract] = Field(default_factory=list)
     database_schema_overview: str = ""
     deployment_strategy: str = ""

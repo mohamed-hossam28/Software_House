@@ -69,7 +69,7 @@ def filter_api_contracts_by_relevance(
     filepath: str,
     purpose: str = "",
     task_title: str = "",
-    top_k: int = 5,
+    top_k: int = 3,
 ) -> list[Any]:
     """Filter and rank API contracts by relevance score."""
     
@@ -90,14 +90,15 @@ def filter_api_contracts_by_relevance(
         # Use sequence matching for fuzzy similarity
         return SequenceMatcher(None, search_text, c_text).ratio()
     
-    # Sort by score descending
-    scored = sorted(contracts, key=score_contract, reverse=True)
+    # Compute score once per contract
+    scored = [(score_contract(c), c) for c in contracts]
+    scored.sort(key=lambda x: x[0], reverse=True)
     
     # Return top K with score > threshold
-    threshold = 0.2
-    filtered = [c for c in scored if score_contract(c) >= threshold]
+    threshold = 0.35
+    filtered = [c for score, c in scored if score >= threshold]
     
-    return filtered[:top_k] if filtered else scored[:top_k]
+    return filtered[:top_k] if filtered else [c for _, c in scored[:top_k]]
 
 ####################BaseAgent##########################
 class BaseAgent(ABC):

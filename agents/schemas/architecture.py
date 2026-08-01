@@ -27,16 +27,11 @@ class APIContractsSchema(BaseModel):
 class SecurityRequirementsSchema(BaseModel):
     security_requirements: List[str] = Field(default_factory=list)
 
-# ── Round 3 schemas ───────────────────────────────────────────────────────────
-class DataFlowSchema(BaseModel):
-    data_flow: str = ""
-
 # ── Full schema (kept for backward compat / smoke tests) ─────────────────────
 class ArchitectureSchema(BaseModel):
     tech_stack: Dict[str, str] = Field(default_factory=dict)
     system_components: List[str] = Field(default_factory=list)
     api_contracts: List[APIContractSchema] = Field(default_factory=list)
     database_schema_overview: str = ""
-    data_flow: str = ""
     deployment_strategy: str = ""
     security_requirements: List[str] = Field(default_factory=list)
