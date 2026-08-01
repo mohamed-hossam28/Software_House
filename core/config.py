@@ -31,6 +31,44 @@ class Settings(BaseSettings):
     default_retries: Optional[int]    = Field(None, validation_alias=AliasChoices("DEFAULT_RETRIES", "default_retries"))
     default_backoff: Optional[float]  = Field(None, validation_alias=AliasChoices("DEFAULT_BACKOFF", "default_backoff"))
 
+    # Per-agent max token settings matching .env keys
+    default_req_max_tokens: Optional[int]         = Field(None, validation_alias=AliasChoices("DEFAULT_Req_MAX_TOKENS", "DEFAULT_REQ_MAX_TOKENS", "default_req_max_tokens"))
+    default_arch_max_tokens: Optional[int]        = Field(None, validation_alias=AliasChoices("DEFAULT_Arch_MAX_TOKENS", "DEFAULT_ARCH_MAX_TOKENS", "default_arch_max_tokens"))
+    default_planner_max_tokens: Optional[int]     = Field(None, validation_alias=AliasChoices("DEFAULT_Planner_MAX_TOKENS", "DEFAULT_PLANNER_MAX_TOKENS", "default_planner_max_tokens"))
+    default_db_max_tokens: Optional[int]          = Field(None, validation_alias=AliasChoices("DEFAULT_DB_MAX_TOKENS", "DEFAULT_DB_MAX_TOKENS", "default_db_max_tokens"))
+    default_be_max_tokens: Optional[int]          = Field(None, validation_alias=AliasChoices("DEFAULT_BE_MAX_TOKENS", "DEFAULT_BE_MAX_TOKENS", "default_be_max_tokens"))
+    default_fe_max_tokens: Optional[int]          = Field(None, validation_alias=AliasChoices("DEFAULT_FE_MAX_TOKENS", "DEFAULT_FE_MAX_TOKENS", "default_fe_max_tokens"))
+    default_integration_max_tokens: Optional[int] = Field(None, validation_alias=AliasChoices("DEFAULT_Integration_MAX_TOKENS", "DEFAULT_INTEGRATION_MAX_TOKENS", "default_integration_max_tokens"))
+
+    @property
+    def req_max_tokens(self) -> int:
+        return self.default_req_max_tokens or self.default_max_tokens or 2000
+
+    @property
+    def arch_max_tokens(self) -> int:
+        return self.default_arch_max_tokens or self.default_max_tokens or 3000
+
+    @property
+    def planner_max_tokens(self) -> int:
+        return self.default_planner_max_tokens or self.default_max_tokens or 5000
+
+    @property
+    def db_max_tokens(self) -> int:
+        return self.default_db_max_tokens or self.default_max_tokens or 2000
+
+    @property
+    def be_max_tokens(self) -> int:
+        return self.default_be_max_tokens or self.default_max_tokens or 3000
+
+    @property
+    def fe_max_tokens(self) -> int:
+        return self.default_fe_max_tokens or self.default_max_tokens or 3000
+
+    @property
+    def integration_max_tokens(self) -> int:
+        return self.default_integration_max_tokens or self.default_max_tokens or 1500
+
+
     @property
     def model_name(self) -> str:
         if self.default_model:

@@ -105,7 +105,7 @@ def requirements_node(state: dict) -> dict:
     agent = RequirementsAgent(
         provider=settings.default_provider,
         model=settings.model_name,
-        max_tokens=settings.default_max_tokens,
+        max_tokens=settings.req_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -184,8 +184,8 @@ def architecture_node(state: dict) -> dict:
     logger.info("[GraphNode] Running ArchitectureAgent...")
     agent = ArchitectureAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.arch_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -200,8 +200,8 @@ def planner_node(state: dict) -> dict:
     logger.info("[GraphNode] Running PlannerAgent...")
     agent = PlannerAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.planner_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -216,8 +216,8 @@ def database_node(state: dict) -> dict:
     logger.info("[GraphNode] Running DatabaseAgent...")
     agent = DatabaseAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.db_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -232,8 +232,8 @@ def backend_node(state: dict) -> dict:
     logger.info("[GraphNode] Running BackendAgent...")
     agent = BackendAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.be_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -248,8 +248,8 @@ def frontend_node(state: dict) -> dict:
     logger.info("[GraphNode] Running FrontendAgent...")
     agent = FrontendAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.fe_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
@@ -264,9 +264,10 @@ def integration_node(state: dict) -> dict:
     logger.info("[GraphNode] Running IntegrationAgent...")
     agent = IntegrationAgent(
         provider=settings.default_provider,
-        model=settings.default_model,
-        max_tokens=settings.default_max_tokens,
+        model=settings.model_name,
+        max_tokens=settings.integration_max_tokens,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
     )
     return agent.run(state)
+
