@@ -247,6 +247,17 @@ def _srs_block(srs: SRSData) -> str:
     )
 
 
+def _db_srs_block(srs: SRSData) -> str:
+    """Format functional requirements and constraints into a focused prompt block for DB Schema design."""
+    return (
+        "## Software Requirements Specification\n\n"
+        "### Functional Requirements\n"
+        f"{_bullet_list(srs.functional_requirements)}\n\n"
+        "### Constraints\n"
+        f"{_bullet_list(srs.constraints)}\n"
+    )
+
+
 def _srs_summary_block(srs: SRSData, stack: dict[str, str]) -> str:
     """Format a condensed SRS summary (functional requirements + tech stack) for Round 2 & 3 calls to minimize token usage."""
     return (
@@ -331,7 +342,7 @@ class ArchitectureAgent(BaseAgent):
         try:
             from agents.schemas.architecture import CoreArchitectureSchema
             raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, CoreArchitectureSchema)
+            data = self.extract_json_and_validate(raw, CoreArchitectureSchema, state=state, lock=lock)
             with lock:
                 results["tech_stack"] = data.get("tech_stack", {})
                 results["system_components"] = data.get("system_components", [])
@@ -342,12 +353,12 @@ class ArchitectureAgent(BaseAgent):
             with lock:
                 state.log_error(self.name, f"core_architecture sub-call failed: {exc}")
 
-    def _call_db_schema(self, srs_text: str,
+    def _call_db_schema(self, db_srs_text: str,
                         results: dict, lock: Lock, state: ProjectState) -> None:
         try:
             from agents.schemas.architecture import DbSchemaOverviewSchema
-            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n", "arch-db", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema)
+            raw = self._call_with_system(DB_SCHEMA_SYSTEM, db_srs_text + "\n```json\n", "arch-db", state=state, lock=lock)
+            data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema, state=state, lock=lock)
             with lock:
                 results["database_schema_overview"] = data.get("database_schema_overview", "")
             logger.info("[ArchitectureAgent] ✓ db_schema_overview complete")
@@ -366,7 +377,7 @@ class ArchitectureAgent(BaseAgent):
         try:
             from agents.schemas.architecture import APIContractsSchema
             raw = self._call_with_system(API_CONTRACTS_SYSTEM, context, "arch-api", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, APIContractsSchema)
+            data = self.extract_json_and_validate(raw, APIContractsSchema, state=state, lock=lock)
             with lock:
                 results["api_contracts"] = data.get("api_contracts", [])
             logger.info("[ArchitectureAgent] ✓ api_contracts complete")
@@ -387,6 +398,7 @@ class ArchitectureAgent(BaseAgent):
         authoritative_stack = TechStackResolver.resolve(ps)
         stack_table = _tech_stack_table(authoritative_stack)
         srs_text = _srs_block(ps.requirements)
+        db_srs_text = _db_srs_block(ps.requirements)
 
         logger.info("[ArchitectureAgent] resolved tech stack: %s", authoritative_stack)
 
@@ -399,7 +411,7 @@ class ArchitectureAgent(BaseAgent):
             futures: list[Future] = [
                 pool.submit(self._call_core_architecture, srs_text, stack_table,
                             results, state_lock, ps),
-                pool.submit(self._call_db_schema, srs_text,
+                pool.submit(self._call_db_schema, db_srs_text,
                             results, state_lock, ps),
             ]
             for f in futures:
@@ -413,7 +425,6 @@ class ArchitectureAgent(BaseAgent):
 
         # ── ROUND 2: Call C (API Contracts) [Waits for Round 1] ───────────────
         logger.info("[ArchitectureAgent] ── Round 2/2 (1 call: API Contracts) ──")
-        time.sleep(1)  # small delay between rounds to respect rate limits
         self._call_api_contracts(
             srs_summary_text,
             merged_stack,
@@ -423,17 +434,13 @@ class ArchitectureAgent(BaseAgent):
             ps,
         )
 
-        # ── Assemble ArchData ────────────────────────────────────────────────
-        security_block = "\n\n## Security Requirements\n" + "\n".join(
-            f"  - {r}" for r in _as_list(results.get("security_requirements", []))
-        )
-
         ps.architecture = ArchData(
             tech_stack               = merged_stack,
             system_components        = _as_list(results.get("system_components", [])),
             api_contracts            = _validated_contracts(results.get("api_contracts", [])),
             database_schema_overview = str(results.get("database_schema_overview", "")).strip(),
-            deployment_strategy      = security_block,
+            security_requirements    = _as_list(results.get("security_requirements", [])),
+            deployment_strategy      = "",
             diagrams                 = [],
         )
 

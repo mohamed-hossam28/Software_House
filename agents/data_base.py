@@ -322,7 +322,7 @@ class DatabaseAgent(BaseAgent):
         # Parse JSON response
         try:
             from agents.schemas.database import DatabaseSchema
-            data = self.extract_json_and_validate(raw, DatabaseSchema)
+            data = self.extract_json_and_validate(raw, DatabaseSchema, state=state, lock=lock)
         except Exception as exc:
             snippet = raw[:500] if raw else "(empty)"
             logger.error(
@@ -380,10 +380,6 @@ class DatabaseAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            if idx > 0:
-                logger.info("[DBAgent] Waiting 2 s between stages (rate limit) …")
-                time.sleep(2)
-
             # Split into trivial batches + non-trivial singles
             trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
             non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]

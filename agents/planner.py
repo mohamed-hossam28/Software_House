@@ -306,7 +306,7 @@ class PlannerAgent(BaseAgent):
         try:
             from agents.schemas.planner import TaskSchema
             raw = self._call_with_system(DATABASE_SYSTEM, prompt, "database", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
+            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
             with lock:
                 results["database"] = data
             logger.info("[PlannerAgent] ✓ database tasks complete (%d items)", len(data))
@@ -326,7 +326,7 @@ class PlannerAgent(BaseAgent):
         try:
             from agents.schemas.planner import TaskSchema
             raw = self._call_with_system(BACKEND_SYSTEM, prompt, "backend", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
+            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
             with lock:
                 results["backend"] = data
             logger.info("[PlannerAgent] ✓ backend tasks complete (%d items)", len(data))
@@ -345,7 +345,7 @@ class PlannerAgent(BaseAgent):
         try:
             from agents.schemas.planner import TaskSchema
             raw = self._call_with_system(FRONTEND_SYSTEM, prompt, "frontend", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
+            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
             with lock:
                 results["frontend"] = data
             logger.info("[PlannerAgent] ✓ frontend tasks complete (%d items)", len(data))

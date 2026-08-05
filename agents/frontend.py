@@ -382,10 +382,6 @@ class FrontendAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            if idx > 0:
-                logger.info("[FrontendAgent] Sleeping 2s between stages (rate limit) …")
-                time.sleep(2)
-
             # Split into trivial batches + non-trivial singles
             trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
             non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]

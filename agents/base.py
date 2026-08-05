@@ -11,7 +11,6 @@ from providers.llm.llmFactory import LLMFactory as llmFactory
 
 from core.state import ProjectState
 import os
-from difflib import SequenceMatcher
 import sys
 from pathlib import Path
 from threading import Lock
@@ -73,7 +72,7 @@ def filter_api_contracts_by_relevance(
     task_title: str = "",
     top_k: int = 3,
 ) -> list[Any]:
-    """Filter and rank API contracts by relevance score."""
+    """Filter and rank API contracts by relevance score using Jaccard keyword similarity."""
     
     if not contracts:
         return []
@@ -81,23 +80,31 @@ def filter_api_contracts_by_relevance(
     if len(contracts) <= top_k:
         return contracts
     
-    search_text = f"{filepath} {purpose} {task_title}".lower()
+    search_words = set(re.findall(r"[a-zA-Z0-9]+", f"{filepath} {purpose} {task_title}".lower()))
+    if not search_words:
+        return contracts[:top_k]
     
     def score_contract(contract: Any) -> float:
         if isinstance(contract, dict):
-            c_text = f"{contract.get('path', '')} {contract.get('description', '')}".lower()
+            c_text = f"{contract.get('path', '')} {contract.get('description', '')}"
         else:
-            c_text = f"{getattr(contract, 'path', '')} {getattr(contract, 'description', '')}".lower()
+            c_text = f"{getattr(contract, 'path', '')} {getattr(contract, 'description', '')}"
         
-        # Use sequence matching for fuzzy similarity
-        return SequenceMatcher(None, search_text, c_text).ratio()
+        c_words = set(re.findall(r"[a-zA-Z0-9]+", c_text.lower()))
+        if not c_words:
+            return 0.0
+        
+        intersection = len(search_words & c_words)
+        if not intersection:
+            return 0.0
+        return intersection / len(search_words | c_words)
     
     # Compute score once per contract
     scored = [(score_contract(c), c) for c in contracts]
     scored.sort(key=lambda x: x[0], reverse=True)
     
     # Return top K with score > threshold
-    threshold = 0.35
+    threshold = 0.05
     filtered = [c for score, c in scored if score >= threshold]
     
     return filtered[:top_k] if filtered else [c for _, c in scored[:top_k]]
@@ -568,7 +575,13 @@ class BaseAgent(ABC):
                 obj = schema_cls(**data)
             return obj.model_dump() if hasattr(obj, "model_dump") else data
 
-    def _repair_json_via_llm(self, json_fragment: str, schema_cls: Any) -> str:
+    def _repair_json_via_llm(
+        self,
+        json_fragment: str,
+        schema_cls: Any,
+        state: Optional[ProjectState] = None,
+        lock: Optional[Any] = None,
+    ) -> str:
         """
         Send **only** the JSON fragment (not the full LLM prose) to the
         model for repair, together with the expected schema so the model
@@ -598,20 +611,25 @@ class BaseAgent(ABC):
 
         logger.info("[%s] Sending JSON fragment to LLM for repair…", self.name)
         try:
-            response = self.provider.complete(
-                system_prompt="You are a helpful assistant that repairs JSON syntax.",
-                user_message=repair_prompt,
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=0.1,
+            raw_text = self._call_with_system(
+                system="You are a helpful assistant that repairs JSON syntax.",
+                user=repair_prompt,
+                agent_name=f"{self.name}-repair",
+                state=state,
+                lock=lock,
             )
-            return response.text
+            return raw_text
         except Exception as exc:
             logger.error("[%s] LLM JSON repair call failed: %s", self.name, exc)
             return json_fragment
 
     def extract_json_and_validate(
-        self, text: str, schema_cls: Any, is_list: bool = False
+        self,
+        text: str,
+        schema_cls: Any,
+        is_list: bool = False,
+        state: Optional[ProjectState] = None,
+        lock: Optional[Any] = None,
     ) -> Any:
         """
         Three-stage extraction pipeline:
@@ -656,7 +674,7 @@ class BaseAgent(ABC):
             )
 
         # ── Stage 3: LLM repair (send only the JSON fragment) ───────
-        repaired_text = self._repair_json_via_llm(raw_fragment, schema_cls)
+        repaired_text = self._repair_json_via_llm(raw_fragment, schema_cls, state=state, lock=lock)
         try:
             parsed_repaired = extractor(repaired_text)
             result = self._validate_data(parsed_repaired, schema_cls, is_list)

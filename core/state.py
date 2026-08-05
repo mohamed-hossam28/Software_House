@@ -121,6 +121,7 @@ class ArchData(BaseModel):
     system_components: list[str] = Field(default_factory=list)
     api_contracts: list[APIContract] = Field(default_factory=list)
     database_schema_overview: str = ""
+    security_requirements: list[str] = Field(default_factory=list)
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths
 

@@ -366,10 +366,6 @@ class BackendAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            if idx > 0:
-                logger.info("[BackendAgent] Waiting 2s between stages to respect API rate limits ...")
-                time.sleep(2)
-
             # Split stage into trivial batches (2-3 files per LLM call) + non-trivial singles
             trivial  = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
             non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
