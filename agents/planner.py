@@ -296,29 +296,6 @@ class PlannerAgent(BaseAgent):
     def system_prompt(self) -> str:
         return _BASE_SYSTEM
 
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response unused; run() is overridden.")
-
-    # ── LLM helper with custom system prompt + streaming ─────────────────────
-    def _call_with_system(self, system: str, user: str, agent_name: str = "") -> str:
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.llm_call(
-                    prompt=user,
-                    system_prompt=system,
-                    agent_name=agent_name or self.name,
-                )
-                return response.text
-            except Exception as exc:
-                logger.warning("[PlannerAgent] LLM attempt %d/%d failed: %s",
-                               attempt, self.max_retries, exc)
-                if attempt == self.max_retries:
-                    raise
-                time.sleep(self.backoff * attempt)
-        raise RuntimeError("Unreachable")
 
     # ── Sub-call workers ─────────────────────────────────────────────────────
 
@@ -328,11 +305,10 @@ class PlannerAgent(BaseAgent):
         prompt = DATABASE_USER_TEMPLATE.format(database_schema_overview=db_schema)
         try:
             from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(DATABASE_SYSTEM, prompt, "database")
+            raw = self._call_with_system(DATABASE_SYSTEM, prompt, "database", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
             with lock:
                 results["database"] = data
-                state.metrics.total_llm_calls += 1
             logger.info("[PlannerAgent] ✓ database tasks complete (%d items)", len(data))
         except Exception as exc:
             logger.error("[PlannerAgent] database sub-call failed: %s", exc)
@@ -349,11 +325,10 @@ class PlannerAgent(BaseAgent):
         )
         try:
             from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(BACKEND_SYSTEM, prompt, "backend")
+            raw = self._call_with_system(BACKEND_SYSTEM, prompt, "backend", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
             with lock:
                 results["backend"] = data
-                state.metrics.total_llm_calls += 1
             logger.info("[PlannerAgent] ✓ backend tasks complete (%d items)", len(data))
         except Exception as exc:
             logger.error("[PlannerAgent] backend sub-call failed: %s", exc)
@@ -369,11 +344,10 @@ class PlannerAgent(BaseAgent):
         )
         try:
             from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(FRONTEND_SYSTEM, prompt, "frontend")
+            raw = self._call_with_system(FRONTEND_SYSTEM, prompt, "frontend", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, TaskSchema, is_list=True)
             with lock:
                 results["frontend"] = data
-                state.metrics.total_llm_calls += 1
             logger.info("[PlannerAgent] ✓ frontend tasks complete (%d items)", len(data))
         except Exception as exc:
             logger.error("[PlannerAgent] frontend sub-call failed: %s", exc)

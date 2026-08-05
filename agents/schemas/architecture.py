@@ -38,5 +38,6 @@ class ArchitectureSchema(BaseModel):
     system_components: List[str] = Field(default_factory=list)
     api_contracts: List[APIContractSchema] = Field(default_factory=list)
     database_schema_overview: str = ""
+    data_flow: str = ""
     deployment_strategy: str = ""
     security_requirements: List[str] = Field(default_factory=list)

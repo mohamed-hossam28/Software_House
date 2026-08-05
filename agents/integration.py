@@ -361,16 +361,11 @@ class IntegrationAgent(BaseAgent):
     def system_prompt(self) -> str:
         return SYSTEM_PROMPT
 
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response unused; run() is overridden.")
 
 
     # ── Phase 1: Deterministic Static Checks ──────────────────────────────────
 
-    def _check_single_file(self, filepath: str, fm: FileManifest, state: ProjectState, manifest_files: list[str], internal_prefixes: set[str]) -> list[dict]:
+    def _check_single_file(self, filepath: str, fm: FileManifest, state: ProjectState, manifest_files: list[str], internal_prefixes: set[str]) -> tuple[list[dict], list[str]]:
         conflicts = []
         code = get_file_code(filepath, fm, state)
 
@@ -378,7 +373,7 @@ class IntegrationAgent(BaseAgent):
             # If not written, check if it's already declared as a known gap.
             # Planner/Agents mark unwritten dependencies, but if it is completely unwritten and has exports, we don't fail here.
             # Rule 9: "Do not report missing_dependencies or suggested_additions if already declared in the owning manifest entry."
-            return conflicts
+            return conflicts, []
 
         # 1. Verify actual exports vs promised exports
         actual_defs = extract_actual_definitions(code, filepath)
@@ -453,8 +448,7 @@ class IntegrationAgent(BaseAgent):
                                     "reason": f"Call to '{name}' in '{filepath}' passed {passed_count} arguments, but target defines {len(args)} arguments ({min_args} required)."
                                 })
 
-        setattr(fm, "_resolved_imports", resolved_paths)
-        return conflicts
+        return conflicts, resolved_paths
 
     def _run_deterministic_checks(self, state: ProjectState) -> list[dict]:
         manifest = state.code_manifest
@@ -468,28 +462,27 @@ class IntegrationAgent(BaseAgent):
                 internal_prefixes.add(parts[0])
 
         conflicts = []
+        resolved_imports_map: dict[str, list[str]] = {}
 
         # 1. Parallel verification per-file
-        lock = Lock()
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
-            futures: list[Future] = []
+            futures: dict[Future, str] = {}
             for path, fm in manifest.files.items():
                 if fm.written:
-                    futures.append(pool.submit(self._check_single_file, path, fm, state, manifest_files, internal_prefixes))
+                    fut = pool.submit(self._check_single_file, path, fm, state, manifest_files, internal_prefixes)
+                    futures[fut] = path
 
-            for future in futures:
+            for future, path in futures.items():
                 try:
-                    res = future.result()
-                    if res:
-                        conflicts.extend(res)
+                    res_conflicts, resolved_paths = future.result()
+                    if res_conflicts:
+                        conflicts.extend(res_conflicts)
+                    resolved_imports_map[path] = resolved_paths
                 except Exception as exc:
                     logger.error("[IntegrationAgent] Verification task exception: %s", exc)
 
         # 2. Cycle Detection (report only, never auto-fix)
-        graph = {}
-        for path, fm in manifest.files.items():
-            if fm.written:
-                graph[path] = getattr(fm, "_resolved_imports", [])
+        graph = resolved_imports_map
 
         visited = {}
         path_stack = []
@@ -823,14 +816,7 @@ class IntegrationAgent(BaseAgent):
                 applied = self._apply_fixes(ps, classifications, conflicts)
                 if applied:
                     logger.info("[IntegrationAgent] Re-running deterministic checks post-fixes…")
-                    for fm in ps.code_manifest.files.values():
-                        if hasattr(fm, "_resolved_imports"):
-                            delattr(fm, "_resolved_imports")
                     conflicts = self._run_deterministic_checks(ps)
-
-        for fm in ps.code_manifest.files.values():
-            if hasattr(fm, "_resolved_imports"):
-                delattr(fm, "_resolved_imports")
 
         merged = len(conflicts) == 0
         conflict_strings = [

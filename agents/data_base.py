@@ -48,6 +48,7 @@ try:
     from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
 except ImportError:
     from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
+from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -106,62 +107,8 @@ No prose outside the JSON object.
 # ── Priority-based stage resolver ──────────────────────────────────────────────
 
 def resolve_db_stages(tasks: list[Task]) -> list[list[Task]]:
-    """
-    Groups DB tasks into execution stages based on priority then depends_on.
-
-    Algorithm:
-      1. Sort all tasks by priority ascending (lower = more urgent / foundational).
-      2. Walk priority levels in order; within each level, apply topological
-         ordering so that tasks whose depends_on are satisfied run first.
-      3. Tasks at the same priority with no cross-dependencies form one stage
-         and execute in parallel.
-
-    Returns a list of stages; each stage is a list of Task objects safe to run
-    concurrently (they share no intra-stage dependency).
-    """
-    if not tasks:
-        return []
-
-    task_map = {t.id: t for t in tasks}
-    db_ids = set(task_map.keys())
-
-    # Group by priority
-    priority_groups: dict[int, list[Task]] = {}
-    for t in tasks:
-        priority_groups.setdefault(t.priority, []).append(t)
-
-    stages: list[list[Task]] = []
-    completed: set[str] = set()
-
-    for priority in sorted(priority_groups.keys()):
-        group = priority_groups[priority]
-        remaining = list(group)
-
-        # Within the priority group, topologically sort by depends_on
-        while remaining:
-            ready: list[Task] = []
-            for task in remaining:
-                db_deps = [d for d in task.depends_on if d in db_ids]
-                if all(d in completed for d in db_deps):
-                    ready.append(task)
-
-            if not ready:
-                # Cycle or cross-priority deps not yet resolved — bundle remainder
-                logger.warning(
-                    "[DBAgent] Possible cycle or unresolved deps at priority %d; "
-                    "bundling %d tasks together.", priority, len(remaining)
-                )
-                stages.append(remaining)
-                for t in remaining:
-                    completed.add(t.id)
-                break
-
-            stages.append(ready)
-            for t in ready:
-                completed.add(t.id)
-                remaining.remove(t)
-
-    return stages
+    """Groups DB tasks into execution stages based on priority then depends_on."""
+    return resolve_stages(tasks, use_priority=True)
 
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
@@ -232,17 +179,6 @@ Return a single JSON object with keys: migration_code, manifest, functions.
 """
 
 
-# ── Disk writer ────────────────────────────────────────────────────────────────
-
-def _write_to_disk(filepath: str, code: str) -> None:
-    rel = filepath.lstrip("/").lstrip("\\")
-    if not rel.startswith(OUTPUT_DIR):
-        rel = os.path.join(OUTPUT_DIR, rel)
-    abs_path = os.path.join(_root_dir, rel)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as fh:
-        fh.write(code)
-
 
 # ── Manifest XML serialiser ────────────────────────────────────────────────────
 
@@ -272,32 +208,6 @@ class DatabaseAgent(BaseAgent):
     def system_prompt(self) -> str:
         return "You are an expert database engineer."
 
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response unused; run() is overridden.")
-
-    # ── LLM wrapper ───────────────────────────────────────────────────────────
-
-    def _call_with_system(self, system: str, user: str, agent_name: str = "database") -> str:
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self.llm_call(
-                    prompt=user,
-                    system_prompt=system,
-                    agent_name=agent_name,
-                )
-                return resp.text
-            except Exception as exc:
-                logger.warning(
-                    "[DBAgent] LLM attempt %d/%d failed: %s",
-                    attempt, self.max_retries, exc,
-                )
-                if attempt == self.max_retries:
-                    raise
-                time.sleep(self.backoff * attempt)
-        raise RuntimeError("Unreachable")
 
     # ── Trivial batch worker ──────────────────────────────────────────────────
 
@@ -336,7 +246,7 @@ class DatabaseAgent(BaseAgent):
         logger.info("[DBAgent] Batch trivial call: %s", filepaths)
 
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="db-batch")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="db-batch", state=state, lock=lock)
         except Exception as exc:
             logger.error("[DBAgent] Batch LLM call failed: %s", exc)
             with lock:
@@ -344,18 +254,7 @@ class DatabaseAgent(BaseAgent):
             return
 
         try:
-            text = raw.strip()
-            text = re.sub(r'^```[a-z]*\n?', '', text, flags=re.MULTILINE).strip().rstrip('`').strip()
-            m_arr = re.search(r'\[.*\]', text, re.DOTALL)
-            m_obj = re.search(r'\{.*\}', text, re.DOTALL)
-            if m_arr:
-                items: list[dict] = _json.loads(m_arr.group(0))
-            elif m_obj:
-                items = [_json.loads(m_obj.group(0))]
-            else:
-                items = _json.loads(text)
-            if not isinstance(items, list):
-                items = [items]
+            items = self._parse_batch_response(raw)
         except Exception as exc:
             logger.error("[DBAgent] Batch JSON parse failed: %s — raw: %s", exc, raw[:300])
             with lock:
@@ -371,41 +270,16 @@ class DatabaseAgent(BaseAgent):
             if not code:
                 logger.warning("[DBAgent] Batch: empty migration_code for %s", fm.filepath)
                 continue
-            manifest_data: dict = item.get("manifest") or {}
-            classes: list[ClassName] = []
-            if manifest_data and "table_name" in manifest_data:
-                table_name = manifest_data["table_name"]
-                columns = manifest_data.get("columns", [])
-                args = []
-                for col in columns:
-                    col_name = col.get("name", "")
-                    col_type = col.get("type", "unknown")
-                    default_val = ""
-                    if col.get("primary_key"):
-                        col_type += " (PK)"
-                    if col.get("foreign_key"):
-                        col_type += f" (FK -> {col['foreign_key']})"
-                    if col.get("nullable"):
-                        default_val = "NULL"
-                    args.append(Argument(
-                        name=col_name,
-                        type=col_type,
-                        default=default_val
-                    ))
-                classes.append(ClassName(
-                    name=table_name,
-                    arguments=args,
-                    docstring=f"Table schema for {table_name}"
-                ))
+            classes, functions = parse_metadata(item)
             try:
                 _write_to_disk(fm.filepath, code)
             except Exception as exc:
                 logger.error("[DBAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
             with lock:
-                state.generated_code.database[fm.filepath] = code
-                state.code_manifest.mark_written(fm.filepath, classes, [])
+                code_bucket = getattr(state.generated_code, self.code_bucket)
+                code_bucket[fm.filepath] = code
+                state.code_manifest.mark_written(fm.filepath, classes, functions)
                 state.completed_task_ids.add(task.id)
-                state.metrics.total_llm_calls += 0  # counted at call site
             logger.info("[DBAgent] ✓ batch trivial: %s", fm.filepath)
 
     # ── Per-task worker ───────────────────────────────────────────────────────
@@ -438,7 +312,7 @@ class DatabaseAgent(BaseAgent):
 
         # LLM call (outside lock — blocking I/O)
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"db-{task.id}")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"db-{task.id}", state=state, lock=lock)
         except Exception as exc:
             logger.error("[DBAgent] LLM call failed for %s: %s", filepath, exc)
             with lock:
@@ -465,48 +339,7 @@ class DatabaseAgent(BaseAgent):
                 state.log_error(self.name, f"'migration_code' missing for {filepath}")
             return
 
-        manifest_data: dict = data.get("manifest") or {}
-
-        # Parse table schema from manifest into classes list to keep it in the state
-        classes: list[ClassName] = []
-        if manifest_data and "table_name" in manifest_data:
-            table_name = manifest_data["table_name"]
-            columns = manifest_data.get("columns", [])
-            args = []
-            for col in columns:
-                col_name = col.get("name", "")
-                col_type = col.get("type", "unknown")
-                default_val = ""
-                if col.get("primary_key"):
-                    col_type += " (PK)"
-                if col.get("foreign_key"):
-                    col_type += f" (FK -> {col['foreign_key']})"
-                if col.get("nullable"):
-                    default_val = "NULL"
-                args.append(Argument(
-                    name=col_name,
-                    type=col_type,
-                    default=default_val
-                ))
-            classes.append(ClassName(
-                name=table_name,
-                arguments=args,
-                docstring=f"Table schema for {table_name}"
-            ))
-
-        # Parse optional helper function metadata
-        functions: list[FunctionName] = []
-        for f in data.get("functions", []):
-            try:
-                args = [Argument(**a) for a in f.get("arguments", [])]
-                functions.append(FunctionName(
-                    name=f["name"],
-                    arguments=args,
-                    return_type=f.get("return_type", "None"),
-                    docstring=f.get("docstring", ""),
-                ))
-            except Exception as e:
-                logger.warning("[DBAgent] Function metadata parse error: %s", e)
+        classes, functions = parse_metadata(data)
 
         # Write migration file to disk (only write code)
         try:
@@ -522,8 +355,6 @@ class DatabaseAgent(BaseAgent):
             state.generated_code.database[filepath] = migration_code
             state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
             state.completed_task_ids.add(task.id)
-            state.metrics.total_tokens_used += 0  # tokens tracked in _call_with_system
-            state.metrics.total_llm_calls += 1
 
         logger.info("[DBAgent] ✓ %s", filepath)
 
@@ -580,8 +411,6 @@ class DatabaseAgent(BaseAgent):
                         logger.error("[DBAgent] Unhandled task exception: %s", exc)
                         with state_lock:
                             ps.log_error(self.name, f"Task exception: {exc}")
-
-            ps.metrics.total_llm_calls += len(batches) + len(non_trivial)
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)

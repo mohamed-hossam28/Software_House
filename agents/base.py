@@ -12,7 +12,9 @@ from providers.llm.llmFactory import LLMFactory as llmFactory
 from core.state import ProjectState
 import os
 from difflib import SequenceMatcher
-
+import sys
+from pathlib import Path
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
@@ -195,20 +197,28 @@ class BaseAgent(ABC):
         return self.__class__.__name__
 
     @property
+    def code_bucket(self) -> str:
+        """Name of the dictionary attribute in ProjectState.generated_code (e.g. 'backend', 'frontend', 'database')."""
+        name = self.name.lower()
+        if name.endswith("agent"):
+            name = name[:-5]
+        if name in ("data_base", "db"):
+            name = "database"
+        return name
+
+    @property
     @abstractmethod
     def system_prompt(self)->str:
         """Get the system prompt of the agent."""
         ...
 
-    @abstractmethod
-    def _build_prompt(self,state:ProjectState)->str:
-        """Build the prompt for the agent."""
-        ...
+    def _build_prompt(self, state: ProjectState) -> str:
+        """Build the prompt for single-call agents using default run(). Override in subclass if using default run()."""
+        raise NotImplementedError(f"[{self.name}] _build_prompt() is not implemented.")
 
-    @abstractmethod
-    def _parse_response(self,state:ProjectState,raw:str)->ProjectState:
-        """Parse the response from the agent."""
-        ...
+    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
+        """Parse response for single-call agents using default run(). Override in subclass if using default run()."""
+        raise NotImplementedError(f"[{self.name}] _parse_response() is not implemented.")
     
 
 
@@ -219,33 +229,12 @@ class BaseAgent(ABC):
         system_prompt: Optional[str] = None,
         agent_name: Optional[str] = None,
     ) -> LLMResponse:
-        import sys
-        from threading import Lock
+        
 
         sys_prompt = system_prompt if system_prompt is not None else self.system_prompt
         prefix = agent_name if agent_name is not None else self.name
 
-        class LineBufferedPrinter:
-            _print_lock = Lock()
-            def __init__(self, prefix: str):
-                self.prefix = prefix
-                self.buffer = ""
-            def __call__(self, chunk: str):
-                self.buffer += chunk
-                while "\n" in self.buffer:
-                    line, self.buffer = self.buffer.split("\n", 1)
-                    with LineBufferedPrinter._print_lock:
-                        sys.stdout.write(f"[{self.prefix}] {line}\n")
-                        sys.stdout.flush()
-            def flush(self):
-                if self.buffer:
-                    with LineBufferedPrinter._print_lock:
-                        sys.stdout.write(f"[{self.prefix}] {self.buffer}\n")
-                        sys.stdout.flush()
-                    self.buffer = ""
-
         printer = LineBufferedPrinter(prefix)
-
         try:
             response = self.provider.complete(
                 system_prompt = sys_prompt,
@@ -269,6 +258,83 @@ class BaseAgent(ABC):
                 raise
         printer.flush()
         return response
+
+    def _call_with_system(
+        self,
+        system: str,
+        user: str,
+        agent_name: str = "",
+        state: Optional[ProjectState] = None,
+        lock: Optional[Any] = None,
+    ) -> str:
+        """
+        Variant of llm_call() that accepts a dedicated system prompt.
+        Retries up to self.max_retries with exponential back-off.
+        Returns raw text and thread-safely updates state metrics if state is provided.
+        """
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.llm_call(
+                    prompt=user,
+                    system_prompt=system,
+                    agent_name=agent_name or self.name,
+                )
+                if state is not None:
+                    if lock is not None:
+                        with lock:
+                            state.metrics.total_tokens_used += response.total_tokens
+                            state.metrics.total_llm_calls += 1
+                    else:
+                        state.metrics.total_tokens_used += response.total_tokens
+                        state.metrics.total_llm_calls += 1
+                return response.text
+            except Exception as exc:
+                logger.warning(
+                    "[%s] LLM attempt %d/%d failed: %s",
+                    self.name, attempt, self.max_retries, exc,
+                )
+                if attempt == self.max_retries:
+                    raise
+                time.sleep(self.backoff * attempt)
+        raise RuntimeError("Unreachable")
+
+    def _parse_batch_response(self, raw: str) -> list[dict]:
+        """
+        Parse raw text response from a batch LLM call into a list of dictionaries.
+        Strips markdown code fences and extracts JSON array or object fallback.
+        """
+        text = self._strip_fences(raw).strip()
+
+        # 1. Try parsing JSON array
+        try:
+            raw_arr = self._extract_raw_json(text, "[")
+            items = self._try_parse(raw_arr, list)
+            if isinstance(items, list):
+                return items
+        except Exception:
+            pass
+
+        # 2. Try parsing single JSON object and wrapping in list
+        try:
+            raw_obj = self._extract_raw_json(text, "{")
+            items = self._try_parse(raw_obj, dict)
+            if isinstance(items, dict):
+                return [items]
+        except Exception:
+            pass
+
+        # 3. Fallback using json_repair
+        import json_repair
+        try:
+            res = json_repair.loads(text)
+            if isinstance(res, list):
+                return res
+            elif isinstance(res, dict):
+                return [res]
+        except Exception:
+            pass
+
+        raise ValueError(f"Batch JSON parse failed: {raw[:300]}")
 
 
     @staticmethod
@@ -602,3 +668,23 @@ class BaseAgent(ABC):
                 self.name, stage3_exc,
             )
             raise stage3_exc
+
+########stream printer with thread safety########   
+class LineBufferedPrinter:
+            _print_lock = Lock()
+            def __init__(self, prefix: str):
+                self.prefix = prefix
+                self.buffer = ""
+            def __call__(self, chunk: str):
+                self.buffer += chunk
+                while "\n" in self.buffer:
+                    line, self.buffer = self.buffer.split("\n", 1)
+                    with LineBufferedPrinter._print_lock:
+                        sys.stdout.write(f"[{self.prefix}] {line}\n")
+                        sys.stdout.flush()
+            def flush(self):
+                if self.buffer:
+                    with LineBufferedPrinter._print_lock:
+                        sys.stdout.write(f"[{self.prefix}] {self.buffer}\n")
+                        sys.stdout.flush()
+                    self.buffer = ""

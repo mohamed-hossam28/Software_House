@@ -1,5 +1,6 @@
 import logging
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+from agents.utils import _as_list
 from providers.llm.base import BaseLLMProvider
 from core.state import ProjectState, SRSData
 
@@ -200,14 +201,6 @@ class RequirementsAgent(BaseAgent):
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
-
-def _as_list(value: object) -> list[str]:
-    """Coerce to list[str] — handles None and non-list values gracefully."""
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    if value is None:
-        return []
-    return [str(value)]
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  Quick smoke-test  (run:  python -m agents.Requirements)                    ║

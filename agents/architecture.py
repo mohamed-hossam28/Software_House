@@ -23,6 +23,7 @@ from threading import Lock
 from typing import Any
 
 from .base import BaseAgent
+from agents.utils import _as_list
 from core.state import ProjectState, ArchData, SRSData, APIContract
 
 logger = logging.getLogger(__name__)
@@ -200,14 +201,6 @@ def _tech_stack_table(stack: dict[str, str]) -> str:
     return header + "\n" + "\n".join(rows)
 
 
-def _as_list(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    if value is None:
-        return []
-    return [str(value)]
-
-
 def _validated_contracts(raw: Any) -> list[APIContract]:
     """Parse raw LLM output into a list of typed APIContract objects."""
     if not isinstance(raw, list):
@@ -329,32 +322,6 @@ class ArchitectureAgent(BaseAgent):
     def system_prompt(self) -> str:
         return _BASE_SYSTEM
 
-    # ── unused (run is overridden) ───────────────────────────────────────────
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response unused; run() is overridden.")
-
-    # ── LLM helper with custom system prompt ─────────────────────────────────
-    def _call_with_system(self, system: str, user: str, agent_name: str = "") -> str:
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.llm_call(
-                    prompt=user,
-                    system_prompt=system,
-                    agent_name=agent_name or self.name,
-                )
-                return response.text
-            except Exception as exc:
-                logger.warning(
-                    "[ArchitectureAgent] LLM attempt %d/%d failed: %s",
-                    attempt, self.max_retries, exc,
-                )
-                if attempt == self.max_retries:
-                    raise
-                time.sleep(self.backoff * attempt)
-        raise RuntimeError("Unreachable")
 
     # ── Individual sub-call workers ──────────────────────────────────────────
 
@@ -363,13 +330,12 @@ class ArchitectureAgent(BaseAgent):
         prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{srs_text}\n```json\n"
         try:
             from agents.schemas.architecture import CoreArchitectureSchema
-            raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core")
+            raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, CoreArchitectureSchema)
             with lock:
                 results["tech_stack"] = data.get("tech_stack", {})
                 results["system_components"] = data.get("system_components", [])
                 results["security_requirements"] = data.get("security_requirements", [])
-                state.metrics.total_llm_calls += 1
             logger.info("[ArchitectureAgent] ✓ core_architecture complete (tech_stack, system_components, security)")
         except Exception as exc:
             logger.error("[ArchitectureAgent] core_architecture failed: %s", exc)
@@ -380,11 +346,10 @@ class ArchitectureAgent(BaseAgent):
                         results: dict, lock: Lock, state: ProjectState) -> None:
         try:
             from agents.schemas.architecture import DbSchemaOverviewSchema
-            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n", "arch-db")
+            raw = self._call_with_system(DB_SCHEMA_SYSTEM, srs_text + "\n```json\n", "arch-db", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema)
             with lock:
                 results["database_schema_overview"] = data.get("database_schema_overview", "")
-                state.metrics.total_llm_calls += 1
             logger.info("[ArchitectureAgent] ✓ db_schema_overview complete")
         except Exception as exc:
             logger.error("[ArchitectureAgent] db_schema_overview failed: %s", exc)
@@ -400,11 +365,10 @@ class ArchitectureAgent(BaseAgent):
         )
         try:
             from agents.schemas.architecture import APIContractsSchema
-            raw = self._call_with_system(API_CONTRACTS_SYSTEM, context, "arch-api")
+            raw = self._call_with_system(API_CONTRACTS_SYSTEM, context, "arch-api", state=state, lock=lock)
             data = self.extract_json_and_validate(raw, APIContractsSchema)
             with lock:
                 results["api_contracts"] = data.get("api_contracts", [])
-                state.metrics.total_llm_calls += 1
             logger.info("[ArchitectureAgent] ✓ api_contracts complete")
         except Exception as exc:
             logger.error("[ArchitectureAgent] api_contracts failed: %s", exc)

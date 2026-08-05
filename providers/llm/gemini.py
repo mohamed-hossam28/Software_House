@@ -54,20 +54,32 @@ class GeminiProvider(BaseLLMProvider):
 
         if stream:
             chunks: list[str] = []
+            input_tokens = 0
+            output_tokens = 0
             for chunk in self.client.models.generate_content_stream(
                 model    = actual_model,
                 contents = user_message,
                 config   = config,
             ):
+                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                    usage = chunk.usage_metadata
+                    input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
                 if chunk.text:
                     chunks.append(chunk.text)
                     if chunk_callback:
                         chunk_callback(chunk.text)
 
+            full_text = "".join(chunks)
+            if input_tokens == 0:
+                input_tokens = max(1, (len(system_prompt) + len(user_message)) // 4)
+            if output_tokens == 0:
+                output_tokens = max(1, len(full_text) // 4)
+
             return LLMResponse(
-                text          = "".join(chunks),
-                input_tokens  = 0,
-                output_tokens = 0,
+                text          = full_text,
+                input_tokens  = input_tokens,
+                output_tokens = output_tokens,
                 model         = actual_model,
                 provider      = self.provider_name,
             )

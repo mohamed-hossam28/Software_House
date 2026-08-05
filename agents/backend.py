@@ -38,6 +38,7 @@ try:
 except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+from agents.utils import write_code_to_disk, write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -78,36 +79,8 @@ Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","argume
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def resolve_backend_stages(tasks: list[Task]) -> list[list[Task]]:
-    """
-    Sorts backend tasks into execution stages based on their dependencies.
-    Tasks in the same stage have no dependencies on each other and can be run in parallel.
-    """
-    task_map = {t.id: t for t in tasks}
-    backend_ids = set(task_map.keys())
-    
-    stages: list[list[Task]] = []
-    visited: set[str] = set()
-    remaining = list(tasks)
-    
-    while remaining:
-        current_stage: list[Task] = []
-        for task in remaining:
-            # A backend task is ready to run if all its backend dependencies are already completed
-            be_deps = [d for d in task.depends_on if d in backend_ids]
-            if all(d in visited for d in be_deps):
-                current_stage.append(task)
-                
-        if not current_stage:
-            # Cycle detected or unreachable tasks — package remaining together to avoid deadlock
-            stages.append(remaining)
-            break
-            
-        stages.append(current_stage)
-        for task in current_stage:
-            visited.add(task.id)
-            remaining.remove(task)
-            
-    return stages
+    """Sorts backend tasks into execution stages based on their dependencies."""
+    return resolve_stages(tasks, use_priority=False)
 
 
 def _build_file_prompt(
@@ -220,19 +193,6 @@ Respond with a single valid JSON object containing "code", "classes", and "funct
     return user_prompt
 
 
-OUTPUT_DIR = "output"
-
-def write_code_to_disk(filepath: str, code: str) -> None:
-    """Safely writes the generated code to the project output directory."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    rel = filepath.lstrip("/").lstrip("\\")
-    if not rel.startswith(OUTPUT_DIR + "/") and not rel.startswith(OUTPUT_DIR + "\\") and rel != OUTPUT_DIR:
-        rel = os.path.join(OUTPUT_DIR, rel)
-    abs_path = os.path.join(root_dir, rel)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(code)
-
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  BackendAgent                                                                ║
@@ -246,35 +206,6 @@ class BackendAgent(BaseAgent):
     def system_prompt(self) -> str:
         return "You are an expert backend engineer."
 
-    def _call_with_system(self, system: str, user: str, agent_name: str = "backend") -> str:
-        """
-        Variant of llm_call() that accepts a dedicated system prompt.
-        Retries up to self.max_retries with exponential back-off.
-        Returns the raw text response.
-        """
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.llm_call(
-                    prompt=user,
-                    system_prompt=system,
-                    agent_name=agent_name,
-                )
-                return response.text
-            except Exception as exc:
-                logger.warning(
-                    "[BackendAgent] LLM attempt %d/%d failed: %s",
-                    attempt, self.max_retries, exc,
-                )
-                if attempt == self.max_retries:
-                    raise
-                time.sleep(self.backoff * attempt)
-        raise RuntimeError("Unreachable")
-
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt is unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response is unused; run() is overridden.")
 
     def _build_batch_prompt(self, tasks: list[Task], manifest: Any, arch: Any) -> str:
         """Build a compact batch prompt for 2-3 trivial files, returning a JSON array."""
@@ -304,42 +235,23 @@ class BackendAgent(BaseAgent):
         with lock:
             manifest = state.code_manifest
             arch = state.architecture
-            backend_tech = arch.tech_stack.get("backend", "FastAPI") if arch.tech_stack else "FastAPI"
+            backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
             sys_prompt = _build_system_prompt(backend_tech)
             user_prompt = self._build_batch_prompt(tasks, manifest, arch)
 
-        filepaths = []
-        for t in tasks:
-            with lock:
-                fm = manifest.by_task(t.id)
-            if fm:
-                filepaths.append(fm.filepath)
-
+        filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
         logger.info("[BackendAgent] Batch trivial call: %s", filepaths)
+
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="be-batch")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="be-batch", state=state, lock=lock)
         except Exception as exc:
             logger.error("[BackendAgent] Batch LLM call failed: %s", exc)
             with lock:
                 state.log_error(self.name, f"Batch LLM call failed: {exc}")
             return
 
-        # Parse JSON array (strip markdown code fences first)
         try:
-            text = raw.strip()
-            # Strip markdown code fence if present
-            text = re.sub(r'^```[a-z]*\n?', '', text, flags=re.MULTILINE).strip().rstrip('`').strip()
-            # Prefer JSON array; fall back to wrapping a single-object response
-            m_arr = re.search(r'\[.*\]', text, re.DOTALL)
-            m_obj = re.search(r'\{.*\}', text, re.DOTALL)
-            if m_arr:
-                items: list[dict] = _json.loads(m_arr.group(0))
-            elif m_obj:
-                items = [_json.loads(m_obj.group(0))]
-            else:
-                items = _json.loads(text)
-            if not isinstance(items, list):
-                items = [items]
+            items = self._parse_batch_response(raw)
         except Exception as exc:
             logger.error("[BackendAgent] Batch JSON parse failed: %s — raw: %s", exc, raw[:300])
             with lock:
@@ -351,35 +263,18 @@ class BackendAgent(BaseAgent):
                 fm = manifest.by_task(task.id)
             if not fm:
                 continue
-            filepath = item.get("filepath", fm.filepath)
             code = str(item.get("code", "")).strip()
             if not code:
-                logger.warning("[BackendAgent] Batch: empty code for %s — skipping", filepath)
+                logger.warning("[BackendAgent] Batch: empty code for %s — skipping", fm.filepath)
                 continue
-            classes: list[ClassName] = []
-            for c in item.get("classes", []):
-                try:
-                    args = [Argument(**a) for a in c.get("arguments", [])]
-                    classes.append(ClassName(name=c["name"], arguments=args, docstring=c.get("docstring", "")))
-                except Exception:
-                    pass
-            functions: list[FunctionName] = []
-            for f in item.get("functions", []):
-                try:
-                    args = [Argument(**a) for a in f.get("arguments", [])]
-                    functions.append(FunctionName(
-                        name=f["name"], arguments=args,
-                        return_type=f.get("return_type", "None"),
-                        docstring=f.get("docstring", ""),
-                    ))
-                except Exception:
-                    pass
+            classes, functions = parse_metadata(item, default_return_type="None")
             try:
                 write_code_to_disk(fm.filepath, code)
             except Exception as exc:
                 logger.error("[BackendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
             with lock:
-                state.generated_code.backend[fm.filepath] = code
+                code_bucket = getattr(state.generated_code, self.code_bucket)
+                code_bucket[fm.filepath] = code
                 state.code_manifest.mark_written(fm.filepath, classes, functions)
                 state.completed_task_ids.add(task.id)
             logger.info("[BackendAgent] ✓ batch trivial: %s", fm.filepath)
@@ -401,32 +296,29 @@ class BackendAgent(BaseAgent):
 
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
         with lock:
-            user_prompt = _build_file_prompt(filepath, manifest, state.architecture, task=task)
-            backend_tech = "FastAPI (Python 3.12)"
-            if hasattr(state.architecture, 'tech_stack') and state.architecture.tech_stack:
-                backend_tech = state.architecture.tech_stack.get("backend", backend_tech)
-            sys_prompt = _build_system_prompt(backend_tech)
+            arch = state.architecture
+            all_contracts = arch.api_contracts if arch else []
 
-        # Call the LLM
+        relevant_deps = filter_manifest_by_dependencies(manifest, file_manifest)
+        relevant_contracts = filter_api_contracts_by_relevance(all_contracts, file_manifest)
+        user_prompt = self._build_single_task_prompt(task, file_manifest, relevant_deps, relevant_contracts, arch)
+
+        backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
+        sys_prompt = _build_system_prompt(backend_tech)
+
         try:
-            raw_response = self._call_with_system(sys_prompt, user_prompt, agent_name=f"be-{task.id}")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"be-{task.id[:6]}", state=state, lock=lock)
         except Exception as exc:
-            logger.error("[BackendAgent] LLM call failed for %s after retries: %s", filepath, exc)
+            logger.error("[BackendAgent] LLM call failed for %s: %s", filepath, exc)
             with lock:
                 state.log_error(self.name, f"LLM call failed for {filepath}: {exc}")
             return
 
-        # Parse JSON from raw response
-        try:
-            from agents.schemas.backend import BackendSchema
-            data = self.extract_json_and_validate(raw_response, BackendSchema)
-        except Exception as exc:
-            logger.error(
-                "[BackendAgent] JSON parse/validation failed for %s: %s — raw response (first 500 chars): %s",
-                filepath, exc, raw_response[:500] if raw_response else "(empty)",
-            )
+        data = self._try_parse_json(raw)
+        if not data or not isinstance(data, dict):
+            logger.error("[BackendAgent] JSON parse/validation failed for %s", filepath)
             with lock:
-                state.log_error(self.name, f"JSON parse/validation failed for {filepath}: {exc}")
+                state.log_error(self.name, f"JSON parse/validation failed for {filepath}")
             return
 
         code = data.get("code", "").strip()
@@ -437,26 +329,7 @@ class BackendAgent(BaseAgent):
             return
 
         # Parse classes and functions from JSON response
-        classes = []
-        for c in data.get("classes", []):
-            try:
-                args = [Argument(**a) for a in c.get("arguments", [])]
-                classes.append(ClassName(name=c["name"], arguments=args, docstring=c.get("docstring", "")))
-            except Exception as e:
-                logger.warning("[BackendAgent] Failed to parse class metadata: %s", e)
-
-        functions = []
-        for f in data.get("functions", []):
-            try:
-                args = [Argument(**a) for a in f.get("arguments", [])]
-                functions.append(FunctionName(
-                    name=f["name"],
-                    arguments=args,
-                    return_type=f.get("return_type", "None"),
-                    docstring=f.get("docstring", "")
-                ))
-            except Exception as e:
-                logger.warning("[BackendAgent] Failed to parse function metadata: %s", e)
+        classes, functions = parse_metadata(data, default_return_type="None")
 
         # Write code to disk
         try:
@@ -523,8 +396,6 @@ class BackendAgent(BaseAgent):
                     except Exception as exc:
                         logger.error("[BackendAgent] Task execution raised exception: %s", exc)
                         ps.log_error(self.name, f"Task execution error: {exc}")
-
-            ps.metrics.total_llm_calls += len(batches) + len(non_trivial)
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)

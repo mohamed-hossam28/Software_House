@@ -10,6 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # Import the agents
+from agents.base import BaseAgent
 from agents.Requirements import RequirementsAgent
 from agents.architecture import ArchitectureAgent
 from agents.planner import PlannerAgent
@@ -32,64 +33,6 @@ def _state_from_dict(state: dict | ProjectState) -> ProjectState:
     if isinstance(state, ProjectState):
         return state
     return ProjectState(**state)
-
-
-def _diff(before: ProjectState, after: ProjectState) -> dict:
-    """
-    Compare two ProjectState snapshots and return only the fields that changed.
-
-    This is the core of the diff-based refactoring: each node returns only
-    the keys it actually modified, so LangGraph never sees conflicting
-    values for the same key from parallel nodes.
-
-    For Annotated/reducer fields (metrics, errors, current_agent), we return
-    only the *delta* so the reducer can merge correctly:
-      - metrics: return a PerformanceMetrics with only the NEW counts/durations
-      - errors: return only the NEW error entries (appended by the agent)
-      - current_agent: return the new value (pick_latest_agent reducer handles it)
-    """
-    before_dict = before.model_dump(mode="json")
-    after_dict = after.model_dump(mode="json")
-
-    diff = {}
-    for key in after_dict:
-        if key == "metrics":
-            # Return the delta so the merge_performance_metrics reducer sums correctly
-            before_m = before_dict["metrics"]
-            after_m = after_dict["metrics"]
-            delta_tokens = after_m["total_tokens_used"] - before_m["total_tokens_used"]
-            delta_calls = after_m["total_llm_calls"] - before_m["total_llm_calls"]
-            # New or changed durations only
-            new_durations = {
-                k: v for k, v in after_m["agent_durations"].items()
-                if before_m["agent_durations"].get(k) != v
-            }
-            if delta_tokens or delta_calls or new_durations:
-                from core.state import PerformanceMetrics
-                diff["metrics"] = PerformanceMetrics(
-                    total_tokens_used=delta_tokens,
-                    total_llm_calls=delta_calls,
-                    agent_durations=new_durations,
-                )
-            continue
-
-        if key == "errors":
-            # Return only NEW errors so the merge_errors reducer appends them
-            new_errors = after_dict["errors"][len(before_dict["errors"]):]
-            if new_errors:
-                diff["errors"] = new_errors
-            continue
-
-        if key == "current_agent":
-            if after_dict["current_agent"] != before_dict["current_agent"]:
-                diff["current_agent"] = after_dict["current_agent"]
-            continue
-
-        # For all other fields, include only if changed
-        if before_dict[key] != after_dict[key]:
-            diff[key] = after_dict[key]
-
-    return diff
 
 
 # ── Node Definitions ─────────────────────────────────────────────────────────
@@ -174,7 +117,7 @@ def human_clarifying_questions_node(state: dict) -> dict:
             except ImportError:
                 logger.info("[GraphNode] Langsmith/Langgraph NodeInterrupt not available. Waiting...")
 
-    return _diff(before, ps)
+    return BaseAgent._compute_diff(before, ps)
 
 
 def architecture_node(state: dict) -> dict:

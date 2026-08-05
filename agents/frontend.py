@@ -36,6 +36,7 @@ try:
     from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
 except ImportError:
     from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -48,6 +49,10 @@ from core.state import (
     ClassName,
     FunctionName,
 )
+
+
+from agents.schemas.frontend import FrontendSchema
+
 
 logger = logging.getLogger(__name__)
 
@@ -86,33 +91,8 @@ Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","argume
 # ║  Stage resolver                                                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 def resolve_frontend_stages(tasks: list[Task]) -> list[list[Task]]:
-    """
-    Groups frontend tasks into dependency-resolved execution stages.
-    Tasks within a stage share no intra-frontend dependencies → safe to parallelise.
-    """
-    fe_ids = {t.id for t in tasks}
-    visited: set[str] = set()
-    remaining = list(tasks)
-    stages: list[list[Task]] = []
-
-    while remaining:
-        ready: list[Task] = []
-        for task in remaining:
-            fe_deps = [d for d in task.depends_on if d in fe_ids]
-            if all(d in visited for d in fe_deps):
-                ready.append(task)
-
-        if not ready:
-            # Cycle / unreachable — bundle remainder to avoid deadlock
-            stages.append(remaining)
-            break
-
-        stages.append(ready)
-        for t in ready:
-            visited.add(t.id)
-            remaining.remove(t)
-
-    return stages
+    """Groups frontend tasks into dependency-resolved execution stages."""
+    return resolve_stages(tasks, use_priority=False)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -221,20 +201,6 @@ Respond with a single JSON object — "code", "classes", "functions" — no pros
 """
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Disk writer                                                                ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-def _write_to_disk(filepath: str, code: str) -> None:
-    """Write generated code under OUTPUT_DIR, preserving sub-path structure."""
-    # Strip any leading "output/" the planner may have already added
-    rel = filepath.lstrip("/").lstrip("\\")
-    if not rel.startswith(OUTPUT_DIR):
-        rel = os.path.join(OUTPUT_DIR, rel)
-    abs_path = os.path.join(_root_dir, rel)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as fh:
-        fh.write(code)
-
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  FrontendAgent                                                              ║
@@ -252,31 +218,6 @@ class FrontendAgent(BaseAgent):
     def system_prompt(self) -> str:
         return "You are an expert frontend engineer."
 
-    def _build_prompt(self, state: ProjectState) -> str:
-        raise NotImplementedError("_build_prompt unused; run() is overridden.")
-
-    def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        raise NotImplementedError("_parse_response unused; run() is overridden.")
-
-    # ── LLM wrapper with per-call system prompt + retries ────────────────────
-    def _call_with_system(self, system: str, user: str, agent_name: str = "frontend") -> str:
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self.llm_call(
-                    prompt=user,
-                    system_prompt=system,
-                    agent_name=agent_name,
-                )
-                return resp.text
-            except Exception as exc:
-                logger.warning(
-                    "[FrontendAgent] LLM attempt %d/%d failed: %s",
-                    attempt, self.max_retries, exc,
-                )
-                if attempt == self.max_retries:
-                    raise
-                time.sleep(self.backoff * attempt)
-        raise RuntimeError("Unreachable")
 
     # ── Per-task worker (runs in thread pool) ─────────────────────────────────
     def _build_batch_prompt(
@@ -316,7 +257,7 @@ class FrontendAgent(BaseAgent):
         logger.info("[FrontendAgent] Batch trivial call: %s", filepaths)
 
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="fe-batch")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="fe-batch", state=state, lock=lock)
         except Exception as exc:
             logger.error("[FrontendAgent] Batch LLM call failed: %s", exc)
             with lock:
@@ -324,18 +265,7 @@ class FrontendAgent(BaseAgent):
             return
 
         try:
-            text = raw.strip()
-            text = re.sub(r'^```[a-z]*\n?', '', text, flags=re.MULTILINE).strip().rstrip('`').strip()
-            m_arr = re.search(r'\[.*\]', text, re.DOTALL)
-            m_obj = re.search(r'\{.*\}', text, re.DOTALL)
-            if m_arr:
-                items: list[dict] = _json.loads(m_arr.group(0))
-            elif m_obj:
-                items = [_json.loads(m_obj.group(0))]
-            else:
-                items = _json.loads(text)
-            if not isinstance(items, list):
-                items = [items]
+            items = self._parse_batch_response(raw)
         except Exception as exc:
             logger.error("[FrontendAgent] Batch JSON parse failed: %s — raw: %s", exc, raw[:300])
             with lock:
@@ -351,30 +281,14 @@ class FrontendAgent(BaseAgent):
             if not code:
                 logger.warning("[FrontendAgent] Batch: empty code for %s", fm.filepath)
                 continue
-            classes: list[ClassName] = []
-            for c in item.get("classes", []):
-                try:
-                    args = [Argument(**a) for a in c.get("arguments", [])]
-                    classes.append(ClassName(name=c["name"], arguments=args, docstring=c.get("docstring", "")))
-                except Exception:
-                    pass
-            functions: list[FunctionName] = []
-            for f in item.get("functions", []):
-                try:
-                    args = [Argument(**a) for a in f.get("arguments", [])]
-                    functions.append(FunctionName(
-                        name=f["name"], arguments=args,
-                        return_type=f.get("return_type", "void"),
-                        docstring=f.get("docstring", ""),
-                    ))
-                except Exception:
-                    pass
+            classes, functions = parse_metadata(item, default_return_type="void")
             try:
                 _write_to_disk(fm.filepath, code)
             except Exception as exc:
                 logger.error("[FrontendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
             with lock:
-                state.generated_code.frontend[fm.filepath] = code
+                code_bucket = getattr(state.generated_code, self.code_bucket)
+                code_bucket[fm.filepath] = code
                 state.code_manifest.mark_written(fm.filepath, classes, functions)
                 state.completed_task_ids.add(task.id)
             logger.info("[FrontendAgent] ✓ batch trivial: %s", fm.filepath)
@@ -383,6 +297,9 @@ class FrontendAgent(BaseAgent):
         """Generate code for one frontend file, write to disk, update manifest."""
         with lock:
             fm = state.code_manifest.by_task(task.id)
+            arch = state.architecture
+            all_contracts = arch.api_contracts if arch else []
+            manifest = state.code_manifest
         if not fm:
             logger.error("[FrontendAgent] Task %s has no manifest entry", task.id)
             with lock:
@@ -392,20 +309,16 @@ class FrontendAgent(BaseAgent):
         filepath = fm.filepath
         logger.info("[FrontendAgent] Generating %s (task %s) …", filepath, task.id)
 
-        # Build prompts inside the lock (reads shared manifest snapshot)
-        with lock:
-            frontend_tech = (
-                state.architecture.tech_stack.get("frontend", "React 18 + TypeScript")
-                if state.architecture.tech_stack else "React 18 + TypeScript"
-            )
-            sys_prompt  = _build_system_prompt(frontend_tech)
-            user_prompt = _build_file_prompt(
-                filepath, state.code_manifest, state.architecture, frontend_tech, task=task
-            )
+        relevant_deps = filter_manifest_by_dependencies(manifest, fm)
+        relevant_contracts = filter_api_contracts_by_relevance(all_contracts, fm)
+
+        frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch and arch.tech_stack else "React 18 + TypeScript"
+        user_prompt = self._build_single_task_prompt(task, fm, relevant_deps, relevant_contracts, arch, frontend_tech)
+        sys_prompt  = _build_system_prompt(frontend_tech)
 
         # LLM call (outside lock — blocking I/O)
         try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"fe-{task.id}")
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"fe-{task.id[:6]}", state=state, lock=lock)
         except Exception as exc:
             logger.error("[FrontendAgent] LLM call failed for %s: %s", filepath, exc)
             with lock:
@@ -413,14 +326,12 @@ class FrontendAgent(BaseAgent):
             return
 
         # Parse JSON
-        try:
-            from agents.schemas.frontend import FrontendSchema
-            data = self.extract_json_and_validate(raw, FrontendSchema)
-        except Exception as exc:
+        data = self._try_parse_json(raw)
+        if not data or not isinstance(data, dict):
             snippet = raw[:500] if raw else "(empty)"
-            logger.error("[FrontendAgent] JSON parse/validation failed for %s: %s | raw: %s", filepath, exc, snippet)
+            logger.error("[FrontendAgent] JSON parse/validation failed for %s | raw: %s", filepath, snippet)
             with lock:
-                state.log_error(self.name, f"JSON parse/validation failed for {filepath}: {exc}")
+                state.log_error(self.name, f"JSON parse/validation failed for {filepath}")
             return
 
         code = data.get("code", "").strip()
@@ -431,25 +342,7 @@ class FrontendAgent(BaseAgent):
             return
 
         # Parse manifest metadata
-        classes: list[ClassName] = []
-        for c in data.get("classes", []):
-            try:
-                args = [Argument(**a) for a in c.get("arguments", [])]
-                classes.append(ClassName(name=c["name"], arguments=args, docstring=c.get("docstring", "")))
-            except Exception as e:
-                logger.warning("[FrontendAgent] class parse error: %s", e)
-
-        functions: list[FunctionName] = []
-        for f in data.get("functions", []):
-            try:
-                args = [Argument(**a) for a in f.get("arguments", [])]
-                functions.append(FunctionName(
-                    name=f["name"], arguments=args,
-                    return_type=f.get("return_type", "void"),
-                    docstring=f.get("docstring", ""),
-                ))
-            except Exception as e:
-                logger.warning("[FrontendAgent] function parse error: %s", e)
+        classes, functions = parse_metadata(data, default_return_type="void")
 
         # Write to disk
         try:
@@ -519,8 +412,6 @@ class FrontendAgent(BaseAgent):
                     except Exception as exc:
                         logger.error("[FrontendAgent] Unhandled task exception: %s", exc)
                         ps.log_error(self.name, f"Task exception: {exc}")
-
-            ps.metrics.total_llm_calls += len(batches) + len(non_trivial)
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)
