@@ -7,11 +7,17 @@ class FixSchema(BaseModel):
     target_content: Optional[str] = None
     replacement_content: Optional[str] = None
 
-class ClassificationSchema(BaseModel):
+class RepairSchema(BaseModel):
+    """
+    A single mechanical repair for one integration conflict.
+    No HUMAN classification exists — every conflict the model addresses must
+    carry a concrete fix, or `action: "none"` when a fix is genuinely infeasible
+    (literally = unresolved and routed back to the coding agent via the graph).
+    """
     conflict_index: int
-    classification: str
+    action: str               # "fix" when a concrete fix is provided, else "none"
     rationale: str
     fix: Optional[FixSchema] = None
 
-class IntegrationSchema(BaseModel):
-    classifications: List[ClassificationSchema] = Field(default_factory=list)
+class IntegrationRepairSchema(BaseModel):
+    repairs: List[RepairSchema] = Field(default_factory=list)

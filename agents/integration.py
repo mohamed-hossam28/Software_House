@@ -54,29 +54,28 @@ OUTPUT_DIR = "output"
 
 SYSTEM_PROMPT = """\
 You are an expert integration and build engineer.
-Your job is to analyze a list of integration conflicts in the codebase and classify each as either "AUTO_FIX" or "HUMAN".
+Your job is to automatically repair integration conflicts in the codebase with concrete, mechanical fixes — there is NO human in the loop, so every conflict that can possibly be fixed locally MUST receive a fix.
 
-Classify a conflict as "AUTO_FIX" ONLY if the fix is mechanical, safe, reversible, and has zero ambiguity about intent:
+Prefer mechanical, safe, reversible fixes with zero ambiguity:
   ✓ Missing __init__.py file (action: create_file, replacement_content: "")
-  ✓ Import path typo (action: replace_text)
+  ✓ Import/resolution path typo (action: replace_text)
   ✓ Casing-only rename (action: replace_text)
   ✓ Trailing slash mismatch in API paths (action: replace_text)
   ✓ Export exists in code but manifest missing it (action: update_manifest)
+  ✓ Plausible, low-risk renames that match a sibling name (action: replace_text)
 
-Classify a conflict as "HUMAN" if it requires deciding business logic, behavior, or has ambiguity:
-  ✗ Function signature mismatch (different number of arguments — which one is correct?)
-  ✗ API contract mismatch (Backend and Frontend disagree, or request/response field names/types mismatch)
-  ✗ Circular imports (fixing requires restructuring, not just path changes)
-  ✗ Missing implementation/file entirely (which agent should write it?)
-  ✗ Anything requiring behavioral decisions
+Only if a fix is genuinely infeasible without deciding business logic or rewriting a file's structure should you mark it "none":
+  ✗ Deep behavioural rewrite / circular-import restructuring
+  ✗ Where there are two plausible definitions and no way to pick automatically
+When you mark a conflict "none", it is treated as unresolved and sent back to the owning coding agent for a REWORK round.
 
-Return a single JSON object. No explanations outside the JSON.
+Return ONLY a single JSON object. No explanations outside the JSON.
 Schema:
 {
-  "classifications": [
+  "repairs": [
     {
       "conflict_index": <int: index of conflict in the list>,
-      "classification": "AUTO_FIX" | "HUMAN",
+      "action": "fix" | "none",
       "rationale": "<string: explanation>",
       "fix": {
         "action": "create_file" | "replace_text" | "update_manifest",
@@ -94,7 +93,8 @@ Here are the integration conflicts detected in the codebase:
 
 {conflicts_json}
 
-Please classify each conflict as either "AUTO_FIX" or "HUMAN". Propose a precise fix if it is AUTO_FIX.
+For each conflict, either propose a precise mechanical fix (action: "fix") or mark it (action: "none")
+if it cannot be fixed without business decisions. Do not leave anything unanswered.
 """
 
 
@@ -326,6 +326,50 @@ def get_file_code(filepath: str, fm: FileManifest, state: ProjectState) -> str:
             except Exception:
                 pass
     return code
+
+
+# ── Word-match deterministic resolver (Phase 1A) ───────────────────────────────
+
+def _tokenize(s: str) -> set[str]:
+    """Lower-cased alphanumeric tokens from an identifier/path, split on ./_- separators."""
+    return set(re.findall(r"[a-z0-9]+", s.lower()))
+
+
+def word_match_score(a: str, b: str) -> float:
+    """Jaccard token-overlap between two identifiers/paths (casing-normalized)."""
+    ta, tb = _tokenize(a), _tokenize(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def best_manifest_match(import_src: str, manifest_files: list[str], internal_prefixes: set[str], threshold: float = 0.4) -> Optional[str]:
+    """
+    Deterministic word-matching: find the manifest file whose path best matches
+    *import_src* (a dotted/path import source). Returns the closest match or None.
+    """
+    best_path: Optional[str] = None
+    best_score = threshold
+    for path in manifest_files:
+        path_score=word_match_score(import_src, path) 
+        if path_score > best_score:
+            best_path = path
+            best_score = path_score
+    return best_path
+
+
+def dirname_matches(import_src: str, manifest_files: list[str]) -> Optional[str]:
+    """
+    If *import_src* looks like a Python package (e.g. 'backend.app.models') and any
+    file in the manifest lives under that package directory, return the package
+    directory path (so a missing __init__.py can be created).
+    """
+    pkg = import_src.replace(".", "/").strip("/")
+    for path in manifest_files:
+        prefix = pkg + "/"
+        if path.startswith(prefix) and path.endswith(".py"):
+            return pkg
+    return None
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -684,28 +728,174 @@ class IntegrationAgent(BaseAgent):
         return conflicts
 
 
-    # ── Phase 2: LLM Classification & Proposal ──────────────────────────────────
+    # ── Phase 2: Deterministic word-match repair ─────────────────────────────
 
-    def _get_llm_classifications(self, conflicts: list[dict]) -> list[dict]:
+    def _resolve_by_word_match(self, state: ProjectState, conflicts: list[dict]) -> tuple[list[dict], list[str]]:
+        """
+        Deterministically repair mechanical conflicts before invoking the LLM.
+
+        Returns (remaining_conflicts, applied_logs). Conflicts it can fix with
+        zero ambiguity are resolved inline and removed from the returned list.
+        """
+        manifest = state.code_manifest
+        manifest_files = list(manifest.files.keys())
+        internal_prefixes = set()
+        for path in manifest_files:
+            parts = path.split('/')
+            if parts and parts[0]:
+                internal_prefixes.add(parts[0])
+
+        remaining: list[dict] = []
+        applied_logs: list[str] = []
+
+        for conflict in conflicts:
+            filepath = conflict.get("filepath", "")
+            reason = conflict.get("reason", "")
+            fixed = False
+
+            # 1. Import path typo — "Import 'X' in 'Y' cannot be resolved ..."
+            m = re.search(r"Import '([^']+)' in '([^']+)' cannot be resolved", reason)
+            if m and not fixed:
+                import_src = m.group(1)
+                current_file = m.group(2)
+                import_src = import_src.strip()
+
+                # Skip relative imports that point outside the tree
+                if import_src.startswith(".."):
+                    remaining.append(conflict)
+                    continue
+
+                if import_src.startswith("."):
+                    dots_count = len(import_src) - len(import_src.lstrip("."))
+                    rel_path = import_src[dots_count:]
+                    parts = current_file.split('/')
+                    if len(parts) > dots_count:
+                        base_dir = '/'.join(parts[:-dots_count])
+                        candidate = f"{base_dir}/{rel_path.replace('.', '/')}" if rel_path else base_dir
+                    else:
+                        remaining.append(conflict)
+                        continue
+                else:
+                    candidate = import_src.replace('.', '/')
+
+                candidate = candidate.strip('/')
+
+                # 1a. Exact or extension-resolved path already known to the resolver?
+                resolved_path = resolve_import_path(import_src, current_file, manifest_files, internal_prefixes)
+                if resolved_path:
+                    fixed = True
+                else:
+                    # 1b. Word-match the (wrong) import against every manifest path.
+                    best = best_manifest_match(candidate, manifest_files, internal_prefixes)
+                    if best:
+                        fix_target = self._import_fix_target(import_src, current_file, best)
+                        if fix_target:
+                            applied = self._apply_repairs(state, [{
+                                "conflict_index": 0,
+                                "action": "fix",
+                                "rationale": conflict.get("reason", ""),
+                                "fix": fix_target,
+                            }], [conflict])
+                            applied_logs.extend(applied)
+                            fixed = bool(applied)
+                            if fixed:
+                                logger.info("[IntegrationAgent] Word-match fixed import '%s' -> %s", import_src, best)
+
+                # 1c. Missing package __init__.py that can be auto-created.
+                if not fixed:
+                    pkg_dir = dirname_matches(import_src, manifest_files)
+                    if pkg_dir:
+                        init_path = pkg_dir + "/__init__.py"
+                        if init_path not in manifest_files:
+                            applied = self._apply_repairs(state, [{
+                                "conflict_index": 0,
+                                "action": "fix",
+                                "rationale": conflict.get("reason", ""),
+                                "fix": {
+                                    "action": "create_file",
+                                    "filepath": init_path,
+                                    "replacement_content": "",
+                                },
+                            }], [conflict])
+                            applied_logs.extend(applied)
+                            fixed = bool(applied)
+                            if fixed:
+                                logger.info("[IntegrationAgent] Word-match created missing package file %s", init_path)
+
+            # 2. Export declared in code but missing from the manifest → sync manifest.
+            m = re.search(r"Export '([^']+)' found in code of '([^']+)' but not declared in manifest", reason)
+            if m and not fixed:
+                actual_export, code_file = m.group(1), m.group(2)
+                fm = manifest.files.get(code_file)
+                if fm and actual_export not in (fm.exports or []):
+                    fm.exports.append(actual_export)
+                    applied_logs.append(f"Synchronized manifest exports for {code_file} with '{actual_export}'")
+                    fixed = True
+
+            if not fixed:
+                remaining.append(conflict)
+
+        return remaining, applied_logs
+
+    def _import_fix_target(self, import_src: str, current_file: str, best_path: str) -> Optional[dict]:
+        """
+        Build a concrete replace_text fix that rewrites *import_src* to the
+        resolved manifest path *best_path*, preserving the import statement style.
+        """
+        if current_file.endswith(".py"):
+            module_path = best_path
+            if module_path.endswith(".py"):
+                module_path = module_path[:-3]
+            if module_path.endswith("__init__"):
+                module_path = module_path[: -len("__init__")].rstrip("/")
+            if import_src.startswith("."):
+                replacement = "." * (len(import_src) - len(import_src.lstrip(".")))
+                # Keep the relative form if we can recompute it; else use the absolute dotted form.
+                import_path = module_path.replace("/", ".")
+            else:
+                import_path = module_path.replace("/", ".")
+            return {
+                "action": "replace_text",
+                "filepath": current_file,
+                "target_content": import_src,
+                "replacement_content": import_path,
+            }
+
+        # JS/TS: rewrite the source string to the resolved path (strip extension for TS path aliases).
+        import_path = best_path
+        if import_path.endswith((".ts", ".tsx")):
+            import_path = import_path[:-3]
+        elif import_path.endswith((".js", ".jsx")):
+            import_path = import_path[:-3]
+        return {
+            "action": "replace_text",
+            "filepath": current_file,
+            "target_content": import_src,
+            "replacement_content": import_path,
+        }
+
+    # ── Phase 3: Batched LLM repair ───────────────────────────────────────────
+
+    def _get_llm_repairs(self, conflicts: list[dict]) -> list[dict]:
         try:
             prompt = USER_PROMPT_TEMPLATE.format(conflicts_json=json.dumps(conflicts, indent=2))
             resp = self.llm_call(prompt)
-            from agents.schemas.integration import IntegrationSchema
-            data = self.extract_json_and_validate(resp.text, IntegrationSchema)
-            return data.get("classifications", [])
+            from agents.schemas.integration import IntegrationRepairSchema
+            data = self.extract_json_and_validate(resp.text, IntegrationRepairSchema)
+            return data.get("repairs", [])
         except Exception as exc:
-            logger.error("[IntegrationAgent] Phase 2 LLM call failed: %s", exc)
+            logger.error("[IntegrationAgent] Batched LLM repair call failed: %s", exc)
             return []
 
-    def _apply_fixes(self, state: ProjectState, classifications: list[dict], conflicts: list[dict]) -> list[str]:
+    def _apply_repairs(self, state: ProjectState, repairs: list[dict], conflicts: list[dict]) -> list[str]:
         applied_logs = []
-        for item in classifications:
+        for item in repairs:
             idx = item.get("conflict_index")
             if idx is None or idx < 0 or idx >= len(conflicts):
                 continue
 
             conflict = conflicts[idx]
-            if item.get("classification") != "AUTO_FIX":
+            if item.get("action") != "fix":
                 continue
 
             fix = item.get("fix")
@@ -728,7 +918,7 @@ class IntegrationAgent(BaseAgent):
                     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
                     with open(abs_path, "w", encoding="utf-8") as f:
                         f.write(content)
-                    
+
                     if agent == "backend":
                         state.generated_code.backend[filepath] = content
                     elif agent == "frontend":
@@ -773,7 +963,7 @@ class IntegrationAgent(BaseAgent):
                         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
                         with open(abs_path, "w", encoding="utf-8") as f:
                             f.write(new_code)
-                        
+
                         if agent == "backend":
                             state.generated_code.backend[filepath] = new_code
                         elif agent == "frontend":
@@ -804,19 +994,40 @@ class IntegrationAgent(BaseAgent):
         ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
 
+        # Bump the graph-level REWORK counter — each invocation is one rework round.
+        ps.integration_rework_rounds += 1
+
         logger.info("[IntegrationAgent] Starting Phase 1 checks…")
         conflicts = self._run_deterministic_checks(ps)
 
+        # Phase 1A — deterministic word-match repair (no LLM).
         if conflicts:
-            logger.info("[IntegrationAgent] Phase 1 found %d conflicts. Running Phase 2 LLM call…", len(conflicts))
-            classifications = self._get_llm_classifications(conflicts)
+            conflicts, word_applied = self._resolve_by_word_match(ps, conflicts)
+            if word_applied:
+                logger.info("[IntegrationAgent] Word-match applied %d mechanical fix(es). Re-checking…", len(word_applied))
+                conflicts = self._run_deterministic_checks(ps)
 
-            if classifications:
-                logger.info("[IntegrationAgent] Applying auto-fixes…")
-                applied = self._apply_fixes(ps, classifications, conflicts)
-                if applied:
-                    logger.info("[IntegrationAgent] Re-running deterministic checks post-fixes…")
-                    conflicts = self._run_deterministic_checks(ps)
+        # Phase 2 — batched LLM repair (no HUMAN deferral), capped internal rounds.
+        if conflicts:
+            max_repair_rounds = 2
+            for round_idx in range(max_repair_rounds):
+                logger.info(
+                    "[IntegrationAgent] Repair round %d/%d — %d conflicts. Running batched LLM repair…",
+                    round_idx + 1, max_repair_rounds, len(conflicts),
+                )
+                repairs = self._get_llm_repairs(conflicts)
+                if not repairs:
+                    logger.warning("[IntegrationAgent] No repair proposals returned; stopping repair loop.")
+                    break
+
+                applied = self._apply_repairs(ps, repairs, conflicts)
+                conflicts = self._run_deterministic_checks(ps)
+
+                if not conflicts:
+                    break
+                if not applied:
+                    logger.info("[IntegrationAgent] No fixes could be applied; stopping repair loop.")
+                    break
 
         merged = len(conflicts) == 0
         conflict_strings = [
@@ -824,18 +1035,36 @@ class IntegrationAgent(BaseAgent):
             for c in conflicts
         ]
 
+        # Group truly-unresolved conflicts by owning agent for the graph REWORK edge.
+        conflicts_by_agent: dict[str, list[str]] = {}
+        rework_targets: dict[str, list[str]] = {}
+        for c, c_str in zip(conflicts, conflict_strings):
+            fpath = c.get("filepath", "")
+            fm = ps.code_manifest.files.get(fpath)
+            agent = fm.agent if fm else "backend"
+            if "frontend" in fpath:
+                agent = "frontend"
+            elif "database" in fpath or fpath.endswith(".sql"):
+                agent = "database"
+            elif "backend" in fpath:
+                agent = "backend"
+            conflicts_by_agent.setdefault(agent, []).append(c_str)
+            rework_targets.setdefault(fpath, []).append(c_str)
+
         ps.integration = IntegrationStatus(
             merged=merged,
             conflicts=conflict_strings,
-            unified_entry_point="output/frontend/index.html" if "output/frontend/index.html" in ps.code_manifest.files else ""
+            unified_entry_point="output/frontend/index.html" if "output/frontend/index.html" in ps.code_manifest.files else "",
+            conflicts_by_agent=conflicts_by_agent,
+            rework_targets=rework_targets,
         )
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)
 
         logger.info(
-            "[IntegrationAgent] Done in %.2fs. Merged: %s. Remaining conflicts: %d.",
-            duration, merged, len(conflicts)
+            "[IntegrationAgent] Done in %.2fs. Merged: %s. Remaining conflicts: %d. Rework rounds: %d/%d.",
+            duration, merged, len(conflicts), ps.integration_rework_rounds, ps.max_integration_rounds,
         )
         return self._compute_diff(before, ps)
 
@@ -865,10 +1094,10 @@ if __name__ == "__main__":
         def provider_name(self) -> str: return "mock"
         def complete(self, system_prompt, user_message, model, max_tokens=8192, temperature=0.2):
             payload = {
-                "classifications": [
+                "repairs": [
                     {
                         "conflict_index": 0,
-                        "classification": "AUTO_FIX",
+                        "action": "fix",
                         "rationale": "Typo in import path",
                         "fix": {
                             "action": "replace_text",

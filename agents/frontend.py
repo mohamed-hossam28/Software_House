@@ -33,9 +33,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
+    # Fallback for direct execution
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
@@ -139,6 +140,10 @@ def _fmt_manifest(manifest: CodeManifest, skip_path: str, task: Task | None = No
                 args = ", ".join(f"{a.name}: {a.type}" for a in fn.arguments)
                 entry.append(f"    function {fn.name}({args}): {fn.docstring}")
         entries.append("\n".join(entry))
+    if len(entries) > MAX_MANIFEST_ENTRIES:
+        omitted = len(entries) - MAX_MANIFEST_ENTRIES
+        entries = entries[:MAX_MANIFEST_ENTRIES]
+        entries.append(f"- … and {omitted} more dependency files omitted")
     return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
@@ -148,6 +153,7 @@ def _build_file_prompt(
     arch: Any,
     frontend_tech: str,
     task: Task | None = None,
+    rework_instructions: str = "",
 ) -> str:
     fm = manifest.files.get(filepath)
     if not fm:
@@ -190,6 +196,7 @@ def _build_file_prompt(
 - **Exports**  : {', '.join(fm.exports) or '(none)'}
   *(You MUST export each name listed above with the exact signature other modules expect.)*
 {style_note}
+{rework_instructions.strip()}
 ## Tech Stack
 {tech_table}
 
@@ -305,6 +312,67 @@ class FrontendAgent(BaseAgent):
                 state.completed_task_ids.add(task.id)
             logger.info("[FrontendAgent] ✓ batch trivial: %s", fm.filepath)
 
+    def _process_rework_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
+        """Single LLM call for a batch of trivial rework files (lean targeted prompt)."""
+        with lock:
+            manifest = state.code_manifest
+            arch = state.architecture
+            frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch.tech_stack else "React 18 + TypeScript"
+            sys_prompt = _build_system_prompt(frontend_tech)
+
+            entries = []
+            valid_tasks = []
+            for t in tasks:
+                fm = manifest.by_task(t.id)
+                if not fm:
+                    continue
+                code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
+                current_code = code_bucket.get(fm.filepath, "")
+                rework = build_rework_instructions(state.integration, fm.filepath)
+                if rework and current_code:
+                    entries.append((fm.filepath, current_code, rework))
+                    valid_tasks.append(t)
+            user_prompt = build_rework_batch_prompt(entries, output_key="code")
+
+        filepaths = [fp for fp, _, _ in entries]
+        logger.info("[FrontendAgent] Batch rework call: %s", filepaths)
+
+        try:
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="fe-rework-batch", state=state, lock=lock)
+        except Exception as exc:
+            logger.error("[FrontendAgent] Rework batch LLM call failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"Rework batch LLM call failed: {exc}")
+            return
+
+        try:
+            items = self._parse_batch_response(raw)
+        except Exception as exc:
+            logger.error("[FrontendAgent] Rework batch JSON parse failed: %s — raw: %s", exc, raw[:300])
+            with lock:
+                state.log_error(self.name, f"Rework batch JSON parse failed: {exc}")
+            return
+
+        for item, task in zip(items, valid_tasks):
+            with lock:
+                fm = manifest.by_task(task.id)
+            if not fm:
+                continue
+            code = str(item.get("code", "")).strip()
+            if not code:
+                logger.warning("[FrontendAgent] Rework batch: empty code for %s", fm.filepath)
+                continue
+            try:
+                _write_to_disk(fm.filepath, code)
+            except Exception as exc:
+                logger.error("[FrontendAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
+            with lock:
+                code_bucket = getattr(state.generated_code, self.code_bucket)
+                code_bucket[fm.filepath] = code
+                # Rework responses return only code — preserve existing manifest metadata.
+                state.completed_task_ids.add(task.id)
+            logger.info("[FrontendAgent] ✓ rework batch: %s", fm.filepath)
+
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
         """Generate code for one frontend file, write to disk, update manifest."""
         with lock:
@@ -321,7 +389,14 @@ class FrontendAgent(BaseAgent):
         logger.info("[FrontendAgent] Generating %s (task %s) …", filepath, task.id)
 
         frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch and arch.tech_stack else "React 18 + TypeScript"
-        user_prompt = _build_file_prompt(filepath, manifest, arch, frontend_tech, task)
+        rework = build_rework_instructions(state.integration, filepath)
+        code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
+        current_code = code_bucket.get(filepath, "")
+        if rework and current_code:
+            # Lean REWORK path: send only the conflict notes + current file content.
+            user_prompt = build_rework_prompt(filepath, current_code, rework, output_key="code")
+        else:
+            user_prompt = _build_file_prompt(filepath, manifest, arch, frontend_tech, task, rework_instructions=rework)
         sys_prompt  = _build_system_prompt(frontend_tech)
 
         # LLM call (outside lock — blocking I/O)
@@ -334,8 +409,9 @@ class FrontendAgent(BaseAgent):
             return
 
         # Parse JSON
-        data = self._try_parse_json(raw)
-        if not data or not isinstance(data, dict):
+        try:
+            data = self.extract_json(raw)
+        except Exception:
             snippet = raw[:500] if raw else "(empty)"
             logger.error("[FrontendAgent] JSON parse/validation failed for %s | raw: %s", filepath, snippet)
             with lock:
@@ -349,8 +425,11 @@ class FrontendAgent(BaseAgent):
                 state.log_error(self.name, f"'code' missing in LLM response for {filepath}")
             return
 
-        # Parse manifest metadata
-        classes, functions = parse_metadata(data, default_return_type="void")
+        # Rework responses return only code — preserve existing manifest metadata.
+        if rework:
+            classes, functions = None, None
+        else:
+            classes, functions = parse_metadata(data, default_return_type="void")
 
         # Write to disk
         try:
@@ -363,7 +442,8 @@ class FrontendAgent(BaseAgent):
         # Update state (thread-safe)
         with lock:
             state.generated_code.frontend[filepath] = code
-            state.code_manifest.mark_written(filepath, classes, functions)
+            if not rework:
+                state.code_manifest.mark_written(filepath, classes, functions)
             state.completed_task_ids.add(task.id)
 
         logger.info("[FrontendAgent] ✓ %s", filepath)
@@ -394,15 +474,24 @@ class FrontendAgent(BaseAgent):
             # Scaffold/entrypoint files are NEVER batched — they need their wiring prompt.
             def _is_batchable(t: Task) -> bool:
                 fm = ps.code_manifest.by_task(t.id)
-                return is_trivial_file(t, ps.code_manifest) and not is_scaffold_file(getattr(fm, "filepath", None))
+                return (
+                    is_trivial_file(t, ps.code_manifest)
+                    and not is_scaffold_file(getattr(fm, "filepath", ""))
+                )
 
-            trivial     = [t for t in stage if _is_batchable(t)]
-            non_trivial = [t for t in stage if not _is_batchable(t)]
-            batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
+            def _is_trivial_rework(t: Task) -> bool:
+                fm = ps.code_manifest.by_task(t.id)
+                return build_rework_instructions(ps.integration, getattr(fm, "filepath", ""))
+
+            trivial_batch = [t for t in stage if _is_batchable(t) and not _is_trivial_rework(t)]
+            rework_batch  = [t for t in stage if _is_batchable(t) and _is_trivial_rework(t)]
+            non_trivial   = [t for t in stage if not _is_batchable(t)]
+            batches    = [trivial_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial_batch), TRIVIAL_BATCH_SIZE)]
+            rework_bs  = [rework_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(rework_batch), TRIVIAL_BATCH_SIZE)]
 
             logger.info(
-                "[FrontendAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d non-trivial",
-                idx + 1, len(stages), len(trivial), len(batches), len(non_trivial),
+                "[FrontendAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d trivial-rework (→ %d batch call(s)) + %d non-trivial",
+                idx + 1, len(stages), len(trivial_batch), len(batches), len(rework_batch), len(rework_bs), len(non_trivial),
             )
 
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
@@ -411,6 +500,10 @@ class FrontendAgent(BaseAgent):
                     for t in batch:
                         t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
+                for rb in rework_bs:
+                    for t in rb:
+                        t.status = "in_progress"
+                    futures.append(pool.submit(self._process_rework_batch, rb, ps, state_lock))
                 for task in non_trivial:
                     task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))

@@ -330,6 +330,12 @@ class IntegrationStatus(BaseModel):
     merged: bool = False
     conflicts: list[str] = Field(default_factory=list)
     unified_entry_point: str = ""
+    #: Truly-unresolved conflicts grouped by owning agent ("backend"/"frontend"/"database"/"devops").
+    #: The graph reads this to route a REWORK loop back to the relevant coding agents.
+    conflicts_by_agent: dict[str, list[str]] = Field(default_factory=dict)
+    #: Truly-unresolved conflicts grouped by file path — used to inject rework
+    #: instructions into the coding-agent prompts when a file is regenerated.
+    rework_targets: dict[str, list[str]] = Field(default_factory=dict)
  
  
 class TestResults(BaseModel):
@@ -404,6 +410,11 @@ class ProjectState(BaseModel):
     status:ProjectStatus=ProjectStatus.PENDING
     max_clarfication_rounds: int = 3
     clarfication_rounds: int = 0
+
+    # ── Integration REWORK loop (mod 1) ───────────────────────────────
+    # integration -> {coding agent} -> integration, capped at max rounds.
+    integration_rework_rounds: int = 0
+    max_integration_rounds: int = 2
 
     # agents outputs
 

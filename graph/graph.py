@@ -20,7 +20,7 @@ from graph.nodes import (
     frontend_node,
     integration_node,
 )
-from graph.edges import route_after_requirements
+from graph.edges import route_after_requirements, route_after_integration
 
 # Define the StateGraph with ProjectState
 workflow = StateGraph(ProjectState)
@@ -64,7 +64,18 @@ workflow.add_edge("backend", "integration")
 workflow.add_edge("frontend", "integration")
 workflow.add_edge("database", "integration")
 
-workflow.add_edge("integration", END)
+# Mod 1 — integration REWORK loop back to the coding agents when conflicts remain,
+# else END. Capped by integration_rework_rounds / max_integration_rounds.
+workflow.add_conditional_edges(
+    "integration",
+    route_after_integration,
+    {
+        "backend": "backend",
+        "frontend": "frontend",
+        "database": "database",
+        "__end__": END,
+    },
+)
 
 
 memory = MemorySaver()

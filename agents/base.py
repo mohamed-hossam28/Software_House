@@ -23,7 +23,11 @@ from core.config import settings
 DEFAULT_MODEL = settings.model_name
 DEFAULT_MAX_TOKENS = settings.default_max_tokens or 8192
 DEFAULT_RETRIES    = settings.default_retries or 3
-DEFAULT_BACKOFF    = settings.default_backoff or 2.0 
+DEFAULT_BACKOFF    = settings.default_backoff or 2.0
+
+# Prompt size caps — keep the request body under typical gateway payload limits.
+MAX_TREE_ENTRIES    = 80   # project file tree entries shown in coding prompts
+MAX_MANIFEST_ENTRIES = 25  # dependency/manifest entries + written summaries per prompt 
 
 ####################Filters####################
 
@@ -146,6 +150,84 @@ def is_scaffold_file(filepath: str | None) -> bool:
     return os.path.basename(filepath or "").lower() in _SCAFFOLD_NAMES
 
 
+def build_rework_instructions(integration: Any, filepath: str) -> str:
+    """
+    Build a prompt section for *filepath* describing integration conflicts that
+    a coding agent must resolve when it regenerates the file (REWORK loop).
+
+    Returns an empty string when no rework is required for this file.
+    """
+    targets = {}
+    if integration is not None:
+        targets = getattr(integration, "rework_targets", {}) or {}
+        if isinstance(targets, dict) is False and hasattr(targets, "model_dump"):
+            targets = targets.model_dump()
+
+    notes = targets.get(filepath) if isinstance(targets, dict) else None
+    if not notes:
+        return ""
+
+    lines = "\n".join(f"- {n}" for n in notes)
+    return (
+        "\n## INTEGRATION REWORK REQUIRED\n"
+        "The previous version of this file failed integration checks. "
+        "Fix the following issue(s) in this rewrite:\n\n"
+        f"{lines}\n"
+    )
+
+
+def build_rework_prompt(
+    filepath: str,
+    current_code: str,
+    rework_instructions: str,
+    output_key: str = "code",
+) -> str:
+    """
+    Build a lean, targeted prompt for a REWORK round.
+
+    Unlike the full generation prompt, this sends ONLY the conflict notes and the
+    current file content, and asks the LLM to return the full corrected file. It is
+    cheaper and minimizes the risk of the LLM regressing unrelated parts of the file.
+    """
+    return (
+        f"{rework_instructions.strip()}\n\n"
+        f"Here is the CURRENT content of `{filepath}`:\n\n"
+        f"```\n{current_code}\n```\n\n"
+        "Rewrite ONLY what is necessary to fix the issue(s) above. Keep everything "
+        f"else identical. Return a single valid JSON object with the full corrected "
+        f"file content under the \"{output_key}\" key. No prose outside the JSON."
+    )
+
+
+def build_rework_batch_prompt(
+    entries: list[tuple[str, str, str]],
+    output_key: str = "code",
+) -> str:
+    """
+    Build a lean, targeted prompt for a REWORK batch of multiple files.
+
+    *entries* is a list of (filepath, current_code, rework_instructions) tuples.
+    Returns a prompt asking for a JSON ARRAY of corrected files (one per entry,
+    same order). Used to batch small/trivial rework files into one LLM call.
+    """
+    blocks = []
+    for i, (fp, current_code, instr) in enumerate(entries, start=1):
+        blocks.append(
+            f"### File {i}: {fp}\n"
+            f"{instr.strip()}\n\n"
+            f"CURRENT content of `{fp}`:\n"
+            f"```\n{current_code}\n```"
+        )
+    joined = "\n\n".join(blocks)
+    return (
+        f"{joined}\n\n"
+        "For EACH file above, fix ONLY the issue(s) listed and return the full "
+        "corrected file content. Do not add new files or reorder. "
+        f"Respond with a single JSON ARRAY (one object per file, in the same order):\n"
+        f'[{{"filepath":"<path>","{output_key}":"<full corrected source>"}}, ...]'
+    )
+
+
 def is_trivial_filepath(filepath: str, exports: list | None = None) -> bool:
     """True if a file is 'trivial' boilerplate (init, barrel, config, types, constants, errors, <3 exports)."""
     basename = os.path.basename(filepath or "").lower()
@@ -239,6 +321,10 @@ def build_project_file_tree(
         )
     if not entries:
         return "(no relevant project files planned yet)"
+    if len(entries) > MAX_TREE_ENTRIES:
+        omitted = len(entries) - MAX_TREE_ENTRIES
+        entries = entries[:MAX_TREE_ENTRIES]
+        entries.append(f"  … and {omitted} more files omitted (tree capped)")
     return "\n".join(entries)
 
 

@@ -45,9 +45,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree
+    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree
+    # Fallback for direct execution
+    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
@@ -146,6 +147,10 @@ def _fmt_manifest_context(manifest: CodeManifest, skip_path: str, task: Task | N
         status = "written" if fm.written else "pending"
         exports = ", ".join(fm.exports) or "(none)"
         entries.append(f"- `{path}` ({status})\n  Purpose: {fm.purpose}\n  Exports: {exports}")
+    if len(entries) > MAX_MANIFEST_ENTRIES:
+        omitted = len(entries) - MAX_MANIFEST_ENTRIES
+        entries = entries[:MAX_MANIFEST_ENTRIES]
+        entries.append(f"- … and {omitted} more dependency files omitted")
     return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
@@ -156,6 +161,7 @@ def _build_file_prompt(
     arch: Any,
     db_tech: str,
     orm_block: str = "",
+    rework_instructions: str = "",
 ) -> str:
     fm = manifest.files.get(filepath)
     purpose = fm.purpose if fm else task.description
@@ -171,6 +177,10 @@ def _build_file_prompt(
     for path, m in manifest.files.items():
         if m.written and m.agent == "database":
             written_tables.append(f"- `{path}` exports: {', '.join(m.exports) or '(none)'}")
+    if len(written_tables) > MAX_MANIFEST_ENTRIES:
+        omitted = len(written_tables) - MAX_MANIFEST_ENTRIES
+        written_tables = written_tables[:MAX_MANIFEST_ENTRIES]
+        written_tables.append(f"- … and {omitted} more written DB files omitted")
     written_str = "\n".join(written_tables) or "None yet."
 
     manifest_ctx = _fmt_manifest_context(manifest, filepath, task)
@@ -188,6 +198,8 @@ def _build_file_prompt(
 - **Exports**   : {exports}
 - **Depends On**: {depends_str}
 - **Priority**  : {task.priority}
+
+{rework_instructions.strip()}
 
 ## Tech Stack
 {tech_table}
@@ -318,6 +330,68 @@ class DatabaseAgent(BaseAgent):
                 state.completed_task_ids.add(task.id)
             logger.info("[DBAgent] ✓ batch trivial: %s", fm.filepath)
 
+    def _process_rework_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
+        """Single LLM call for a batch of trivial rework DB files (lean targeted prompt)."""
+        with lock:
+            manifest = state.code_manifest
+            arch = state.architecture
+            db_tech = _resolve_db_tech(arch)
+            orm_block = _orm_constraint_block(arch)
+            sys_prompt = _build_system_prompt(db_tech, orm_block)
+
+            entries = []
+            valid_tasks = []
+            for t in tasks:
+                fm = manifest.by_task(t.id)
+                if not fm:
+                    continue
+                code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
+                current_code = code_bucket.get(fm.filepath, "")
+                rework = build_rework_instructions(state.integration, fm.filepath)
+                if rework and current_code:
+                    entries.append((fm.filepath, current_code, rework))
+                    valid_tasks.append(t)
+            user_prompt = build_rework_batch_prompt(entries, output_key="migration_code")
+
+        filepaths = [fp for fp, _, _ in entries]
+        logger.info("[DBAgent] Batch rework call: %s", filepaths)
+
+        try:
+            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="db-rework-batch", state=state, lock=lock)
+        except Exception as exc:
+            logger.error("[DBAgent] Rework batch LLM call failed: %s", exc)
+            with lock:
+                state.log_error(self.name, f"Rework batch LLM call failed: {exc}")
+            return
+
+        try:
+            items = self._parse_batch_response(raw)
+        except Exception as exc:
+            logger.error("[DBAgent] Rework batch JSON parse failed: %s — raw: %s", exc, raw[:300])
+            with lock:
+                state.log_error(self.name, f"Rework batch JSON parse failed: {exc}")
+            return
+
+        for item, task in zip(items, valid_tasks):
+            with lock:
+                fm = manifest.by_task(task.id)
+            if not fm:
+                continue
+            code = str(item.get("migration_code", "")).strip()
+            if not code:
+                logger.warning("[DBAgent] Rework batch: empty migration_code for %s", fm.filepath)
+                continue
+            try:
+                _write_to_disk(fm.filepath, code)
+            except Exception as exc:
+                logger.error("[DBAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
+            with lock:
+                code_bucket = getattr(state.generated_code, self.code_bucket)
+                code_bucket[fm.filepath] = code
+                # Rework responses return only code — preserve existing manifest metadata.
+                state.completed_task_ids.add(task.id)
+            logger.info("[DBAgent] ✓ rework batch: %s", fm.filepath)
+
     # ── Per-task worker ───────────────────────────────────────────────────────
 
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
@@ -342,9 +416,16 @@ class DatabaseAgent(BaseAgent):
             db_tech = _resolve_db_tech(arch)
             orm_block = _orm_constraint_block(arch)
             sys_prompt = _build_system_prompt(db_tech, orm_block)
-            user_prompt = _build_file_prompt(
-                filepath, task, state.code_manifest, arch, db_tech, orm_block
-            )
+            rework = build_rework_instructions(state.integration, filepath)
+            code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
+            current_code = code_bucket.get(filepath, "")
+            if rework and current_code:
+                # Lean REWORK path: send only the conflict notes + current file content.
+                user_prompt = build_rework_prompt(filepath, current_code, rework, output_key="migration_code")
+            else:
+                user_prompt = _build_file_prompt(
+                    filepath, task, state.code_manifest, arch, db_tech, orm_block, rework_instructions=rework
+                )
 
         # LLM call (outside lock — blocking I/O)
         try:
@@ -375,7 +456,11 @@ class DatabaseAgent(BaseAgent):
                 state.log_error(self.name, f"'migration_code' missing for {filepath}")
             return
 
-        classes, functions = parse_metadata(data)
+        # Rework responses return only code — preserve existing manifest metadata.
+        if rework:
+            classes, functions = None, None
+        else:
+            classes, functions = parse_metadata(data)
 
         # Write migration file to disk (only write code)
         try:
@@ -389,7 +474,8 @@ class DatabaseAgent(BaseAgent):
         # Thread-safe state update
         with lock:
             state.generated_code.database[filepath] = migration_code
-            state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
+            if not rework:
+                state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
             state.completed_task_ids.add(task.id)
 
         logger.info("[DBAgent] ✓ %s", filepath)
@@ -416,14 +502,21 @@ class DatabaseAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            # Split into trivial batches + non-trivial singles
-            trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
-            non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
-            batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
+            # Trivial rework targets are batched via the lean rework prompt;
+            # non-trivial rework files get the single lean prompt in _process_task.
+            def _needs_rework(t: Task) -> bool:
+                fm = ps.code_manifest.by_task(t.id)
+                return build_rework_instructions(ps.integration, getattr(fm, "filepath", ""))
+
+            trivial_batch = [t for t in stage if is_trivial_file(t, ps.code_manifest) and not _needs_rework(t)]
+            rework_batch  = [t for t in stage if is_trivial_file(t, ps.code_manifest) and _needs_rework(t)]
+            non_trivial   = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            batches    = [trivial_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial_batch), TRIVIAL_BATCH_SIZE)]
+            rework_bs  = [rework_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(rework_batch), TRIVIAL_BATCH_SIZE)]
 
             logger.info(
-                "[DBAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d non-trivial",
-                idx + 1, len(stages), len(trivial), len(batches), len(non_trivial),
+                "[DBAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d trivial-rework (→ %d batch call(s)) + %d non-trivial",
+                idx + 1, len(stages), len(trivial_batch), len(batches), len(rework_batch), len(rework_bs), len(non_trivial),
             )
 
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
@@ -432,6 +525,10 @@ class DatabaseAgent(BaseAgent):
                     for t in batch:
                         t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
+                for rb in rework_bs:
+                    for t in rb:
+                        t.status = "in_progress"
+                    futures.append(pool.submit(self._process_rework_batch, rb, ps, state_lock))
                 for task in non_trivial:
                     task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
