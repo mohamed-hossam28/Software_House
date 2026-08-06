@@ -45,9 +45,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree
 from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
@@ -69,10 +69,36 @@ OUTPUT_DIR = "output"
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
-def _build_system_prompt(db_tech: str) -> str:
+def _resolve_db_tech(arch: Any) -> str:
+    """Resolve DB tooling string deterministically from the tech stack (no LLM override)."""
+    from core.state import resolve_db_tooling
+    tech = (arch.tech_stack or {}).get("database", "") if arch and arch.tech_stack else ""
+    mapping = resolve_db_tooling(tech)
+    base = tech or "SQLite"
+    migrations = mapping.get("migrations", "None")
+    return f"{base} ({mapping.get('orm', 'SQLAlchemy')} / migrations: {migrations})"
+
+
+def _orm_constraint_block(arch: Any) -> str:
+    """Instruction forcing a single ORM paradigm — matching the resolved DB mapping."""
+    from core.state import resolve_db_tooling
+    tech = (arch.tech_stack or {}).get("database", "") if arch and arch.tech_stack else ""
+    mapping = resolve_db_tooling(tech)
+    orm = mapping.get("orm", "SQLAlchemy")
+    return (
+        f"## ORM / Migration Strategy: {orm} using {mapping.get('migrations', 'None')}\n"
+        f"IMPORTANT: Use {orm} as the single data-access layer. "
+        "Do NOT use Prisma, Drizzle, TypeORM, raw DDL in parallel, or any other ORM. "
+        "All models/migrations must use the same paradigm as the backend models."
+    )
+
+
+def _build_system_prompt(db_tech: str, orm_block: str = "") -> str:
     return f"""\
 You are an expert database engineer specialising in {db_tech}.
 Generate a complete, runnable database migration file AND a structured manifest block.
+
+{orm_block}
 
 ## Strict Rules
 1.  Table and column names MUST match the Architecture database_schema_overview EXACTLY
@@ -129,6 +155,7 @@ def _build_file_prompt(
     manifest: CodeManifest,
     arch: Any,
     db_tech: str,
+    orm_block: str = "",
 ) -> str:
     fm = manifest.files.get(filepath)
     purpose = fm.purpose if fm else task.description
@@ -150,6 +177,10 @@ def _build_file_prompt(
 
     depends_str = ", ".join(task.depends_on) if task.depends_on else "(none)"
 
+    tree_str = build_project_file_tree(
+        manifest, highlight_path=filepath, task=task, agent="database"
+    )
+
     return f"""\
 ## Migration File to Generate
 - **File Path** : `{filepath}`
@@ -161,6 +192,11 @@ def _build_file_prompt(
 ## Tech Stack
 {tech_table}
 
+{orm_block}
+
+## Project File Tree (capped)
+{tree_str}
+
 ## Architecture — Database Schema Overview
 {getattr(arch, 'database_schema_overview', 'No schema overview provided.')}
 
@@ -171,9 +207,8 @@ def _build_file_prompt(
 {manifest_ctx}
 
 ---
-
 Generate the complete migration for `{filepath}`.
-Follow ALL 11 rules in the system prompt.
+Follow ALL rules in the system prompt.
 Return a single JSON object with keys: migration_code, manifest, functions.
 ```json
 """
@@ -238,8 +273,9 @@ class DatabaseAgent(BaseAgent):
         with lock:
             manifest = state.code_manifest
             arch = state.architecture
-            db_tech = arch.tech_stack.get("database", "PostgreSQL") if arch.tech_stack else "PostgreSQL"
-            sys_prompt  = _build_system_prompt(db_tech)
+            db_tech = _resolve_db_tech(arch)
+            orm_block = _orm_constraint_block(arch)
+            sys_prompt  = _build_system_prompt(db_tech, orm_block)
             user_prompt = self._build_batch_prompt(tasks, manifest, arch, db_tech)
 
         filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
@@ -302,12 +338,12 @@ class DatabaseAgent(BaseAgent):
 
         # Build prompts while holding the lock (read-only snapshot of shared state)
         with lock:
-            db_tech = "PostgreSQL with SQLAlchemy (Alembic)"
-            if state.architecture.tech_stack:
-                db_tech = state.architecture.tech_stack.get("database", db_tech)
-            sys_prompt = _build_system_prompt(db_tech)
+            arch = state.architecture
+            db_tech = _resolve_db_tech(arch)
+            orm_block = _orm_constraint_block(arch)
+            sys_prompt = _build_system_prompt(db_tech, orm_block)
             user_prompt = _build_file_prompt(
-                filepath, task, state.code_manifest, state.architecture, db_tech
+                filepath, task, state.code_manifest, arch, db_tech, orm_block
             )
 
         # LLM call (outside lock — blocking I/O)

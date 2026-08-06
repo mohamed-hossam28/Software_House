@@ -76,6 +76,50 @@ def merge_completed_task_ids(a: Any, b: Any) -> set[str]:
     return set_a | set_b
 
 
+def merge_code_manifest(current: Any, update: Any) -> Any:
+    """Merge CodeManifest entries across parallel node updates."""
+    def _get_files(obj: Any) -> dict:
+        if isinstance(obj, dict):
+            return obj.get("files", {})
+        if hasattr(obj, "files"):
+            return {k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v) for k, v in obj.files.items()}
+        return {}
+
+    files_a = _get_files(current)
+    files_b = _get_files(update)
+    merged_files = {**files_a, **files_b}
+
+    if isinstance(current, dict) or isinstance(update, dict):
+        return {"files": merged_files}
+    return CodeManifest(files=merged_files)
+
+
+def merge_code_map(current: Any, update: Any) -> Any:
+    """Merge CodeMap (database, backend, frontend dicts) across parallel node updates."""
+    def _get_bucket(obj: Any, bucket: str) -> dict:
+        if isinstance(obj, dict):
+            return obj.get(bucket, {})
+        return getattr(obj, bucket, {}) or {}
+
+    res = CodeMap(
+        database={**_get_bucket(current, "database"), **_get_bucket(update, "database")},
+        backend={**_get_bucket(current, "backend"), **_get_bucket(update, "backend")},
+        frontend={**_get_bucket(current, "frontend"), **_get_bucket(update, "frontend")},
+    )
+    if isinstance(current, dict) or isinstance(update, dict):
+        return res.model_dump(mode="json")
+    return res
+
+
+def merge_tasks(current: Any, update: Any) -> Any:
+    """Merge TaskList across parallel node updates."""
+    if not update:
+        return current
+    if not current:
+        return update
+    return update
+
+
 
 
 ################ Enum Values######################################################################  
@@ -95,6 +139,48 @@ class ReviewVerdict(str, Enum):
  
 
 ###################### data models##############################################################
+
+#: Deterministic ORM / migration strategy per database technology.
+#: Used to enforce a single database paradigm (Problem 5) — the LLM can never override it.
+DB_ORM_MAP: dict[str, dict[str, str]] = {
+    "PostgreSQL": {"orm": "SQLAlchemy", "migrations": "Alembic",                 "model_dir": "app/models/", "migration_dir": "alembic/versions/"},
+    "SQLite":     {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
+    "MongoDB":    {"orm": "Beanie",     "migrations": "None",                    "model_dir": "app/models/", "migration_dir": ""},
+    "MySQL":      {"orm": "SQLAlchemy", "migrations": "Alembic",                 "model_dir": "app/models/", "migration_dir": "alembic/versions/"},
+}
+
+#: Fallback used when the database tech string matches no known provider.
+_DEFAULT_ORM: dict[str, str] = {
+    "orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()",
+    "model_dir": "app/models/", "migration_dir": "app/db/",
+}
+
+
+def resolve_db_tooling(database_tech: str) -> dict[str, str]:
+    """Resolve ORM/migration strategy deterministically from a database tech string."""
+    db_key = (database_tech or "").lower()
+    for name, mapping in DB_ORM_MAP.items():
+        if name.lower() in db_key:
+            return mapping
+    return dict(_DEFAULT_ORM)
+
+
+#: Complexity tiers for calibrating output size to user intent (Problem 4).
+COMPLEXITY_TIERS: tuple[str, ...] = ("MINIMAL", "STANDARD", "ENTERPRISE")
+
+
+def classify_complexity(raw_prompt: str) -> str:
+    """Keyword-scan the raw user prompt to assign a complexity tier."""
+    text = (raw_prompt or "").lower()
+    enterprise = ("enterprise", "production", "production-grade", "scalable", "microservices", "high-availability")
+    minimal    = ("very simple", "simple", "basic", "just a", "toy", "demo", "tiny", "skeleton", "minimal")
+    if any(k in text for k in enterprise):
+        return "ENTERPRISE"
+    if any(k in text for k in minimal):
+        return "MINIMAL"
+    return "STANDARD"
+
+
 class SRSData(BaseModel):
     """output of req agent"""
     raw_prompt: str = ""
@@ -124,6 +210,7 @@ class ArchData(BaseModel):
     security_requirements: list[str] = Field(default_factory=list)
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths
+    complexity_tier: str = "STANDARD"                                # MINIMAL | STANDARD | ENTERPRISE
 
  
 class Task(BaseModel):
@@ -322,9 +409,9 @@ class ProjectState(BaseModel):
 
     requirements:    SRSData       = Field(default_factory=SRSData)
     architecture:    ArchData      = Field(default_factory=ArchData)
-    tasks:           TaskList      = Field(default_factory=TaskList)
-    code_manifest:   CodeManifest  = Field(default_factory=CodeManifest)   # ← file-level contracts
-    generated_code:  CodeMap       = Field(default_factory=CodeMap)
+    tasks:           Annotated[TaskList, merge_tasks] = Field(default_factory=TaskList)
+    code_manifest:   Annotated[CodeManifest, merge_code_manifest] = Field(default_factory=CodeManifest)   # ← file-level contracts
+    generated_code:  Annotated[CodeMap, merge_code_map] = Field(default_factory=CodeMap)
     integration:     IntegrationStatus = Field(default_factory=IntegrationStatus)
     tests:           TestResults   = Field(default_factory=TestResults)
     security:        SecurityScan  = Field(default_factory=SecurityScan)

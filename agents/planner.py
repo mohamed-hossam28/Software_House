@@ -1,19 +1,19 @@
 """
 agents/planner.py
 ─────────────────
-Planner Agent — parallel 3-call execution, minimal prompts, streaming enabled.
+Planner Agent — TWO-PASS planning (Problem 1).
 
-SINGLE ROUND — 3 calls in parallel:
-  ├── Call A: database  (needs: db_schema only)
-  ├── Call B: backend   (needs: backend tech + api_contracts + table names)
-  └── Call C: frontend  (needs: frontend tech + api_contracts)
+PASS 1 — Single skeleton LLM call.
+  One LLM call produces the COMPLETE project file tree (agent / file / exports /
+  imports_from). Global visibility means it cannot invent phantom imports.
 
-VALIDATION PASS — deterministic, no LLM
+PASS 2 — Deterministic task generation (no LLM).
+  Topological sort over the import graph assigns depends_on + priority, then
+  FileManifest entries are built. Zero LLM creativity in ordering.
 """
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from typing import Any
 
@@ -22,92 +22,92 @@ from providers.llm.base import BaseLLMProvider
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract,
 )
+import re
 
 logger = logging.getLogger(__name__)
-MAX_PARALLEL_CALLS = 3
 
 VALID_AGENTS: frozenset[str] = frozenset({"database", "backend", "frontend", "devops"})
 AGENT_PRIORITY: dict[str, int] = {"database": 1, "backend": 2, "frontend": 2, "devops": 3}
 AGENT_PREFIX: dict[str, str] = {"database": "db", "backend": "be", "frontend": "fe", "devops": "do"}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Per-call system prompts                                                    ║
+# ║  Pass-1 system + user prompts                                                ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-_BASE_SYSTEM = """\
-You are a senior engineering project manager. Break architecture into granular tasks.
-Respond with a SINGLE JSON array — no prose outside it.
-Every element:
-{"id":"<ID>","agent":"<AGENT_VALUE>","title":"<short>","description":"<detailed: file path, \
-class/function, contracts, acceptance criteria>","depends_on":["<id>",...],"priority":<PRIORITY>,\
-"status":"pending","file":"<repo-relative path>","exports":["<name>"],"classes":["<name>"],\
-"functions":["<name>"]}
-Rules: file — unique non-empty path. exports — only cross-module names. \
-classes/functions — suggestions, coding agent may add helpers.
+_SKELETON_SYSTEM = """\
+You are a senior engineering project manager. Design the COMPLETE file structure for the ENTIRE
+project in a single response. You have GLOBAL visibility over every file, so you MUST list every
+file — including each file that any other file imports from.
+
+Respond with a SINGLE JSON object — no prose outside it:
+{"skeleton": [
+  {"id":"<ID>","agent":"<database|backend|frontend|devops>","title":"<short>",
+   "description":"<what this file does>","file":"<repo-relative path>",
+   "exports":["<name>", ...],
+   "imports_from":{"<source file path>":["<name>", ...], ...}}
+]}
+
+Rules:
+- ID prefix by owner agent: db-*, be-*, fe-*, do-* (e.g. be-001).
+- exports: ONLY cross-module names — what OTHER files import from THIS file.
+- imports_from: the exact source file path(s) this file imports from, and which names it imports.
+  This is how the system computes build order — be precise and exhaustive.
+- EVERY file referenced in imports_from MUST itself appear in the skeleton. No phantom imports.
+- Include entrypoint/wiring files: backend main.py (registers routers) and frontend index.html.
+- Unique, non-empty, repo-relative file paths.
 """
 
-DATABASE_SYSTEM = _BASE_SYSTEM.replace("<AGENT_VALUE>", "database").replace("<PRIORITY>", "1") + """
-## Scope: DATABASE tasks ONLY
-- One task per table/migration. IDs: db-001, db-002, ...
-- depends_on: [] always (root tasks). Agent: "database".
-- Do NOT produce backend/frontend/devops tasks.
-"""
+SKELETON_USER_TEMPLATE = """\
+### Software Requirements (Functional)
+{srs_bullets}
 
-BACKEND_SYSTEM = _BASE_SYSTEM.replace("<AGENT_VALUE>", "backend").replace("<PRIORITY>", "2") + """
-## Scope: BACKEND tasks ONLY
-- One task per file (routes, services, models, schemas, config).
-- IDs: be-001, be-002, ... Agent: "backend".
-- depends_on: reference "db-001", "db-002" etc. based on table order in schema.
-- Do NOT produce database/frontend/devops tasks.
-"""
+### Tech Stack
+{tech_stack}
 
-FRONTEND_SYSTEM = _BASE_SYSTEM.replace("<AGENT_VALUE>", "frontend").replace("<PRIORITY>", "2") + """
-## Scope: FRONTEND tasks ONLY
-- One task per file (components, pages, hooks, API client, routing, styles).
-- IDs: fe-001, fe-002, ... Agent: "frontend".
-- depends_on: [] for most. NEVER reference be-* IDs.
-- Do NOT produce database/backend/devops tasks.
-"""
+### API Contracts
+{api_contracts}
 
-# ── Slim user prompt templates ───────────────────────────────────────────────────
-
-DATABASE_USER_TEMPLATE = """\
 ### Database Schema Overview
 {database_schema_overview}
 
+{complexity_constraint}
 ---
-Generate ALL database tasks. One per table/migration. JSON array only:
+Generate the complete project skeleton. JSON object only:
 ```json
 """
 
-BACKEND_USER_TEMPLATE = """\
-### Backend Technology
-{backend_tech}
 
-### API Contracts
-{api_contracts}
+def _srs_bullets(srs: Any) -> str:
+    """Render functional requirements (compact) for the skeleton prompt."""
+    reqs = getattr(srs, "functional_requirements", None)
+    if not reqs:
+        return "  (none provided)"
+    return "\n".join(f"- {r}" for r in reqs)
 
-### Database Tables (for depends_on prediction)
-{table_names}
 
----
-Generate ALL backend tasks. One per file. Reference db-* IDs in depends_on.
-JSON array only:
-```json
-"""
+def _fmt_tech_stack(stack: dict[str, str]) -> str:
+    if not stack:
+        return "  (none)"
+    return "\n".join(f"- {k}: {v}" for k, v in stack.items())
 
-FRONTEND_USER_TEMPLATE = """\
-### Frontend Technology
-{frontend_tech}
 
-### API Contracts
-{api_contracts}
-
----
-Generate ALL frontend tasks. One per file. Do NOT depend on backend tasks.
-JSON array only:
-```json
-"""
+def _complexity_constraint(tier: str) -> str:
+    """Prompt-level constraint calibrating file count to user intent (Problem 4)."""
+    tier = (tier or "STANDARD").upper()
+    limits = {"MINIMAL": "8-12", "STANDARD": "15-30", "ENTERPRISE": "30-60+"}
+    return (
+        f"## Complexity: {tier}\n"
+        f"- Target total project file count: {limits.get(tier, '15-30')}.\n"
+        + {
+            "MINIMAL": "- No auth/user tables unless explicitly requested.\n"
+                       "- Single DB table where possible. Minimal CSS. No state management.\n"
+                       "- Do NOT create notification/modal/loading components unless requested.",
+            "STANDARD": "- Full CRUD, optional auth, moderate styling.\n"
+                        "- Only create files that map to stated requirements — no speculative scaffolding.",
+            "ENTERPRISE": "- Full auth/RBAC/monitoring as warranted.\n"
+                          "- Every file must map to a stated requirement.",
+        }.get(tier, "- Only create files that map to stated requirements.")
+    )
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────────
@@ -187,14 +187,23 @@ def _validate_tasks(raw_list: list[Any]) -> tuple[list[Task], list[str]]:
         if not isinstance(item, dict):
             warnings.append(f"task[{i}] is not a dict — skipped")
             continue
-        missing = [f for f in ("id", "agent", "title", "description") if not item.get(f)]
-        if missing:
-            warnings.append(f"task[{i}] missing required fields {missing} — skipped")
+        tid   = str(item.get("id", "")).strip()
+        if not tid:
+            warnings.append(f"task[{i}] missing required field 'id' — skipped")
             continue
-        tid   = str(item["id"]).strip()
-        agent = str(item["agent"]).strip().lower()
+
+        agent = str(item.get("agent", "")).strip().lower()
+        if not agent:
+            # Infer agent from ID prefix (e.g. be-001 -> backend, db-001 -> database, fe-001 -> frontend)
+            if tid.startswith("be-"):
+                agent = "backend"
+            elif tid.startswith("db-"):
+                agent = "database"
+            elif tid.startswith("fe-"):
+                agent = "frontend"
+
         if agent not in VALID_AGENTS:
-            warnings.append(f"task '{tid}': unknown agent '{agent}' — skipped")
+            warnings.append(f"task '{tid}': unknown or missing agent '{agent}' — skipped")
             continue
         if tid in seen_ids:
             warnings.append(f"duplicate task ID '{tid}' — skipped")
@@ -236,25 +245,44 @@ def _validate_tasks(raw_list: list[Any]) -> tuple[list[Task], list[str]]:
     return tasks, warnings
 
 
-def _build_manifest(tasks: list[Task], raw_list: list[Any]) -> dict[str, FileManifest]:
+def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) -> dict[str, FileManifest]:
     """Build CodeManifest entries from validated tasks + raw LLM dicts."""
     raw_by_id: dict[str, dict] = {}
     for item in raw_list:
         if isinstance(item, dict) and item.get("id"):
             raw_by_id[str(item["id"]).strip()] = item
 
+    db_model_dir = "app/models/"
+    if arch is not None and getattr(arch, "tech_stack", None):
+        from core.state import resolve_db_tooling
+        db_model_dir = resolve_db_tooling(arch.tech_stack.get("database", "")).get("model_dir", "app/models/")
+
     manifest_files: dict[str, FileManifest] = {}
     for task in tasks:
         raw_item  = raw_by_id.get(task.id, {})
         file_path = str(raw_item.get("file", "")).strip().lstrip("/").lstrip("\\")
+
         if not file_path:
-            logger.warning("[PlannerAgent] task '%s' has no 'file' field — skipping manifest", task.id)
-            continue
+            # Fallback file path if LLM omitted 'file' field
+            sanitized_title = re.sub(r'[^a-zA-Z0-9_]', '_', task.title.lower()).strip('_') or f"task_{task.id}"
+            if task.agent == "database":
+                folder, ext = db_model_dir, ".py"
+            elif task.agent == "backend":
+                folder, ext = "app/api", ".py"
+            else:
+                folder, ext = "src", ".js"
+            file_path = f"{folder}{sanitized_title}{ext}"
+            logger.info("[PlannerAgent] task '%s' missing 'file' field — created fallback path: %s", task.id, file_path)
+
         if not file_path.startswith("output/") and not file_path.startswith("output\\"):
             file_path = f"output/{file_path}"
+
         if file_path in manifest_files:
-            logger.warning("[PlannerAgent] duplicate file path '%s' (task '%s') — skipping", file_path, task.id)
-            continue
+            # Disambiguate duplicate file paths by suffixing task_id
+            parts = file_path.rsplit(".", 1)
+            file_path = f"{parts[0]}_{task.id}.{parts[1]}" if len(parts) == 2 else f"{file_path}_{task.id}"
+            logger.info("[PlannerAgent] disambiguated duplicate file path to '%s'", file_path)
+
         manifest_files[file_path] = FileManifest(
             agent=task.agent, task_id=task.id, filepath=file_path,
             purpose=str(raw_item.get("description", ""))[:120],
@@ -263,13 +291,147 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any]) -> dict[str, FileMan
     return manifest_files
 
 
+def _inject_scaffold_tasks(
+    tasks: list[Task],
+    manifest_files: dict[str, FileManifest],
+) -> tuple[list[Task], dict[str, FileManifest]]:
+    """
+    Add mandatory wiring/scaffold tasks (Problem 2):
+      - backend  → app/main.py  (registers every backend router)
+      - frontend → index.html   (loads every stylesheet + script)
+    Each scaffold depends on ALL of its own agent's tasks so it runs last in that
+    agent's execution order and sees the complete list of files to wire.
+    """
+    existing_ids = {t.id for t in tasks}
+    existing_paths = set(manifest_files)
+    next_tasks = list(tasks)
+    next_manifest = dict(manifest_files)
+
+    def _next_id(prefix: str) -> str:
+        n = 900
+        while f"{prefix}-{n:03d}" in existing_ids:
+            n += 1
+        return f"{prefix}-{n:03d}"
+
+    backend_task_ids = [t.id for t in tasks if t.agent == "backend"]
+    if backend_task_ids and "output/app/main.py" not in existing_paths:
+        tid = _next_id("be")
+        existing_ids.add(tid)
+        next_tasks.append(Task(
+            id=tid, agent="backend",
+            title="Backend entrypoint (main.py)",
+            description="FastAPI application entry point that registers all routers, adds CORS, and serves static files.",
+            depends_on=list(backend_task_ids), priority=AGENT_PRIORITY["backend"], status="pending",
+        ))
+        next_manifest["output/app/main.py"] = FileManifest(
+            agent="backend", task_id=tid, filepath="output/app/main.py",
+            purpose="FastAPI application entry point — registers all routers and middleware.",
+            exports=["app"],
+        )
+
+    frontend_task_ids = [t.id for t in tasks if t.agent == "frontend"]
+    if frontend_task_ids and "output/index.html" not in existing_paths:
+        tid = _next_id("fe")
+        existing_ids.add(tid)
+        next_tasks.append(Task(
+            id=tid, agent="frontend",
+            title="Frontend entrypoint (index.html)",
+            description="HTML entry point that loads every stylesheet and script in the correct order.",
+            depends_on=list(frontend_task_ids), priority=AGENT_PRIORITY["frontend"], status="pending",
+        ))
+        next_manifest["output/index.html"] = FileManifest(
+            agent="frontend", task_id=tid, filepath="output/index.html",
+            purpose="HTML entry point loading all stylesheets and scripts.",
+            exports=["index"],
+        )
+
+    return next_tasks, next_manifest
+
+
+def _generate_tasks_from_skeleton(nodes: list[Any], warnings: list[str]) -> list[Task]:
+    """
+    Pass 2 — deterministic task generation from the skeleton (no LLM).
+
+    depends_on is computed by topological sort over the import graph: a task depends
+    on the node(s) whose FILES it imports (per imports_from). Ordering is therefore
+    driven by real data dependencies, not arbitrary priority numbers.
+    """
+    file_to_id: dict[str, str] = {}
+    for nd in nodes:
+        p = str(nd.get("file", "")).strip().lstrip("/").lstrip("\\")
+        if p:
+            file_to_id.setdefault(p, str(nd.get("id", "")).strip())
+
+    tasks: list[Task] = []
+    for nd in nodes:
+        tid = str(nd.get("id", "")).strip()
+        if not tid:
+            warnings.append("skeleton entry missing 'id' — skipped")
+            continue
+        agent = str(nd.get("agent", "")).strip().lower()
+        if not agent:
+            for prefix, a in (("db-", "database"), ("be-", "backend"), ("fe-", "frontend"), ("do-", "devops")):
+                if tid.startswith(prefix):
+                    agent = a
+                    break
+        if agent not in VALID_AGENTS:
+            warnings.append(f"skeleton task '{tid}': unknown agent '{agent}' — skipped")
+            continue
+
+        depends: set[str] = set()
+        imp = nd.get("imports_from") or {}
+        for src_path in imp.keys():
+            src = str(src_path).strip().lstrip("/").lstrip("\\")
+            dep_id = file_to_id.get(src)
+            if dep_id is None:
+                warnings.append(
+                    f"skeleton task '{tid}' imports unknown file '{src}' (phantom import) — dependency dropped"
+                )
+                continue
+            if dep_id != tid:
+                depends.add(dep_id)
+
+        tasks.append(Task(
+            id=tid, agent=agent,
+            title=str(nd.get("title", "")),
+            description=str(nd.get("description", "")),
+            depends_on=sorted(depends),
+            priority=AGENT_PRIORITY[agent], status="pending",
+        ))
+
+    valid_ids = {t.id for t in tasks}
+    for t in tasks:
+        bad = [d for d in t.depends_on if d not in valid_ids]
+        if bad:
+            warnings.append(f"task '{t.id}': depends_on references unknown IDs {bad} — removed")
+            t.depends_on = [d for d in t.depends_on if d in valid_ids]
+
+    # frontend runs parallel to backend — strip any FE->BE dependencies
+    backend_ids = {t.id for t in tasks if t.agent == "backend"}
+    for t in tasks:
+        if t.agent != "frontend":
+            continue
+        be = [d for d in t.depends_on if d in backend_ids]
+        if be:
+            warnings.append(f"task '{t.id}' (frontend) depends on backend task(s) {be} — removed")
+            t.depends_on = [d for d in t.depends_on if d not in backend_ids]
+
+    if _has_cycle(tasks):
+        warnings.append("CYCLE DETECTED in import graph — clearing all depends_on")
+        logger.error("[PlannerAgent] circular dependency detected — clearing all depends_on")
+        for t in tasks:
+            t.depends_on = []
+
+    return tasks
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  PlannerAgent                                                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 class PlannerAgent(BaseAgent):
     """
-    3 parallel LLM calls (database, backend, frontend) with minimal prompts
-    and streaming enabled, then deterministic merge + validation.
+    Two-pass planner: one skeleton call (global visibility), then deterministic
+    task generation via topological sort on the import graph.
     """
 
     def __init__(
@@ -294,65 +456,8 @@ class PlannerAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return _BASE_SYSTEM
+        return _SKELETON_SYSTEM
 
-
-    # ── Sub-call workers ─────────────────────────────────────────────────────
-
-    def _call_database(self, db_schema: str,
-                       results: dict, lock: Lock, state: ProjectState) -> None:
-        """Call A: only needs database_schema_overview."""
-        prompt = DATABASE_USER_TEMPLATE.format(database_schema_overview=db_schema)
-        try:
-            from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(DATABASE_SYSTEM, prompt, "database", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
-            with lock:
-                results["database"] = data
-            logger.info("[PlannerAgent] ✓ database tasks complete (%d items)", len(data))
-        except Exception as exc:
-            logger.error("[PlannerAgent] database sub-call failed: %s", exc)
-            with lock:
-                state.log_error("PlannerAgent", f"database sub-call failed: {exc}")
-
-    def _call_backend(self, backend_tech: str, api_contracts_str: str, table_names: str,
-                      results: dict, lock: Lock, state: ProjectState) -> None:
-        """Call B: needs backend tech key + api_contracts + table names."""
-        prompt = BACKEND_USER_TEMPLATE.format(
-            backend_tech=backend_tech,
-            api_contracts=api_contracts_str,
-            table_names=table_names,
-        )
-        try:
-            from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(BACKEND_SYSTEM, prompt, "backend", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
-            with lock:
-                results["backend"] = data
-            logger.info("[PlannerAgent] ✓ backend tasks complete (%d items)", len(data))
-        except Exception as exc:
-            logger.error("[PlannerAgent] backend sub-call failed: %s", exc)
-            with lock:
-                state.log_error("PlannerAgent", f"backend sub-call failed: {exc}")
-
-    def _call_frontend(self, frontend_tech: str, api_contracts_str: str,
-                       results: dict, lock: Lock, state: ProjectState) -> None:
-        """Call C: needs frontend tech key + api_contracts only."""
-        prompt = FRONTEND_USER_TEMPLATE.format(
-            frontend_tech=frontend_tech,
-            api_contracts=api_contracts_str,
-        )
-        try:
-            from agents.schemas.planner import TaskSchema
-            raw = self._call_with_system(FRONTEND_SYSTEM, prompt, "frontend", state=state, lock=lock)
-            data = self.extract_json_and_validate(raw, TaskSchema, is_list=True, state=state, lock=lock)
-            with lock:
-                results["frontend"] = data
-            logger.info("[PlannerAgent] ✓ frontend tasks complete (%d items)", len(data))
-        except Exception as exc:
-            logger.error("[PlannerAgent] frontend sub-call failed: %s", exc)
-            with lock:
-                state.log_error("PlannerAgent", f"frontend sub-call failed: {exc}")
 
     # ── Main execution ───────────────────────────────────────────────────────
     def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
@@ -361,51 +466,61 @@ class PlannerAgent(BaseAgent):
         ps.mark_agent_start(self.name)
         t0 = time.perf_counter()
         arch = ps.architecture
+        lock = Lock()
 
-        # Pre-extract only what each call needs
-        db_schema       = arch.database_schema_overview or "(none provided)"
-        backend_tech    = arch.tech_stack.get("backend", "FastAPI (Python 3.12)")
-        frontend_tech   = arch.tech_stack.get("frontend", "React 18 + TypeScript")
-        api_contracts   = _fmt_api_contracts(arch.api_contracts)
-        table_names     = _extract_table_names(arch.database_schema_overview)
+        # Build the Pass-1 skeleton prompt from architecture + SRS context
+        prompt = SKELETON_USER_TEMPLATE.format(
+            srs_bullets         = _srs_bullets(ps.requirements),
+            tech_stack          = _fmt_tech_stack(arch.tech_stack),
+            api_contracts       = _fmt_api_contracts(arch.api_contracts),
+            database_schema_overview = arch.database_schema_overview or "(none provided)",
+            complexity_constraint    = _complexity_constraint(getattr(arch, "complexity_tier", "STANDARD")),
+        )
 
-        results: dict[str, list[Any]] = {}
-        state_lock = Lock()
+        # ── PASS 1: single skeleton LLM call ────────────────────────────────
+        logger.info("[PlannerAgent] ── Pass 1: single skeleton call ──")
+        try:
+            from agents.schemas.planner import SkeletonSchema
+            raw = self._call_with_system(_SKELETON_SYSTEM, prompt, "planner-skeleton", state=ps, lock=lock)
+            data = self.extract_json_and_validate(raw, SkeletonSchema, state=ps, lock=lock)
+        except Exception as exc:
+            logger.error("[PlannerAgent] skeleton call failed: %s", exc)
+            ps.log_error(self.name, f"skeleton call failed: {exc}")
+            ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
+            return self._compute_diff(before, ps)
 
-        # ── SINGLE ROUND: 3 parallel calls ──────────────────────────────────
-        logger.info("[PlannerAgent] ── Launching 3 parallel sub-calls (streaming) ──")
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
-            futures: list[Future] = [
-                pool.submit(self._call_database, db_schema, results, state_lock, ps),
-                pool.submit(self._call_backend, backend_tech, api_contracts, table_names,
-                            results, state_lock, ps),
-                pool.submit(self._call_frontend, frontend_tech, api_contracts,
-                            results, state_lock, ps),
-            ]
-            for f in futures:
-                f.result()
-
-        # ── Merge ────────────────────────────────────────────────────────────
-        merged_raw: list[Any] = []
-        for agent_key in ("database", "backend", "frontend"):
-            merged_raw.extend(results.get(agent_key, []))
-        logger.info("[PlannerAgent] Merged %d raw tasks from 3 sub-calls", len(merged_raw))
-
-        # ── VALIDATION PASS ──────────────────────────────────────────────────
-        tasks, warnings = _validate_tasks(merged_raw)
-        for w in warnings:
-            logger.warning("[PlannerAgent] %s", w)
-            ps.log_error(self.name, w)
-
-        if not tasks:
-            msg = "No valid tasks produced — check LLM responses."
+        skeleton = data.get("skeleton", []) if isinstance(data, dict) else []
+        logger.info("[PlannerAgent] ✓ skeleton produced (%d files)", len(skeleton))
+        if not skeleton:
+            msg = "No skeleton produced — check LLM response."
             logger.error("[PlannerAgent] %s", msg)
             ps.log_error(self.name, msg)
             ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
             return self._compute_diff(before, ps)
 
-        ps.tasks = TaskList(tasks=tasks)
-        manifest_files = _build_manifest(tasks, merged_raw)
+        # ── PASS 2: deterministic task generation (no LLM) ─────────────────
+        warnings: list[str] = []
+        tasks = _generate_tasks_from_skeleton(skeleton, warnings)
+        for w in warnings:
+            logger.warning("[PlannerAgent] %s", w)
+            ps.log_error(self.name, w)
+
+        if not tasks:
+            msg = "No valid tasks produced — check LLM response."
+            logger.error("[PlannerAgent] %s", msg)
+            ps.log_error(self.name, msg)
+            ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
+            return self._compute_diff(before, ps)
+
+        manifest_files = _build_manifest(tasks, skeleton, arch)
+
+        # Inject mandatory wiring/scaffold tasks (Problem 2) — run last per agent.
+        tasks, manifest_files = _inject_scaffold_tasks(tasks, manifest_files)
+
+        manifest_task_ids = {fm.task_id for fm in manifest_files.values()}
+        synced_tasks = [t for t in tasks if t.id in manifest_task_ids]
+
+        ps.tasks = TaskList(tasks=synced_tasks)
         ps.code_manifest = CodeManifest(files=manifest_files)
 
         duration = time.perf_counter() - t0
@@ -490,6 +605,50 @@ if __name__ == "__main__":
     assert len(mf) == 2
     assert mf["output/backend/app/models/user.py"].exports == ["User"]
     print("[PASS] _build_manifest — 2 entries with correct exports")
+
+    # ── _generate_tasks_from_skeleton (Pass 2) ────────────────────────────────
+    skel = [
+        {"id": "db-001", "agent": "database", "title": "Todo model",
+         "file": "app/models/todo.py", "exports": ["TodoItem"], "imports_from": {}},
+        {"id": "be-002", "agent": "backend", "title": "Todo schemas",
+         "file": "app/schemas/todo.py", "exports": ["TodoItemCreate"], "imports_from": {}},
+        {"id": "be-001", "agent": "backend", "title": "Todo routes",
+         "file": "app/api/routes/todo.py", "exports": ["router"],
+         "imports_from": {"app/models/todo.py": ["TodoItem"], "app/schemas/todo.py": ["TodoItemCreate"]}},
+        {"id": "fe-001", "agent": "frontend", "title": "Todo list",
+         "file": "assets/js/todoList.js", "exports": ["TodoList"], "imports_from": {}},
+        # Phantom import — source file never appears in the skeleton
+        {"id": "be-003", "agent": "backend", "title": "Phantom svc",
+         "file": "app/services/phantom.py", "exports": ["srv"],
+         "imports_from": {"app/models/nonexistent.py": ["Missing"]}},
+    ]
+    warnings = []
+    gen = _generate_tasks_from_skeleton(skel, warnings)
+    by_id = {t.id: t for t in gen}
+    assert len(gen) == 5, f"expected 5 tasks, got {len(gen)}"
+    assert by_id["be-001"].depends_on == ["be-002", "db-001"], by_id["be-001"].depends_on
+    assert by_id["be-003"].depends_on == [], "phantom import should be dropped"
+    assert any("phantom import" in w for w in warnings), "phantom import should be warned"
+    assert by_id["be-001"].priority == AGENT_PRIORITY["backend"]
+    print("[PASS] _generate_tasks_from_skeleton — import-graph deps + phantom drop")
+
+    # FE->BE deps are stripped (frontend runs parallel to backend)
+    skel2 = [
+        {"id": "be-001", "agent": "backend", "title": "r", "file": "app/api/r.py",
+         "exports": ["router"], "imports_from": {}},
+        {"id": "fe-001", "agent": "frontend", "title": "f", "file": "assets/js/f.js",
+         "exports": ["App"], "imports_from": {"app/api/r.py": ["router"]}},
+    ]
+    gen2 = _generate_tasks_from_skeleton(skel2, [])
+    fe = next(t for t in gen2 if t.agent == "frontend")
+    assert fe.depends_on == [], f"FE->BE dep not stripped: {fe.depends_on}"
+    print("[PASS] _generate_tasks_from_skeleton — FE->BE dep stripped")
+
+    # SkeletonSchema validates imports_from
+    from agents.schemas.planner import SkeletonSchema
+    ss = SkeletonSchema.model_validate({"skeleton": skel[:2]})
+    assert len(ss.skeleton) == 2 and ss.skeleton[0].imports_from == {}
+    print("[PASS] SkeletonSchema — parses skeleton + imports_from")
 
     # ── FileManifest / CodeManifest ─────────────────────────────────────────────
     fm = FileManifest(agent="backend", task_id="be-001", filepath="backend/app/routes/auth.py",

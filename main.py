@@ -132,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Build a simple todo app with a FastAPI backend and React frontend.",
+        default="Build a very simple todo app with a FastAPI backend and html and css frontend that does not use any frameworks for the frontend",
         help="Natural language prompt for the software project"
     )
     parser.add_argument(

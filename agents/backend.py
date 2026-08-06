@@ -34,10 +34,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
 from agents.utils import write_code_to_disk, write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
@@ -156,6 +156,14 @@ def _build_file_prompt(
     else:
         tech_stack_str = "No tech stack specified."
 
+    # Capped project file tree (Problem 3) — what else exists + exact exports
+    tree_str = build_project_file_tree(
+        manifest, highlight_path=filepath, task=task, agent="backend"
+    )
+
+    # Deterministic wiring for entrypoint files (Problem 2)
+    scaffold_note = build_scaffold_context(manifest, filepath)
+
     user_prompt = f"""\
 ## File to Generate
 - **File Path**: `{filepath}`
@@ -172,6 +180,12 @@ def _build_file_prompt(
 
 ### API Contracts
 {contracts_str}
+
+{scaffold_note}
+
+## Project File Tree (capped)
+You may ONLY import from files listed here — use the EXACT export names shown.
+{tree_str}
 
 ## Project Code Manifest (Other Files)
 Use this manifest to understand how to import from and communicate with other modules.
@@ -297,11 +311,8 @@ class BackendAgent(BaseAgent):
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
         with lock:
             arch = state.architecture
-            all_contracts = arch.api_contracts if arch else []
 
-        relevant_deps = filter_manifest_by_dependencies(manifest, file_manifest)
-        relevant_contracts = filter_api_contracts_by_relevance(all_contracts, file_manifest)
-        user_prompt = self._build_single_task_prompt(task, file_manifest, relevant_deps, relevant_contracts, arch)
+        user_prompt = _build_file_prompt(file_manifest.filepath, manifest, arch, task)
 
         backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
         sys_prompt = _build_system_prompt(backend_tech)
@@ -366,9 +377,14 @@ class BackendAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            # Split stage into trivial batches (2-3 files per LLM call) + non-trivial singles
-            trivial  = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
-            non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            # Split stage into trivial batches (2-3 files per LLM call) + non-trivial singles.
+            # Scaffold/entrypoint files are NEVER batched — they need their wiring prompt.
+            def _is_batchable(t: Task) -> bool:
+                fm = ps.code_manifest.by_task(t.id)
+                return is_trivial_file(t, ps.code_manifest) and not is_scaffold_file(getattr(fm, "filepath", None))
+
+            trivial     = [t for t in stage if _is_batchable(t)]
+            non_trivial = [t for t in stage if not _is_batchable(t)]
             batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
 
             logger.info(

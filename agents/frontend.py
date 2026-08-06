@@ -33,9 +33,9 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
 except ImportError:
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE
+    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, build_project_file_tree, build_scaffold_context, is_scaffold_file
 from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
 
 from core.state import (
@@ -176,6 +176,12 @@ def _build_file_prompt(
             "   No empty rule-sets, no placeholder comments.\n"
         )
 
+    tree_str = build_project_file_tree(
+        manifest, highlight_path=filepath, task=task, agent="frontend"
+    )
+
+    scaffold_note = build_scaffold_context(manifest, filepath)
+
     return f"""\
 ## File to Generate
 - **Path**     : `{filepath}`
@@ -189,6 +195,12 @@ def _build_file_prompt(
 
 ## API Contracts  ← USE THESE EXACT PATHS / FIELD NAMES
 {contracts}
+
+{scaffold_note}
+
+## Project File Tree (capped)
+You may ONLY import from files listed here — use the EXACT export names shown.
+{tree_str}
 
 ## Project Code Manifest
 {manifest_s}
@@ -298,7 +310,6 @@ class FrontendAgent(BaseAgent):
         with lock:
             fm = state.code_manifest.by_task(task.id)
             arch = state.architecture
-            all_contracts = arch.api_contracts if arch else []
             manifest = state.code_manifest
         if not fm:
             logger.error("[FrontendAgent] Task %s has no manifest entry", task.id)
@@ -309,11 +320,8 @@ class FrontendAgent(BaseAgent):
         filepath = fm.filepath
         logger.info("[FrontendAgent] Generating %s (task %s) …", filepath, task.id)
 
-        relevant_deps = filter_manifest_by_dependencies(manifest, fm)
-        relevant_contracts = filter_api_contracts_by_relevance(all_contracts, fm)
-
         frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch and arch.tech_stack else "React 18 + TypeScript"
-        user_prompt = self._build_single_task_prompt(task, fm, relevant_deps, relevant_contracts, arch, frontend_tech)
+        user_prompt = _build_file_prompt(filepath, manifest, arch, frontend_tech, task)
         sys_prompt  = _build_system_prompt(frontend_tech)
 
         # LLM call (outside lock — blocking I/O)
@@ -382,9 +390,14 @@ class FrontendAgent(BaseAgent):
         state_lock = Lock()
 
         for idx, stage in enumerate(stages):
-            # Split into trivial batches + non-trivial singles
-            trivial     = [t for t in stage if is_trivial_file(t, ps.code_manifest)]
-            non_trivial = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            # Split into trivial batches + non-trivial singles.
+            # Scaffold/entrypoint files are NEVER batched — they need their wiring prompt.
+            def _is_batchable(t: Task) -> bool:
+                fm = ps.code_manifest.by_task(t.id)
+                return is_trivial_file(t, ps.code_manifest) and not is_scaffold_file(getattr(fm, "filepath", None))
+
+            trivial     = [t for t in stage if _is_batchable(t)]
+            non_trivial = [t for t in stage if not _is_batchable(t)]
             batches = [trivial[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial), TRIVIAL_BATCH_SIZE)]
 
             logger.info(

@@ -24,7 +24,7 @@ from typing import Any
 
 from .base import BaseAgent
 from agents.utils import _as_list
-from core.state import ProjectState, ArchData, SRSData, APIContract
+from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +54,19 @@ _LAYER_TECH_MAP: dict[str, dict[str, str]] = {
         "laravel":  "Laravel 11 (PHP)",
     },
     "frontend": {
-        "react":    "React 18 + TypeScript",
-        "vue":      "Vue 3 + TypeScript",
-        "angular":  "Angular 17",
-        "next.js":  "Next.js 14 (React)",
-        "nextjs":   "Next.js 14 (React)",
-        "svelte":   "SvelteKit",
-        "nuxt":     "Nuxt 3 (Vue)",
+        "html":         "HTML5 + CSS3 + Vanilla JavaScript",
+        "css":          "HTML5 + CSS3 + Vanilla JavaScript",
+        "vanilla":      "HTML5 + CSS3 + Vanilla JavaScript",
+        "no framework": "HTML5 + CSS3 + Vanilla JavaScript",
+        "htmx":         "HTML5 + HTMX + CSS3",
+        "jinja":        "Jinja2 Templates + HTML5 + CSS3",
+        "react":        "React 18 + TypeScript",
+        "vue":          "Vue 3 + TypeScript",
+        "angular":      "Angular 17",
+        "next.js":      "Next.js 14 (React)",
+        "nextjs":       "Next.js 14 (React)",
+        "svelte":       "SvelteKit",
+        "nuxt":         "Nuxt 3 (Vue)",
     },
     "database": {
         "postgresql": "PostgreSQL 16",
@@ -116,6 +122,8 @@ class TechStackResolver:
         """
         # Combine the text fields most likely to contain tech preferences
         combined_text = " ".join([
+            *srs.functional_requirements,
+            *srs.non_functional_requirements,
             *srs.constraints,
             *srs.assumptions,
             srs.raw_prompt,
@@ -283,7 +291,7 @@ _BASE_SYSTEM = (
 
 CORE_ARCH_SYSTEM = _BASE_SYSTEM + """
 Your tasks for the given software requirement specification (SRS):
-1. Decide the backend, frontend, database, cache, and infrastructure technologies. Use the resolved baseline stack when available; fill gaps with best choices.
+1. Decide the backend, frontend, database, cache, and infrastructure technologies. Strictly honor any explicit framework, library, language, or stack requested by the user in the SRS (e.g. HTML/CSS, Vanilla JS, Svelte, Vue, Angular, Django, Flask, Go, Rust, SQLite, etc.). Use the baseline defaults ONLY for unspecified layers.
 2. List every high-level service/component the system needs (e.g. AuthService, BoardService, NotificationService, APIGateway, etc.). Be exhaustive.
 3. Define security requirements (auth strategy, RBAC roles, data encryption, rate limiting, CORS policy, secrets management).
 
@@ -316,6 +324,35 @@ Return JSON:
 """
 
 
+def _complexity_block(tier: str) -> str:
+    """Calibrate output size/complexity to user intent (Problem 4)."""
+    constraints = {
+        "MINIMAL": (
+            "Maximum 10 files total.\n"
+            "- No authentication or user management.\n"
+            "- Single database table (no users table unless explicitly requested).\n"
+            "- Minimal CSS — clean but not elaborate.\n"
+            "- No state management libraries.\n"
+            "- No notification/modal/loading/empty-state components unless explicitly requested.\n"
+            "- Only system components the feature truly needs."
+        ),
+        "STANDARD": (
+            "Full CRUD, optional authentication, moderate styling.\n"
+            "- Include only components/services the requirements actually describe.\n"
+            "- Avoid speculative features (notifications, RBAC, CI/CD) unless requested."
+        ),
+        "ENTERPRISE": (
+            "Full authentication, RBAC, monitoring, CI/CD, Docker as warranted.\n"
+            "- You may be exhaustive, but every component must map to a stated requirement."
+        ),
+    }
+    return (
+        f"## Complexity: {tier}\n"
+        "Calibrate the architecture to this tier. Do not over-engineer beyond the tier.\n"
+        + constraints.get(tier, constraints["STANDARD"])
+    )
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  ArchitectureAgent                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -336,9 +373,9 @@ class ArchitectureAgent(BaseAgent):
 
     # ── Individual sub-call workers ──────────────────────────────────────────
 
-    def _call_core_architecture(self, srs_text: str, stack_table: str,
+    def _call_core_architecture(self, srs_text: str, stack_table: str, complexity_block: str,
                                  results: dict, lock: Lock, state: ProjectState) -> None:
-        prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{srs_text}\n```json\n"
+        prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{complexity_block}\n\n{srs_text}\n```json\n"
         try:
             from agents.schemas.architecture import CoreArchitectureSchema
             raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core", state=state, lock=lock)
@@ -405,11 +442,17 @@ class ArchitectureAgent(BaseAgent):
         results: dict[str, Any] = {}
         state_lock = Lock()
 
+        # ── Complexity calibration (Problem 4) ─────────────────────────────────
+        tier = classify_complexity(getattr(ps.requirements, "raw_prompt", ""))
+        complexity_block = _complexity_block(tier)
+        results["complexity_tier"] = tier
+        logger.info("[ArchitectureAgent] complexity tier: %s", tier)
+
         # ── ROUND 1: Call A (Core Arch) + Call B (DB Schema) [Parallel] ───────
         logger.info("[ArchitectureAgent] ── Round 1/2 (2 parallel calls: Core Arch & DB Schema) ──")
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures: list[Future] = [
-                pool.submit(self._call_core_architecture, srs_text, stack_table,
+                pool.submit(self._call_core_architecture, srs_text, stack_table, complexity_block,
                             results, state_lock, ps),
                 pool.submit(self._call_db_schema, db_srs_text,
                             results, state_lock, ps),
@@ -417,8 +460,8 @@ class ArchitectureAgent(BaseAgent):
             for f in futures:
                 f.result()
 
-        # Merge authoritative stack over LLM-returned stack
-        merged_stack = {**results.get("tech_stack", {}), **authoritative_stack}
+        # LLM dynamically chosen stack takes priority over pre-calculated static baseline
+        merged_stack = {**authoritative_stack, **results.get("tech_stack", {})}
         results["tech_stack"] = merged_stack
 
         srs_summary_text = _srs_summary_block(ps.requirements, merged_stack)
@@ -442,6 +485,7 @@ class ArchitectureAgent(BaseAgent):
             security_requirements    = _as_list(results.get("security_requirements", [])),
             deployment_strategy      = "",
             diagrams                 = [],
+            complexity_tier          = str(results.get("complexity_tier", "STANDARD")),
         )
 
         duration = time.perf_counter() - t0

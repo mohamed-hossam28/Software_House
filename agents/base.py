@@ -137,6 +137,27 @@ _TRIVIAL_PATTERNS = (
 
 TRIVIAL_BATCH_SIZE = 3  # max files per batch LLM call
 
+#: Entrypoint/scaffold files get a dedicated single-file prompt (Problem 2) —
+#: they must NEVER be batched as trivial because their wiring context is special.
+_SCAFFOLD_NAMES = frozenset({"main.py", "app.py", "server.py", "index.html", "index.htm"})
+
+
+def is_scaffold_file(filepath: str | None) -> bool:
+    return os.path.basename(filepath or "").lower() in _SCAFFOLD_NAMES
+
+
+def is_trivial_filepath(filepath: str, exports: list | None = None) -> bool:
+    """True if a file is 'trivial' boilerplate (init, barrel, config, types, constants, errors, <3 exports)."""
+    basename = os.path.basename(filepath or "").lower()
+    if basename in _TRIVIAL_NAMES:
+        return True
+    for pattern in _TRIVIAL_PATTERNS:
+        if pattern in (filepath or "").lower():
+            return True
+    if exports is not None and len(exports) < 3:
+        return True
+    return False
+
 
 def is_trivial_file(task: Any, manifest: Any) -> bool:
     """
@@ -153,19 +174,112 @@ def is_trivial_file(task: Any, manifest: Any) -> bool:
 
     filepath = getattr(fm, "filepath", "")
     exports  = getattr(fm, "exports", []) or []
-    basename = os.path.basename(filepath).lower()
+    return is_trivial_filepath(filepath, exports)
 
-    # Explicit name match
-    if basename in _TRIVIAL_NAMES:
+
+def _shares_resource(path_a: str, path_b: str) -> bool:
+    """True when two paths share a directory or an identifier token (e.g. both relate to 'todo')."""
+    if not path_a or not path_b:
+        return False
+    if os.path.dirname(path_a).rstrip("/") == os.path.dirname(path_b).rstrip("/"):
         return True
-    # Suffix pattern match
-    for pattern in _TRIVIAL_PATTERNS:
-        if pattern in filepath.lower():
-            return True
-    # Export count
-    if len(exports) < 3:
-        return True
-    return False
+    a_tokens = {t for t in os.path.basename(path_a).split(".")[0].lower().split("_") if t}
+    b_tokens = {t for t in os.path.basename(path_b).split(".")[0].lower().split("_") if t}
+    return bool(a_tokens & b_tokens)
+
+
+def build_project_file_tree(
+    manifest: Any,
+    highlight_path: str = "",
+    task: Any = None,
+    agent: str | None = None,
+    include_trivial: bool = True,
+) -> str:
+    """
+    Build a CAPPED project file tree for injection into coding prompts.
+
+    Capping rule (keeps ~95% of the full-tree benefit at small token cost):
+      include a file iff it is one of:
+        - a declared dependency of `task` (task.depends_on)
+        - already written
+        - a trivial/boilerplate file
+        - a same-agent + same-resource file
+    The current file is marked with '★'.
+    """
+    if not hasattr(manifest, "files") or not manifest.files:
+        return "(no files planned yet)"
+    if highlight_path not in manifest.files:
+        # highlight may be an unregistered scaffold path — find by filepath anyway
+        pass
+
+    dep_ids = set(task.depends_on) if (task and getattr(task, "depends_on", None)) else set()
+    all_filepaths = sorted(
+        manifest.files.keys(),
+        key=lambda p: (p.rstrip("/").count("/"), p),
+    )
+    entries: list[str] = []
+    for path in all_filepaths:
+        fm = manifest.files[path]
+        written = getattr(fm, "written", False)
+        included = (
+            path == highlight_path
+            or getattr(fm, "task_id", None) in dep_ids
+            or written
+            or (include_trivial and is_trivial_filepath(path, getattr(fm, "exports", [])))
+            or (fm.agent == agent and _shares_resource(path, highlight_path))
+        )
+        if not included:
+            continue
+        marker = " ★ (generating)" if path == highlight_path else ""
+        status = "written" if written else "pending"
+        exports = ", ".join(getattr(fm, "exports", []) or []) or "(none)"
+        depth = path.rstrip("/").count("/")
+        entries.append(
+            f"{'  ' * depth}- `{path}`  [{status}] {fm.agent} — exports: {exports}{marker}"
+        )
+    if not entries:
+        return "(no relevant project files planned yet)"
+    return "\n".join(entries)
+
+
+def build_scaffold_context(manifest: Any, filepath: str) -> str:
+    """
+    Deterministic wiring instructions for entrypoint/scaffold files .
+    Backend entrypoint (main.py) gets the exact router list; index.html gets the
+    exact stylesheet/script list — no LLM guessing about what to load.
+    """
+    if not hasattr(manifest, "files"):
+        return ""
+    base = os.path.basename(filepath or "").lower()
+    if base in ("main.py", "app.py", "server.py"):
+        routers = []
+        for path, fm in manifest.files.items():
+            if path == filepath:
+                continue
+            if fm.agent != "backend":
+                continue
+            exports = getattr(fm, "exports", []) or []
+            if "router" in exports or "routes" in path.lower() or "controllers" in path.lower():
+                routers.append(f"- `{path}` → exports: {', '.join(exports)}")
+        header = "## Scaffold Wiring — You MUST register these routers (their files already exist):"
+        return header + ("\n" + "\n".join(routers) if routers else "\n(none found)")
+    if base == "index.html":
+        styles = sorted(
+            p for p in manifest.files if p != filepath and p.endswith((".css", ".scss", ".sass"))
+        )
+        scripts = sorted(
+            p for p in manifest.files
+            if p != filepath and p.endswith((".js", ".ts", ".tsx", ".jsx"))
+        )
+        parts = ["## Scaffold Wiring — index.html MUST load the following files in this order:"]
+        if styles:
+            parts.append("\n".join([f"- stylesheet: `{p}`" for p in styles]))
+        if scripts:
+            parts.append("\n".join([f"- script: `{p}`" for p in scripts]))
+        if not styles and not scripts:
+            parts.append("(no stylesheets/scripts planned yet)")
+        return "\n".join(parts)
+    return ""
 
 
 ####################BaseAgent##########################
