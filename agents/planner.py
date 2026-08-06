@@ -291,14 +291,58 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
     return manifest_files
 
 
+def _detect_backend_root(manifest_files: dict[str, FileManifest]) -> str | None:
+    """Return the common parent directory of all backend files, e.g. 'output/backend/'."""
+    backend_paths = [fm.filepath for fm in manifest_files.values() if fm.agent == "backend"]
+    if not backend_paths:
+        return None
+    parts_list = [p.rstrip("/").split("/") for p in backend_paths]
+    common = parts_list[0][:-1]  # exclude filename
+    for p in parts_list[1:]:
+        common = [a for a, b in zip(common, p[:-1]) if a == b]
+    if not common:
+        return None
+    root = "/".join(common) + "/"
+    # If all backend files live in the same directory, go up one level
+    # so that main.py sits alongside the subdirectory, not inside it.
+    dirs = {p.rsplit("/", 1)[0] + "/" for p in backend_paths}
+    if len(dirs) <= 1:
+        root_parts = root.rstrip("/").split("/")
+        if len(root_parts) > 1:
+            root = "/".join(root_parts[:-1]) + "/"
+    return root
+
+
+def _detect_frontend_root(manifest_files: dict[str, FileManifest]) -> str | None:
+    """Return the common parent directory of all frontend files, e.g. 'output/frontend/'."""
+    frontend_paths = [fm.filepath for fm in manifest_files.values() if fm.agent == "frontend"]
+    if not frontend_paths:
+        return None
+    parts_list = [p.rstrip("/").split("/") for p in frontend_paths]
+    common = parts_list[0][:-1]
+    for p in parts_list[1:]:
+        common = [a for a, b in zip(common, p[:-1]) if a == b]
+    if not common:
+        return None
+    root = "/".join(common) + "/"
+    dirs = {p.rsplit("/", 1)[0] + "/" for p in frontend_paths}
+    if len(dirs) <= 1:
+        root_parts = root.rstrip("/").split("/")
+        if len(root_parts) > 1:
+            root = "/".join(root_parts[:-1]) + "/"
+    return root
+
+
 def _inject_scaffold_tasks(
     tasks: list[Task],
     manifest_files: dict[str, FileManifest],
 ) -> tuple[list[Task], dict[str, FileManifest]]:
     """
     Add mandatory wiring/scaffold tasks (Problem 2):
-      - backend  → app/main.py  (registers every backend router)
-      - frontend → index.html   (loads every stylesheet + script)
+      - backend  → <backend_root>/main.py  (registers every backend router)
+      - frontend → <frontend_root>/index.html   (loads every stylesheet + script)
+    Paths are inferred from the skeleton's existing file structure so that
+    entrypoints always land in the same directory tree as the rest of the code.
     Each scaffold depends on ALL of its own agent's tasks so it runs last in that
     agent's execution order and sees the complete list of files to wire.
     """
@@ -313,8 +357,15 @@ def _inject_scaffold_tasks(
             n += 1
         return f"{prefix}-{n:03d}"
 
+    # Infer root directories from the skeleton's actual file paths
+    backend_root = _detect_backend_root(manifest_files) or "output/app/"
+    frontend_root = _detect_frontend_root(manifest_files) or "output/"
+
+    be_main = f"{backend_root}main.py"
+    fe_index = f"{frontend_root}index.html"
+
     backend_task_ids = [t.id for t in tasks if t.agent == "backend"]
-    if backend_task_ids and "output/app/main.py" not in existing_paths:
+    if backend_task_ids and be_main not in existing_paths:
         tid = _next_id("be")
         existing_ids.add(tid)
         next_tasks.append(Task(
@@ -323,14 +374,14 @@ def _inject_scaffold_tasks(
             description="FastAPI application entry point that registers all routers, adds CORS, and serves static files.",
             depends_on=list(backend_task_ids), priority=AGENT_PRIORITY["backend"], status="pending",
         ))
-        next_manifest["output/app/main.py"] = FileManifest(
-            agent="backend", task_id=tid, filepath="output/app/main.py",
+        next_manifest[be_main] = FileManifest(
+            agent="backend", task_id=tid, filepath=be_main,
             purpose="FastAPI application entry point — registers all routers and middleware.",
             exports=["app"],
         )
 
     frontend_task_ids = [t.id for t in tasks if t.agent == "frontend"]
-    if frontend_task_ids and "output/index.html" not in existing_paths:
+    if frontend_task_ids and fe_index not in existing_paths:
         tid = _next_id("fe")
         existing_ids.add(tid)
         next_tasks.append(Task(
@@ -339,8 +390,8 @@ def _inject_scaffold_tasks(
             description="HTML entry point that loads every stylesheet and script in the correct order.",
             depends_on=list(frontend_task_ids), priority=AGENT_PRIORITY["frontend"], status="pending",
         ))
-        next_manifest["output/index.html"] = FileManifest(
-            agent="frontend", task_id=tid, filepath="output/index.html",
+        next_manifest[fe_index] = FileManifest(
+            agent="frontend", task_id=tid, filepath=fe_index,
             purpose="HTML entry point loading all stylesheets and scripts.",
             exports=["index"],
         )
