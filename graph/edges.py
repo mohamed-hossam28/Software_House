@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 from core.state import ProjectState, ProjectStatus
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ def route_after_integration(state: Any) -> list[str]:
     merged = bool(_get_field(integration, "merged", False))
     conflicts_by_agent = _get_field(integration, "conflicts_by_agent", {}) or {}
     rounds = _get_field(state, "integration_rework_rounds", 0) or 0
-    max_rounds = _get_field(state, "max_integration_rounds", 2) or 2
+    max_rounds = _get_field(state, "max_integration_rounds", settings.rework_trial or 2) or 2
 
     if merged:
         logger.info("[Router] Integration merged cleanly. END.")

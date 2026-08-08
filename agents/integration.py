@@ -12,11 +12,14 @@ Never execute code or tests.
 Integration may only perform mechanical fixes (AUTO_FIX) or report behavioral/logic decisions (HUMAN).
 """
 
-import os
-import sys
-import re
+import ast
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
@@ -48,6 +51,10 @@ logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_CALLS = 3
 OUTPUT_DIR = "output"
+
+#: Conflict types that integration must NEVER guess a fix for — they are routed
+#: straight to the owning coding agent via the REWORK loop with grounded error text.
+REWORK_ONLY_TYPES = frozenset({"SYNTAX", "IMPORT_NAME"})
 
 
 # ── Phase 2: LLM Prompt & System Prompt ────────────────────────────────────────
@@ -125,6 +132,76 @@ def parse_js_ts_imports(code: str) -> list[str]:
     for match in re.finditer(r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
         imports.append(match.group(1).strip())
     return imports
+
+
+def parse_python_imported_names(code: str) -> list[tuple[str, list[str], bool]]:
+    """
+    Extract (module_src, [exported_names], has_default) for every
+    `from X import A, B` statement. Alias-aware: `from X import A as B`
+    reports the *exported* name 'A' (what the target must define).
+    """
+    results: list[tuple[str, list[str], bool]] = []
+    for match in re.finditer(r"^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+(.+?)\s*$", code, re.MULTILINE):
+        module_src = match.group(1).strip()
+        import_part = match.group(2).strip()
+        if import_part == "*":
+            continue
+        names: list[str] = []
+        for item in import_part.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            exported = item
+            if " as " in item:
+                exported = item.split(" as ")[0].strip()
+            if exported:
+                names.append(exported)
+        if names:
+            results.append((module_src, names, False))
+    return results
+
+
+def parse_js_ts_imported_names(code: str) -> list[tuple[str, list[str], bool]]:
+    """
+    Extract (module_src, [exported_names], has_default) for JS/TS imports.
+    Alias-aware: `import { A as B } from 'x'` reports the *exported* name 'A'.
+    Default imports / `default` renames set has_default (checked against a bare
+    `export default` in the target). Type-only and star imports are skipped.
+    """
+    results: list[tuple[str, list[str], bool]] = []
+    for match in re.finditer(r"import\s+[\s\S]*?\s+from\s+['\"]([^'\"]+)['\"]", code):
+        header = match.group(0)
+        if re.match(r"import\s+type\b", header):
+            continue
+        module_src = match.group(1).strip()
+        names: list[str] = []
+        has_default = False
+
+        # Default import: `import A from 'x'` / `import A, { ... } from 'x'`
+        default_match = re.match(r"import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:,|\s+from)", header)
+        if default_match:
+            has_default = True
+
+        # Named imports: `import { A, B as C, type T, default as D } from 'x'`
+        for inner in re.finditer(r"\{([^}]*)\}", header):
+            for item in inner.group(1).split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                exported = item
+                if " as " in item:
+                    exported = item.split(" as ")[0].strip()
+                if exported == "default":
+                    has_default = True
+                    continue
+                if exported.startswith("type "):
+                    exported = exported[5:].strip()
+                if exported:
+                    names.append(exported)
+
+        if names or has_default:
+            results.append((module_src, names, has_default))
+    return results
 
 
 def check_js_ts_extensions(base_path: str, manifest_files: list[str]) -> Optional[str]:
@@ -205,8 +282,27 @@ def extract_actual_definitions(code: str, filepath: str) -> set[str]:
             name = match.group(1)
             if not name.startswith('__'):
                 defs.add(name)
+        # Module-level constants / assignments (column-0 only, not inside functions),
+        # so `from config import API_URL` can be validated against `API_URL = "..."`.
+        _PY_KEYWORDS = {
+            "and", "as", "assert", "async", "await", "break", "class", "continue",
+            "def", "del", "elif", "else", "except", "finally", "for", "from",
+            "global", "if", "import", "in", "is", "lambda", "nonlocal", "not",
+            "or", "pass", "raise", "return", "try", "while", "with", "yield",
+        }
+        for line in code.splitlines():
+            if line.startswith((" ", "\t")):
+                continue
+            stripped = line.lstrip()
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*?)?=", stripped)
+            if m:
+                name = m.group(1)
+                if name not in _PY_KEYWORDS and not name.startswith('__'):
+                    defs.add(name)
     elif filepath.endswith(('.js', '.jsx', '.ts', '.tsx')):
         for match in re.finditer(r"\bexport\s+(?:default\s+)?(?:class|function|const|let|var)\s+([a-zA-Z0-9_]+)", code):
+            defs.add(match.group(1))
+        for match in re.finditer(r"\bexport\s+default\s+(?!function|class|const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)", code):
             defs.add(match.group(1))
         for match in re.finditer(r"\bexport\s*\{\s*([^\}]+)\}", code):
             content = match.group(1)
@@ -409,7 +505,7 @@ class IntegrationAgent(BaseAgent):
 
     # ── Phase 1: Deterministic Static Checks ──────────────────────────────────
 
-    def _check_single_file(self, filepath: str, fm: FileManifest, state: ProjectState, manifest_files: list[str], internal_prefixes: set[str]) -> tuple[list[dict], list[str]]:
+    def _check_single_file(self, filepath: str, fm: FileManifest, state: ProjectState, manifest_files: list[str], internal_prefixes: set[str], available_names: dict[str, set[str] | None]) -> tuple[list[dict], list[str]]:
         conflicts = []
         code = get_file_code(filepath, fm, state)
 
@@ -419,10 +515,19 @@ class IntegrationAgent(BaseAgent):
             # Rule 9: "Do not report missing_dependencies or suggested_additions if already declared in the owning manifest entry."
             return conflicts, []
 
-        # 1. Verify actual exports vs promised exports
+        # 1. Verify actual exports vs promised exports.
+        #    A promised export may be satisfied by a definition OR a re-export
+        #    (e.g. `__init__.py` doing `from .user import User`).
         actual_defs = extract_actual_definitions(code, filepath)
+        reexport_names = set()
+        if filepath.endswith('.py'):
+            for _, names, _ in parse_python_imported_names(code):
+                reexport_names.update(names)
+        else:
+            for _, names, _ in parse_js_ts_imported_names(code):
+                reexport_names.update(names)
         for promised in fm.exports:
-            if promised not in actual_defs:
+            if promised not in actual_defs and promised not in reexport_names:
                 conflicts.append({
                     "filepath": filepath,
                     "task_id": fm.task_id,
@@ -492,7 +597,76 @@ class IntegrationAgent(BaseAgent):
                                     "reason": f"Call to '{name}' in '{filepath}' passed {passed_count} arguments, but target defines {len(args)} arguments ({min_args} required)."
                                 })
 
+        # 3. Verify imported names actually exist in their resolved target file.
+        #    Catches runtime ImportErrors statically: `from app.models import User`
+        #    where User is spelled wrong / missing / renamed in models.py.
+        if filepath.endswith('.py'):
+            name_specs = parse_python_imported_names(code)
+        else:
+            name_specs = parse_js_ts_imported_names(code)
+
+        for module_src, names, has_default in name_specs:
+            resolved = resolve_import_path(module_src, filepath, manifest_files, internal_prefixes)
+            if not resolved:
+                # Path-level mismatch — already reported by the main import loop above.
+                continue
+
+            target_avail = available_names.get(resolved)
+            if target_avail is None:
+                # Target code unavailable (not written / no source) — cannot verify, skip.
+                continue
+
+            if has_default:
+                target_code = get_file_code(resolved, state.code_manifest.files.get(resolved), state)
+                if "export default" not in (target_code or ""):
+                    conflicts.append({
+                        "type": "IMPORT_NAME",
+                        "filepath": filepath,
+                        "task_id": fm.task_id,
+                        "expected": f"Default export in '{resolved}'",
+                        "actual": "missing",
+                        "reason": f"Import in '{filepath}' expects a default export from '{resolved}', but that file declares no 'export default'."
+                    })
+
+            for name in names:
+                if name in target_avail:
+                    continue
+                avail_list = sorted(target_avail)[:10]
+                conflicts.append({
+                    "type": "IMPORT_NAME",
+                    "filepath": filepath,
+                    "task_id": fm.task_id,
+                    "expected": f"Exported name '{name}' in '{resolved}'",
+                    "actual": "missing",
+                    "reason": f"Import 'from {module_src} import {name}' in '{filepath}' references '{name}', but '{resolved}' does not define or re-export it. Available names: {avail_list}"
+                })
+
         return conflicts, resolved_paths
+
+    def _compute_available_names(self, state: ProjectState, manifest_files: list[str]) -> dict[str, set[str] | None]:
+        """
+        For every manifest file, the set of names it makes importable:
+        its own definitions (class/def/constants/exports) PLUS the names it
+        imports itself (re-export support, e.g. `__init__.py` doing
+        `from .user import User`). Returns None when the target's code is
+        unavailable so callers can skip the name check instead of false-positive.
+        """
+        available: dict[str, set[str] | None] = {}
+        for path in manifest_files:
+            fm = state.code_manifest.files.get(path)
+            code = get_file_code(path, fm, state)
+            if not code:
+                available[path] = None
+                continue
+            names = extract_actual_definitions(code, path)
+            if path.endswith('.py'):
+                for _, imported, _ in parse_python_imported_names(code):
+                    names.update(imported)
+            else:
+                for _, imported, _ in parse_js_ts_imported_names(code):
+                    names.update(imported)
+            available[path] = names
+        return available
 
     def _run_deterministic_checks(self, state: ProjectState) -> list[dict]:
         manifest = state.code_manifest
@@ -508,12 +682,15 @@ class IntegrationAgent(BaseAgent):
         conflicts = []
         resolved_imports_map: dict[str, list[str]] = {}
 
+        # Precompute each file's importable names (own defs + re-exports) once.
+        available_names = self._compute_available_names(state, manifest_files)
+
         # 1. Parallel verification per-file
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
             futures: dict[Future, str] = {}
             for path, fm in manifest.files.items():
                 if fm.written:
-                    fut = pool.submit(self._check_single_file, path, fm, state, manifest_files, internal_prefixes)
+                    fut = pool.submit(self._check_single_file, path, fm, state, manifest_files, internal_prefixes, available_names)
                     futures[fut] = path
 
             for future, path in futures.items():
@@ -986,6 +1163,86 @@ class IntegrationAgent(BaseAgent):
 
         return applied_logs
 
+    # ── Phase 1B: Grounded syntax/compile smoke ───────────────────────────────
+
+    @staticmethod
+    def _syntax_check_python(code: str) -> list[dict]:
+        """ast.parse the code string — catches SyntaxError without executing or resolving imports."""
+        try:
+            ast.parse(code)
+            return []
+        except SyntaxError as e:
+            line = e.lineno or 0
+            col = e.offset or 0
+            lines = code.splitlines()
+            src_line = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+            return [{"line": line, "col": col, "msg": e.msg or "syntax error", "src_line": src_line}]
+        except Exception as exc:
+            return [{"line": 0, "col": 0, "msg": f"parse failure: {exc}", "src_line": ""}]
+
+    @staticmethod
+    def _syntax_check_js(code: str, node_bin: str) -> list[dict]:
+        """`node --check` via stdin — pure syntax validation, no npm/node_modules/disk."""
+        try:
+            proc = subprocess.run(
+                [node_bin, "--check"],
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("[IntegrationAgent] node --check invocation failed: %s", exc)
+            return []
+        if proc.returncode == 0:
+            return []
+        msg = (proc.stderr or proc.stdout or "").strip()
+        m = re.search(r"\[stdin\]:(\d+)(?::(\d+))?", msg)
+        line = int(m.group(1)) if m else 0
+        col = int(m.group(2)) if m and m.group(2) else 0
+        return [{"line": line, "col": col, "msg": msg, "src_line": ""}]
+
+    def _run_syntax_smoke(self, state: ProjectState) -> list[dict]:
+        """
+        Per-file parse/compile check on in-memory generated code. Produces
+        grounded SYNTAX conflicts that are routed to the owning coding agent.
+        Graceful degradation: when tooling is absent (no node) the check is
+        skipped with a debug log — never a fabricated conflict, never a crash.
+        """
+        node_bin = shutil.which("node")
+        conflicts: list[dict] = []
+        for path, fm in state.code_manifest.files.items():
+            if not fm.written:
+                continue
+            code = get_file_code(path, fm, state)
+            if not code:
+                continue
+
+            if path.endswith(".py"):
+                errors = self._syntax_check_python(code)
+                lang = "Python"
+            elif path.endswith((".js", ".mjs", ".cjs")):
+                if node_bin is None:
+                    logger.debug("[IntegrationAgent] node unavailable; skipping JS syntax check for %s", path)
+                    continue
+                errors = self._syntax_check_js(code, node_bin)
+                lang = "JavaScript"
+            else:
+                # .ts/.tsx/.css/.sql/.html → no local syntax tooling; skip.
+                continue
+
+            for err in errors:
+                loc = f"line {err['line']}" if err.get("line") else "unknown line"
+                conflicts.append({
+                    "type": "SYNTAX",
+                    "filepath": path,
+                    "task_id": fm.task_id,
+                    "expected": f"Valid {lang} syntax",
+                    "actual": "syntax error",
+                    "reason": f"Syntax error in '{path}' ({loc}): {err['msg']}",
+                })
+        return conflicts
+
     # ── Main Execution ────────────────────────────────────────────────────────
 
     def run(self, state: dict | ProjectState) -> dict[str, Any]:
@@ -1007,23 +1264,34 @@ class IntegrationAgent(BaseAgent):
                 logger.info("[IntegrationAgent] Word-match applied %d mechanical fix(es). Re-checking…", len(word_applied))
                 conflicts = self._run_deterministic_checks(ps)
 
-        # Phase 2 — batched LLM repair (no HUMAN deferral), capped internal rounds.
-        if conflicts:
+        # Phase 1B — grounded syntax/compile smoke. Real parser errors are routed
+        # straight to the owning coding agents; integration never guesses a parse fix.
+        syntax_conflicts = self._run_syntax_smoke(ps)
+        if syntax_conflicts:
+            logger.info("[IntegrationAgent] Syntax smoke found %d real error(s).", len(syntax_conflicts))
+        conflicts = conflicts + syntax_conflicts
+
+        # Phase 2 — batched LLM repair on static/contract conflicts only.
+        # SYNTAX / IMPORT_NAME conflicts bypass the LLM (REWORK_ONLY_TYPES).
+        llm_repairable = [c for c in conflicts if c.get("type") not in REWORK_ONLY_TYPES]
+        if llm_repairable:
             max_repair_rounds = 2
             for round_idx in range(max_repair_rounds):
                 logger.info(
                     "[IntegrationAgent] Repair round %d/%d — %d conflicts. Running batched LLM repair…",
-                    round_idx + 1, max_repair_rounds, len(conflicts),
+                    round_idx + 1, max_repair_rounds, len(llm_repairable),
                 )
-                repairs = self._get_llm_repairs(conflicts)
+                repairs = self._get_llm_repairs(llm_repairable)
                 if not repairs:
                     logger.warning("[IntegrationAgent] No repair proposals returned; stopping repair loop.")
                     break
 
-                applied = self._apply_repairs(ps, repairs, conflicts)
+                applied = self._apply_repairs(ps, repairs, llm_repairable)
                 conflicts = self._run_deterministic_checks(ps)
+                conflicts = conflicts + self._run_syntax_smoke(ps)
 
-                if not conflicts:
+                llm_repairable = [c for c in conflicts if c.get("type") not in REWORK_ONLY_TYPES]
+                if not llm_repairable:
                     break
                 if not applied:
                     logger.info("[IntegrationAgent] No fixes could be applied; stopping repair loop.")
@@ -1177,4 +1445,74 @@ export const LoginPage = () => {
     assert state.integration.merged, f"Expected clean integration merge, got conflicts: {state.integration.conflicts}"
     assert "models.user" in state.generated_code.backend["backend/app/routes/auth.py"]
     print("[PASS] IntegrationAgent mock run — auto-fixed typo and re-verified successfully")
+
+    # ── 3. Imported-name parsers ─────────────────────────────────────────────
+    py_specs = parse_python_imported_names("from app.models import User, create_user as mk\nfrom x import *\nimport y\n")
+    assert py_specs == [("app.models", ["User", "create_user"], False)], py_specs
+    js_specs = parse_js_ts_imported_names(
+        "import App from './App';\n"
+        "import { getUsers, type T as Alias } from './api';\n"
+        "import type { Props } from './types';\n"
+    )
+    assert js_specs[0] == ("./App", [], True), js_specs
+    assert js_specs[1] == ("./api", ["getUsers", "T"], False), js_specs
+    assert len(js_specs) == 2, js_specs  # type-only import skipped
+    print("[PASS] parse_python_imported_names / parse_js_ts_imported_names — aliases, defaults, star/type skips")
+
+    # ── 4. Broadened definitions (constants + default exports) ───────────────
+    py_defs = extract_actual_definitions("API_URL = 'http://x'\nclass User:\n    pass\n", "app.py")
+    assert {"API_URL", "User"} <= py_defs, py_defs
+    js_defs = extract_actual_definitions("export default App\nexport const API_URL = 1\n", "app.ts")
+    assert {"App", "API_URL"} <= js_defs, js_defs
+    print("[PASS] extract_actual_definitions — module-level constants + bare default export")
+
+    # ── 5. Syntax smoke helpers ──────────────────────────────────────────────
+    assert IntegrationAgent._syntax_check_python("def f(:\n    pass\n"), "expected a SyntaxError from broken python"
+    errs = IntegrationAgent._syntax_check_python("def f(:\n    pass\n")
+    assert errs and errs[0]["line"] == 1 and errs[0]["col"], errs
+    assert IntegrationAgent._syntax_check_python("x = 1\n") == []
+    node_bin = shutil.which("node")
+    if node_bin:
+        assert IntegrationAgent._syntax_check_js("const x = 1;\n", node_bin) == []
+        assert IntegrationAgent._syntax_check_js("const x = ;\n", node_bin), "expected a SyntaxError from broken js"
+    else:
+        print("[WARN] node unavailable — skipping node --check assertions")
+    print("[PASS] Syntax smoke helpers — ast.parse + node --check")
+
+    # ── 6. End-to-end: syntax + imported-name conflicts route to rework ──────
+    state2 = ProjectState(project_id="int-test2", project_name="Int Test 2")
+    code_user2 = "class User:\n    pass\n"
+    code_bad_syntax = "def broken(:\n    return 1\n"
+    code_bad_import = "from app.models import NotAThing\n"
+    code_reexport = "from .user import User\n"
+    fm_a = FileManifest(agent="backend", task_id="be-a", filepath="app/models/user.py",
+                        purpose="User", exports=["User"], written=True)
+    fm_b = FileManifest(agent="backend", task_id="be-b", filepath="app/broken.py",
+                        purpose="Broken", exports=["broken"], written=True)
+    fm_c = FileManifest(agent="backend", task_id="be-c", filepath="app/badimport.py",
+                        purpose="Bad import", exports=["badimport"], written=True)
+    fm_d = FileManifest(agent="backend", task_id="be-d", filepath="app/models/__init__.py",
+                        purpose="Re-export", exports=["User"], written=True)
+    state2.code_manifest = CodeManifest(files={
+        "app/models/user.py": fm_a,
+        "app/broken.py": fm_b,
+        "app/badimport.py": fm_c,
+        "app/models/__init__.py": fm_d,
+    })
+    state2.generated_code = CodeMap(backend={
+        "app/models/user.py": code_user2,
+        "app/broken.py": code_bad_syntax,
+        "app/badimport.py": code_bad_import,
+        "app/models/__init__.py": code_reexport,
+    })
+
+    agent2 = IntegrationAgent(provider=MockLLM())
+    result2 = agent2.run(state2)
+    assert not state2.integration.merged
+    conflict_strings2 = state2.integration.conflicts
+    assert any(s.startswith("[SYNTAX]") for s in conflict_strings2), conflict_strings2
+    assert any(s.startswith("[IMPORT_NAME]") for s in conflict_strings2), conflict_strings2
+    rework_for = {c for c in state2.integration.rework_targets.get("app/badimport.py", [])}
+    assert any("NotAThing" in c for c in rework_for), state2.integration.rework_targets
+    print("[PASS] End-to-end — SYNTAX + IMPORT_NAME conflicts routed to rework targets")
     print("=" * 60 + "\n")

@@ -210,3 +210,6 @@ project_context.md
 tests
 SESSION_MEMORY.md
 output
+project_req.md
+.agents
+skills-lock.json

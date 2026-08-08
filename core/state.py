@@ -16,6 +16,8 @@ from enum import Enum
 from typing import Any, Optional, Annotated
 from datetime import datetime
 
+from core.config import settings
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Reducer functions for parallel-safe state merging
@@ -413,8 +415,9 @@ class ProjectState(BaseModel):
 
     # ── Integration REWORK loop (mod 1) ───────────────────────────────
     # integration -> {coding agent} -> integration, capped at max rounds.
+    # Cap sourced from config (REWORK_TRIAL env) so it's tunable without code changes.
     integration_rework_rounds: int = 0
-    max_integration_rounds: int = 2
+    max_integration_rounds: int = settings.rework_trial or 2
 
     # agents outputs
 
