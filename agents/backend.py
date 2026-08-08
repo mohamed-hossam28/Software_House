@@ -196,6 +196,7 @@ def _build_file_prompt(
 
 ## Project File Tree (capped)
 You may ONLY import from files listed here — use the EXACT export names shown.
+**IMPORT RULE**: Import internal modules relative to the layer root (e.g. `from db.session import ...`), NEVER with the `output.backend.` / `output.` workspace prefix.
 {tree_str}
 
 ## Project Code Manifest (Other Files)

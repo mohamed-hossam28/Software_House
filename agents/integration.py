@@ -214,6 +214,19 @@ def check_js_ts_extensions(base_path: str, manifest_files: list[str]) -> Optiona
     return None
 
 
+def layer_root_for(filepath: str) -> Optional[str]:
+    """
+    Return the layer root directory for a generated file, e.g. 'output/backend/'
+    for 'output/backend/db/session.py'. Returns None for paths that are not
+    workspace-generated (e.g. test fixtures like 'app/...' or 'backend/app/...')
+    so their resolution/fix behavior is left unchanged.
+    """
+    parts = (filepath or "").split('/')
+    if len(parts) >= 2 and parts[0] == OUTPUT_DIR:
+        return f"{OUTPUT_DIR}/{parts[1]}/"
+    return None
+
+
 def resolve_import_path(import_source: str, current_file: str, manifest_files: list[str], internal_prefixes: set[str]) -> Optional[str]:
     # Python resolution
     if current_file.endswith('.py'):
@@ -235,6 +248,19 @@ def resolve_import_path(import_source: str, current_file: str, manifest_files: l
         else:
             first_part = import_source.split('.')[0]
             if first_part not in internal_prefixes:
+                # Maybe a layer-root-relative import (e.g. `db.session` from a file
+                # under output/backend/). Try resolving against the current file's
+                # layer root before giving up.
+                root = layer_root_for(current_file)
+                if root:
+                    candidate = root + import_source.replace('.', '/')
+                    candidate = candidate.strip('/')
+                    for ext in ['.py', '/__init__.py']:
+                        path_with_ext = candidate + ext
+                        if path_with_ext in manifest_files:
+                            return path_with_ext
+                    if candidate in manifest_files:
+                        return candidate
                 return None
             candidate = import_source.replace('.', '/')
 
@@ -1025,6 +1051,12 @@ class IntegrationAgent(BaseAgent):
                 module_path = module_path[:-3]
             if module_path.endswith("__init__"):
                 module_path = module_path[: -len("__init__")].rstrip("/")
+            # Import paths are layer-root-relative: strip the `output/<layer>/`
+            # prefix so `output/backend/db/session.py` → `db.session` (works when
+            # the app runs from inside `output/backend/`).
+            root = layer_root_for(current_file)
+            if root and module_path.startswith(root):
+                module_path = module_path[len(root):]
             if import_src.startswith("."):
                 replacement = "." * (len(import_src) - len(import_src.lstrip(".")))
                 # Keep the relative form if we can recompute it; else use the absolute dotted form.
@@ -1243,6 +1275,63 @@ class IntegrationAgent(BaseAgent):
                 })
         return conflicts
 
+    # ── Phase 1C: Workspace-prefix import normalization ────────────────────────
+
+    def _normalize_workspace_imports(self, state: ProjectState) -> list[str]:
+        """
+        Rewrite Python imports written with the workspace root prefix
+        (`from output.backend.db.session import …`) into layer-root-relative form
+        (`from db.session import …`). This is the form that works when the app is
+        run from inside its own folder (e.g. `output/backend/`).
+
+        Mechanical + reversible (string prefix strip only), no LLM involved.
+        Returns the list of applied fix logs; no-op when nothing to normalize.
+        """
+        applied_logs: list[str] = []
+        for path, fm in state.code_manifest.files.items():
+            if not fm.written or not path.endswith(".py"):
+                continue
+            root = layer_root_for(path)
+            if not root:
+                continue
+            layer_dotted = root.strip("/").replace("/", ".")
+            code = get_file_code(path, fm, state)
+            if not code:
+                continue
+
+            repairs: list[dict] = []
+            # `from output.backend.X import ...` / `import output.backend.X`
+            # (dotted submodule form only — bare `import output.backend` is left alone).
+            for match in re.finditer(
+                r"(from|import)\s+" + re.escape(layer_dotted) + r"\.", code
+            ):
+                # Match at the *start* of an import statement (line anchor),
+                # so `from output.backend...` becomes `from ...` while leaving
+                # already-relative imports untouched.
+                line_start = code.rfind("\n", 0, match.start()) + 1
+                prefix = code[line_start:match.start()]
+                if not re.match(r"^\s*$", prefix):
+                    continue
+                target = match.group(0)
+                replacement = match.group(1) + " "
+                repairs.append({
+                        "conflict_index": 0,
+                        "action": "fix",
+                        "rationale": "Normalize workspace-prefixed import to layer-root-relative form",
+                        "fix": {
+                            "action": "replace_text",
+                            "filepath": path,
+                            "target_content": target,
+                            "replacement_content": replacement,
+                        },
+                    })
+
+            if repairs:
+                applied_logs.extend(self._apply_repairs(state, repairs, [{}] * len(repairs)))
+        if applied_logs:
+            logger.info("[IntegrationAgent] Normalized %d workspace-prefixed import(s).", len(applied_logs))
+        return applied_logs
+
     # ── Main Execution ────────────────────────────────────────────────────────
 
     def run(self, state: dict | ProjectState) -> dict[str, Any]:
@@ -1263,6 +1352,13 @@ class IntegrationAgent(BaseAgent):
             if word_applied:
                 logger.info("[IntegrationAgent] Word-match applied %d mechanical fix(es). Re-checking…", len(word_applied))
                 conflicts = self._run_deterministic_checks(ps)
+
+        # Phase 1C — workspace-prefix import normalization (no LLM). Rewrites
+        # `from output.backend.db.session import …` → `from db.session import …`
+        # so generated code is root-relative to its own layer folder.
+        if self._normalize_workspace_imports(ps):
+            logger.info("[IntegrationAgent] Re-checking after import normalization…")
+            conflicts = self._run_deterministic_checks(ps)
 
         # Phase 1B — grounded syntax/compile smoke. Real parser errors are routed
         # straight to the owning coding agents; integration never guesses a parse fix.
@@ -1515,4 +1611,32 @@ export const LoginPage = () => {
     rework_for = {c for c in state2.integration.rework_targets.get("app/badimport.py", [])}
     assert any("NotAThing" in c for c in rework_for), state2.integration.rework_targets
     print("[PASS] End-to-end — SYNTAX + IMPORT_NAME conflicts routed to rework targets")
+
+    # ── 7. Workspace-prefix import normalization (layer-root-relative) ────────
+    state3 = ProjectState(project_id="int-test3", project_name="Int Test 3")
+    fm_e = FileManifest(agent="backend", task_id="be-e", filepath="output/backend/norm_main.py",
+                        purpose="Main", exports=["app"], written=True)
+    fm_f = FileManifest(agent="backend", task_id="be-f", filepath="output/backend/db/session.py",
+                        purpose="Session", exports=["async_engine"], written=True)
+    state3.code_manifest = CodeManifest(files={
+        "output/backend/norm_main.py": fm_e,
+        "output/backend/db/session.py": fm_f,
+    })
+    code_main3 = "from output.backend.db.session import async_engine\nfrom db.session import async_engine as rel\n\napp = None\n"
+    state3.generated_code = CodeMap(backend={
+        "output/backend/norm_main.py": code_main3,
+        "output/backend/db/session.py": "async_engine = None\n",
+    })
+    agent3 = IntegrationAgent(provider=MockLLM())
+    result3 = agent3.run(state3)
+    norm_code3 = state3.generated_code.backend["output/backend/norm_main.py"]
+    assert "from db.session import async_engine" in norm_code3, norm_code3
+    assert "output.backend" not in norm_code3, norm_code3
+    assert "as rel" in norm_code3, norm_code3  # already-relative import untouched
+    print("[PASS] Workspace-prefix imports normalized to layer-root-relative form")
+
+    # Clean up the file written by the normalization smoke run (it lives under output/).
+    abs_p3 = os.path.join(_root_dir, "output/backend/norm_main.py")
+    if os.path.exists(abs_p3):
+        os.remove(abs_p3)
     print("=" * 60 + "\n")

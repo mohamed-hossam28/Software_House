@@ -207,6 +207,7 @@ def _build_file_prompt(
 {orm_block}
 
 ## Project File Tree (capped)
+**IMPORT RULE**: Import internal modules relative to the layer root (e.g. `from db.session import ...`), NEVER with the `output.backend.` / `output.` workspace prefix.
 {tree_str}
 
 ## Architecture — Database Schema Overview

@@ -348,7 +348,8 @@ def build_scaffold_context(manifest: Any, filepath: str) -> str:
             if "router" in exports or "routes" in path.lower() or "controllers" in path.lower():
                 routers.append(f"- `{path}` → exports: {', '.join(exports)}")
         header = "## Scaffold Wiring — You MUST register these routers (their files already exist):"
-        return header + ("\n" + "\n".join(routers) if routers else "\n(none found)")
+        note = "\n**IMPORT RULE**: Import each router relative to the layer root (e.g. `from api.routes.todo import router`), NEVER with the `output.backend.` / `output.` workspace prefix."
+        return header + note + ("\n" + "\n".join(routers) if routers else "\n(none found)")
     if base == "index.html":
         styles = sorted(
             p for p in manifest.files if p != filepath and p.endswith((".css", ".scss", ".sass"))
