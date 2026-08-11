@@ -45,11 +45,11 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
-from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -321,9 +321,14 @@ class DatabaseAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item)
             try:
-                _write_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[DBAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[DBAgent] Batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -383,9 +388,14 @@ class DatabaseAgent(BaseAgent):
                 logger.warning("[DBAgent] Rework batch: empty migration_code for %s", fm.filepath)
                 continue
             try:
-                _write_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[DBAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[DBAgent] Rework batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -463,14 +473,18 @@ class DatabaseAgent(BaseAgent):
         else:
             classes, functions = parse_metadata(data)
 
-        # Write migration file to disk (only write code)
+        # Write migration file to disk (safe-write guard refuses corrupted content)
         try:
-            _write_to_disk(filepath, migration_code)
+            written_code = safe_write(filepath, migration_code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[DBAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:
                 state.log_error(self.name, f"Disk write failed for {filepath}: {exc}")
-            # Still update state so the manifest records the attempt
+            written_code = None
+        if written_code is None:
+            logger.error("[DBAgent] Corrupted content refused for %s — file not written", filepath)
+            return
+        migration_code = written_code
 
         # Thread-safe state update
         with lock:

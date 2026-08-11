@@ -399,6 +399,69 @@ def _inject_scaffold_tasks(
     return next_tasks, next_manifest
 
 
+def _inject_project_files(
+    tasks: list[Task],
+    manifest_files: dict[str, FileManifest],
+) -> tuple[list[Task], dict[str, FileManifest], list[str]]:
+    """
+    Commit to the deliverable's project-scaffolding file set (Phase C3).
+    These files are REQUIRED for a runnable deliverable and the integration
+    agent verifies they exist and are written (FILE_SET check):
+      - output/requirements.txt          (Python dependency manifest)
+      - output/README.md                 (run instructions)
+      - <backend_root>.env.example       (environment template — no real secrets)
+    """
+    existing_ids = {t.id for t in tasks}
+    next_tasks = list(tasks)
+    next_manifest = dict(manifest_files)
+
+    backend_root = _detect_backend_root(manifest_files) or "output/backend/"
+
+    def _next_id(prefix: str) -> str:
+        n = 900
+        while f"{prefix}-{n:03d}" in existing_ids:
+            n += 1
+        return f"{prefix}-{n:03d}"
+
+    required_files: list[str] = []
+    specs = [
+        (
+            "output/requirements.txt",
+            "Python dependencies (requirements.txt)",
+            "Locked Python dependency manifest covering every third-party import used by the backend.",
+            ["requirements"],
+        ),
+        (
+            "output/README.md",
+            "Project README (README.md)",
+            "Run instructions: install dependencies, start the backend, and open the frontend.",
+            ["readme"],
+        ),
+        (
+            f"{backend_root}.env.example",
+            "Environment template (.env.example)",
+            "Example environment variables (DB URL, ports, secrets) — never real secrets.",
+            ["env_example"],
+        ),
+    ]
+    for path, title, purpose, exports in specs:
+        if path in next_manifest:
+            continue
+        tid = _next_id("be")
+        existing_ids.add(tid)
+        next_tasks.append(Task(
+            id=tid, agent="backend", title=title, description=purpose,
+            depends_on=[], priority=AGENT_PRIORITY["backend"], status="pending",
+        ))
+        next_manifest[path] = FileManifest(
+            agent="backend", task_id=tid, filepath=path,
+            purpose=purpose, exports=exports,
+        )
+        required_files.append(path)
+
+    return next_tasks, next_manifest, required_files
+
+
 def _generate_tasks_from_skeleton(nodes: list[Any], warnings: list[str]) -> list[Task]:
     """
     Pass 2 — deterministic task generation from the skeleton (no LLM).
@@ -568,11 +631,16 @@ class PlannerAgent(BaseAgent):
         # Inject mandatory wiring/scaffold tasks (Problem 2) — run last per agent.
         tasks, manifest_files = _inject_scaffold_tasks(tasks, manifest_files)
 
+        # Inject the committed project-scaffolding file set (Phase C3) and
+        # record it on state so the integration agent can enforce it (FILE_SET).
+        tasks, manifest_files, required_files = _inject_project_files(tasks, manifest_files)
+
         manifest_task_ids = {fm.task_id for fm in manifest_files.values()}
         synced_tasks = [t for t in tasks if t.id in manifest_task_ids]
 
         ps.tasks = TaskList(tasks=synced_tasks)
         ps.code_manifest = CodeManifest(files=manifest_files)
+        ps.required_files = required_files
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)

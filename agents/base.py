@@ -29,6 +29,66 @@ DEFAULT_BACKOFF    = settings.default_backoff or 2.0
 MAX_TREE_ENTRIES    = 80   # project file tree entries shown in coding prompts
 MAX_MANIFEST_ENTRIES = 25  # dependency/manifest entries + written summaries per prompt 
 
+_ESCAPED_CHAR_RE = re.compile(r"\\(?:[\"\\/bfnrt]|u[0-9a-fA-F]{4})")
+
+
+def deep_unescape(data: Any) -> Any:
+    """
+    Recursively unescape values that are themselves JSON-encoded strings
+    (double-encoded LLM output, e.g. a `code` field containing
+    `"from sqlalchemy import ...\\n..."` written as a JSON string).
+
+    Two shapes are decoded:
+      1. values still carrying escape sequences (`\\n`, `\\"`, ...) — inner
+         JSON string, decoded with json.loads;
+      2. values that are quote-wrapped with raw newlines inside — the outer
+         parse already turned `\\n` into real newlines, leaving a string that
+         is no longer valid JSON but clearly was a wrapped code blob.
+
+    Plain code strings such as `"use strict"` are left untouched.
+    """
+    if isinstance(data, dict):
+        return {k: deep_unescape(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [deep_unescape(v) for v in data]
+    if isinstance(data, str):
+        s = data
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            inner = s[1:-1]
+            if _ESCAPED_CHAR_RE.search(s):
+                try:
+                    value = json.loads(s)
+                    if isinstance(value, str):
+                        return deep_unescape(value)
+                except Exception:
+                    pass
+            elif "\n" in inner or re.search(r"=|;|[{}()]", inner):
+                # Already-outer-parsed wrapped string: raw newlines inside, or a
+                # single line that clearly holds code (`=`, braces, semicolons).
+                return deep_unescape(inner)
+        return s
+    return data
+
+
+def record_corrupt_write(state: Any, filepath: str, conflict: dict) -> None:
+    """Register a refused safe-write as a FILE_CORRUPTION conflict for the rework loop."""
+    c_str = (
+        f"[FILE_CORRUPTION] File: {filepath} | Expected: {conflict.get('expected')} "
+        f"| Actual: {conflict.get('actual')} | Reason: {conflict.get('reason')}"
+    )
+    if hasattr(state, "corrupt_writes"):
+        state.corrupt_writes.append(c_str)
+    logger.warning("[safe-write] REFUSED corrupted content for %s: %s", filepath, conflict.get("reason"))
+
+
+def agent_refuse_corrupt(state: Any, lock: Any):
+    """Build a lock-safe on_corrupt callback for the safe-write guard."""
+    def _refuse(filepath: str, conflict: dict) -> None:
+        with lock:
+            record_corrupt_write(state, filepath, conflict)
+    return _refuse
+
+
 ####################Filters####################
 
 def filter_manifest_by_dependencies(
@@ -194,8 +254,14 @@ def build_rework_prompt(
         f"Here is the CURRENT content of `{filepath}`:\n\n"
         f"```\n{current_code}\n```\n\n"
         "Rewrite ONLY what is necessary to fix the issue(s) above. Keep everything "
-        f"else identical. Return a single valid JSON object with the full corrected "
-        f"file content under the \"{output_key}\" key. No prose outside the JSON."
+        "else identical. Return a single valid JSON object with the full corrected "
+        f"file content under the \"{output_key}\" key. No prose outside the JSON.\n\n"
+        "CRITICAL — the \"code\" value MUST contain the COMPLETE corrected file as "
+        "plain source text, exactly one copy. Never quote or JSON-escape it (no \\n "
+        "sequences, no wrapped quotes). Do NOT paste the CURRENT content shown above "
+        "into the value as a prefix and append changes — the value REPLACES the entire "
+        "file. If no change is actually needed, return the current content as-is, "
+        "exactly one copy."
     )
 
 
@@ -224,7 +290,12 @@ def build_rework_batch_prompt(
         "For EACH file above, fix ONLY the issue(s) listed and return the full "
         "corrected file content. Do not add new files or reorder. "
         f"Respond with a single JSON ARRAY (one object per file, in the same order):\n"
-        f'[{{"filepath":"<path>","{output_key}":"<full corrected source>"}}, ...]'
+        f'[{{"filepath":"<path>","{output_key}":"<full corrected source>"}}, ...]\n\n'
+        "CRITICAL — each \"code\" value MUST contain the COMPLETE corrected file as "
+        "plain source text, exactly one copy. Never quote or JSON-escape it (no \\n "
+        "sequences, no wrapped quotes). Do NOT paste the CURRENT content shown above "
+        "into a value as a prefix and append changes — each value REPLACES the entire "
+        "file. If no change is needed for a file, return its content as-is, exactly once."
     )
 
 
@@ -365,6 +436,13 @@ def build_scaffold_context(manifest: Any, filepath: str) -> str:
             parts.append("\n".join([f"- script: `{p}`" for p in scripts]))
         if not styles and not scripts:
             parts.append("(no stylesheets/scripts planned yet)")
+        if scripts:
+            parts.append(
+                "**NO INLINE LOGIC RULE**: All application behavior MUST live in the script "
+                "files listed above and be loaded with <script src>. Do NOT duplicate "
+                "fetch/render logic inside inline <script> tags in index.html — inline "
+                "duplicates shadow the real script files and break the app."
+            )
         return "\n".join(parts)
     return ""
 
@@ -518,7 +596,7 @@ class BaseAgent(ABC):
             raw_arr = self._extract_raw_json(text, "[")
             items = self._try_parse(raw_arr, list)
             if isinstance(items, list):
-                return items
+                return deep_unescape(items)
         except Exception:
             pass
 
@@ -527,7 +605,7 @@ class BaseAgent(ABC):
             raw_obj = self._extract_raw_json(text, "{")
             items = self._try_parse(raw_obj, dict)
             if isinstance(items, dict):
-                return [items]
+                return deep_unescape([items])
         except Exception:
             pass
 
@@ -536,9 +614,9 @@ class BaseAgent(ABC):
         try:
             res = json_repair.loads(text)
             if isinstance(res, list):
-                return res
+                return deep_unescape(res)
             elif isinstance(res, dict):
-                return [res]
+                return deep_unescape([res])
         except Exception:
             pass
 
@@ -725,7 +803,7 @@ class BaseAgent(ABC):
         """
         text = cls._strip_fences(text)
         raw  = cls._extract_raw_json(text, "{")
-        return cls._try_parse(raw, dict)
+        return deep_unescape(cls._try_parse(raw, dict))
 
     @classmethod
     def extract_json_list(cls, text: str) -> list[Any]:
@@ -734,7 +812,7 @@ class BaseAgent(ABC):
         """
         text = cls._strip_fences(text)
         raw  = cls._extract_raw_json(text, "[")
-        return cls._try_parse(raw, list)
+        return deep_unescape(cls._try_parse(raw, list))
 
     @staticmethod
     def extract_section(text: str, tag: str) -> str:
@@ -868,7 +946,7 @@ class BaseAgent(ABC):
             repaired_local = json_repair.loads(raw_fragment)
             if not isinstance(repaired_local, (dict, list)):
                 raise ValueError("json_repair returned unexpected type")
-            return self._validate_data(repaired_local, schema_cls, is_list)
+            return self._validate_data(deep_unescape(repaired_local), schema_cls, is_list)
         except Exception as stage2_exc:
             logger.warning(
                 "[%s] Stage 2 (local repair) failed: %s", self.name, stage2_exc

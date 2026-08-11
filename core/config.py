@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Integration REWORK loop cap (integration -> coding agent -> integration)
     rework_trial: Optional[int] = Field(None, validation_alias=AliasChoices("REWORK_TRIAL", "rework_trial"))
 
+    # Per-file REWORK give-up threshold: a file that keeps failing past this
+    # many integration rounds stops routing back (kept in the summary as
+    # unresolved) so it cannot starve other files of global rounds.
+    rework_file_max: Optional[int] = Field(None, validation_alias=AliasChoices("REWORK_FILE_MAX", "rework_file_max"))
+
     # Per-agent max token settings matching .env keys
     default_req_max_tokens: Optional[int]         = Field(None, validation_alias=AliasChoices("DEFAULT_Req_MAX_TOKENS", "DEFAULT_REQ_MAX_TOKENS", "default_req_max_tokens"))
     default_arch_max_tokens: Optional[int]        = Field(None, validation_alias=AliasChoices("DEFAULT_Arch_MAX_TOKENS", "DEFAULT_ARCH_MAX_TOKENS", "default_arch_max_tokens"))

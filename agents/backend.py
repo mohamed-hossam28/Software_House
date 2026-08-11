@@ -34,11 +34,11 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
-from agents.utils import write_code_to_disk, write_to_disk, parse_metadata, resolve_stages
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -173,6 +173,31 @@ def _build_file_prompt(
     # Deterministic wiring for entrypoint files (Problem 2)
     scaffold_note = build_scaffold_context(manifest, filepath)
 
+    # Phase C — architecture rules pinned by the planner:
+    #   C1: request/response models live ONLY in a shared schemas/ module.
+    #   C2: routers are thin; data access lives in the services/ layer.
+    layer_rules = []
+    has_schemas = any("/schemas/" in p for p in manifest.files)
+    has_services = any("/services/" in p for p in manifest.files)
+    if has_schemas:
+        layer_rules.append(
+            "**SCHEMA RULE (single source of truth)**: All request/response models MUST be "
+            "defined in the shared `schemas/` module and IMPORTED from there. NEVER redefine "
+            "a request/response model class inside a router, service, or other file — that "
+            "creates contract drift (e.g. `completed` vs `is_completed`)."
+        )
+    if has_services:
+        layer_rules.append(
+            "**SERVICE LAYER RULE**: Routers MUST be thin — parse the request, call the "
+            "matching function from the `services/` module, return its result. All data "
+            "access and business logic (DB sessions, queries, commits) lives in `services/`. "
+            "Do not perform data access inline in a router."
+        )
+    if layer_rules:
+        layer_rules_str = "\n".join(layer_rules)
+    else:
+        layer_rules_str = "(no layer-wide architecture rules for this project)"
+
     user_prompt = f"""\
 ## File to Generate
 - **File Path**: `{filepath}`
@@ -193,6 +218,9 @@ def _build_file_prompt(
 {contracts_str}
 
 {scaffold_note}
+
+## Layer Architecture Rules (MUST follow)
+{layer_rules_str}
 
 ## Project File Tree (capped)
 You may ONLY import from files listed here — use the EXACT export names shown.
@@ -295,9 +323,14 @@ class BackendAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item, default_return_type="None")
             try:
-                write_code_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[BackendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[BackendAgent] Batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -356,9 +389,14 @@ class BackendAgent(BaseAgent):
                 logger.warning("[BackendAgent] Rework batch: empty code for %s — skipping", fm.filepath)
                 continue
             try:
-                write_code_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[BackendAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[BackendAgent] Rework batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -426,14 +464,18 @@ class BackendAgent(BaseAgent):
         else:
             classes, functions = parse_metadata(data, default_return_type="None")
 
-        # Write code to disk
+        # Write code to disk (safe-write guard refuses corrupted content)
         try:
-            write_code_to_disk(filepath, code)
+            written_code = safe_write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[BackendAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:
                 state.log_error(self.name, f"Disk write failed for {filepath}: {exc}")
-            # Continue so it's at least stored in state
+            written_code = None
+        if written_code is None:
+            logger.error("[BackendAgent] Corrupted content refused for %s — file not written", filepath)
+            return
+        code = written_code
 
         # Update ProjectState thread-safely
         with lock:

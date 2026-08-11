@@ -30,9 +30,11 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+    from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF, deep_unescape, record_corrupt_write
 except ImportError:
-    from base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+    from base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF, deep_unescape, record_corrupt_write
+
+from agents.utils import detect_corruption, safe_write
 
 from providers.llm.base import BaseLLMProvider
 
@@ -54,7 +56,34 @@ OUTPUT_DIR = "output"
 
 #: Conflict types that integration must NEVER guess a fix for — they are routed
 #: straight to the owning coding agent via the REWORK loop with grounded error text.
-REWORK_ONLY_TYPES = frozenset({"SYNTAX", "IMPORT_NAME"})
+REWORK_ONLY_TYPES = frozenset({
+    "SYNTAX", "IMPORT_NAME", "STARTUP", "SCHEMA_COLUMN", "WIRING",
+    "FRONTEND_HTTP", "FRONTEND_DOM", "FILE_SET", "FILE_CORRUPTION",
+})
+
+#: Pydantic base-model names that mark a class as a request/response schema.
+_PYDANTIC_BASES = ("BaseModel", "PydanticBaseModel", "BaseSettings")
+
+#: HTTP verbs that routers can declare.
+_HTTP_VERBS = ("get", "post", "put", "patch", "delete")
+
+_REFUSED_FILEPATH_RE = re.compile(r"File:\s*([^\s|]+)")
+
+
+def _extract_refused_filepath(conflict_str: str) -> str:
+    """Pull the filepath out of a safe-write refusal string."""
+    m = _REFUSED_FILEPATH_RE.search(conflict_str or "")
+    return m.group(1) if m else ""
+
+#: Fetch-response methods that are NOT entity fields (frontend usage analysis).
+_JS_MEMBER_SAFE = frozenset({
+    "json", "text", "ok", "status", "statusText", "headers", "then", "catch",
+    "finally", "push", "pop", "shift", "unshift", "splice", "concat", "slice",
+    "map", "filter", "reduce", "forEach", "find", "includes", "indexOf",
+    "length", "trim", "toLowerCase", "toUpperCase", "replace", "split", "join",
+    "appendChild", "removeChild", "addEventListener", "classList", "dataset",
+    "setAttribute", "getAttribute", "focus", "innerHTML", "textContent", "value",
+})
 
 
 # ── Phase 2: LLM Prompt & System Prompt ────────────────────────────────────────
@@ -304,7 +333,7 @@ def extract_actual_definitions(code: str, filepath: str) -> set[str]:
     if filepath.endswith('.py'):
         for match in re.finditer(r"^\s*class\s+([a-zA-Z0-9_]+)", code, re.MULTILINE):
             defs.add(match.group(1))
-        for match in re.finditer(r"^\s*def\s+([a-zA-Z0-9_]+)", code, re.MULTILINE):
+        for match in re.finditer(r"^\s*(?:async\s+)?def\s+([a-zA-Z0-9_]+)", code, re.MULTILINE):
             name = match.group(1)
             if not name.startswith('__'):
                 defs.add(name)
@@ -388,6 +417,8 @@ def count_passed_arguments(args_str: str) -> int:
 
 def normalize_api_path(path: str) -> str:
     path = re.sub(r'\{([^}]+)\}', r':\1', path)
+    # Parameter NAMES are irrelevant to matching — `{id}` == `{todo_id}`.
+    path = re.sub(r':\w+', ':', path)
     return path.strip().rstrip('/')
 
 
@@ -492,6 +523,265 @@ def dirname_matches(import_src: str, manifest_files: list[str]) -> Optional[str]
         if path.startswith(prefix) and path.endswith(".py"):
             return pkg
     return None
+
+
+# ── Phase A: cross-layer semantic check helpers ────────────────────────────────
+
+def parse_sqlalchemy_models(code: str) -> dict[str, set[str]]:
+    """
+    Parse SQLAlchemy ORM models: {ModelName -> {column names}}.
+    Only classes inheriting from a '*Base' (declarative_base()) are considered.
+    """
+    models: dict[str, set[str]] = {}
+    for m in re.finditer(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", code, re.MULTILINE):
+        name, bases = m.group(1), m.group(2)
+        if "Base" not in bases:
+            continue
+        if any(b in bases for b in _PYDANTIC_BASES):
+            continue  # pydantic BaseModel — not an ORM model
+        body = _class_body_lines(code, m.end())
+        cols = set(re.findall(r"\b(\w+)\s*=\s*Column\s*\(", body))
+        if cols:
+            models[name] = cols
+    return models
+
+
+def parse_pydantic_schemas(code: str) -> dict[str, set[str]]:
+    """
+    Parse Pydantic request/response models: {ClassName -> {field names}}.
+    """
+    schemas: dict[str, set[str]] = {}
+    for m in re.finditer(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", code, re.MULTILINE):
+        name, bases = m.group(1), m.group(2)
+        if not any(b in bases for b in _PYDANTIC_BASES):
+            continue
+        body = _class_body_lines(code, m.end())
+        fields: set[str] = set()
+        for line in body.splitlines():
+            fm = re.match(r"^\s{4}(\w+)\s*:\s*(?:[^#]*)$", line) or \
+                 re.match(r"^\s{4}(\w+)\s*=\s*Field\s*\(", line)
+            if fm and fm.group(1) != "model_config":
+                fields.add(fm.group(1))
+        if fields:
+            schemas[name] = fields
+    return schemas
+
+
+def _class_body_lines(code: str, header_end: int) -> str:
+    """Lines after a class header until the next top-level class/def statement."""
+    rest = code[header_end:].splitlines()
+    block: list[str] = []
+    for line in rest:
+        if line and not line.startswith((" ", "\t")) and \
+                re.match(r"^(class|def|async def|@)\s", line):
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+_FASTAPI_SKIP_TYPES = frozenset({
+    "request", "response", "backgroundtasks", "str", "int", "bool", "float",
+    "list", "dict", "any", "optional", "depends", "session", "none", "status",
+    "tuple", "set", "bytes", "none",
+})
+
+
+def parse_backend_routes(code: str) -> list[dict]:
+    """
+    Parse FastAPI route declarations: [{"method", "path", "request_model",
+    "response_model"}] — reads router prefixes, decorators, handler signatures.
+    Commented-out decorators are ignored.
+    """
+    routes: list[dict] = []
+    router_prefix = ""
+    pm = re.search(r"\bAPIRouter\s*\([^)]*?prefix\s*=\s*['\"]([^'\"]+)['\"]", code)
+    if pm:
+        router_prefix = pm.group(1).rstrip("/")
+
+    for dm in re.finditer(
+        r"@(\w+)\.(" + "|".join(_HTTP_VERBS) + r")\s*\(\s*['\"]([^'\"]+)['\"]", code
+    ):
+        line_start = code.rfind("\n", 0, dm.start()) + 1
+        if code[line_start:dm.start()].lstrip().startswith("#"):
+            continue  # commented-out decorator
+        method = dm.group(2).upper()
+        path = dm.group(3)
+        if not path.startswith("/"):
+            path = "/" + path
+        full_path = (router_prefix + path) or "/"
+
+        request_model = ""
+        response_model = ""
+        handler = re.search(r"\bdef\s+\w+\s*\(([^)]*)\)", code[dm.end():])
+        if handler:
+            for arg, anno in re.findall(r"(\w+)\s*:\s*(\w+)", handler.group(1)):
+                key = anno.lower()
+                if key not in _FASTAPI_SKIP_TYPES and not key.endswith("response") and "depends" not in key:
+                    request_model = anno
+                    break
+        rm = re.search(r"response_model\s*=\s*(?:List\[(\w+)\]|(\w+))", code[dm.end():dm.end() + 600])
+        if rm:
+            response_model = rm.group(1) or rm.group(2)
+
+        routes.append({
+            "method": method,
+            "path": full_path,
+            "request_model": request_model,
+            "response_model": response_model,
+        })
+    return routes
+
+
+def parse_frontend_fetches(code: str) -> list[dict]:
+    """
+    Parse frontend `fetch(...)` calls: [{"path", "method", "body_keys", "after"}].
+    Resolves simple template-literal URL building (const API_BASE_URL + ${id}).
+    "after" is the code following the call (used to scope response handling).
+    """
+    base_url = ""
+    bm = re.search(
+        r"\b(?:const|let|var)\s+(\w+)\s*=\s*['\"]([^'\"]+)['\"]", code)
+    if bm and ("api" in bm.group(1).lower() or "base" in bm.group(1).lower() or "url" in bm.group(1).lower()):
+        base_url = bm.group(2).rstrip("/")
+
+    fetches: list[dict] = []
+    for m in re.finditer(r"\bfetch\s*\(\s*([`'\"])([^`'\"]*)\1", code):
+        raw_path = m.group(2)
+        # Template-literal segments: substitute known constants, then params.
+        resolved = raw_path.replace("${" + (bm.group(1) if bm else "") + "}", base_url) if bm else raw_path
+        resolved = re.sub(r"\$\{[^}]*\}", "/{id}", resolved)
+        resolved = re.sub(r"/{2,}", "/", resolved)  # collapse accidental // from joins
+        resolved = resolved.strip()
+        if not resolved:
+            continue
+
+        method = "GET"
+        body_keys: list[str] = []
+        window = code[m.end():m.end() + 500]
+        mm = re.search(r"method\s*:\s*['\"]([A-Za-z]+)['\"]", window)
+        if mm:
+            method = mm.group(1).upper()
+        sm = re.search(r"JSON\.stringify\s*\(\s*\{([^}]*)\}", window)
+        if sm:
+            for item in re.split(r",", sm.group(1)):
+                item = item.strip()
+                if not item:
+                    continue
+                key = item.split(":")[0].strip().strip("'\"")
+                if key:
+                    body_keys.append(key)
+
+        fetches.append({
+            "path": resolved,
+            "method": method,
+            "body_keys": body_keys,
+            "after": window,
+        })
+    return fetches
+
+
+def parse_html_ids(code: str) -> set[str]:
+    return set(re.findall(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", code))
+
+
+def parse_js_used_ids(code: str) -> set[str]:
+    ids = set(re.findall(r"getElementById\s*\(\s*['\"]([^'\"]+)['\"]", code))
+    ids.update(re.findall(r"querySelector(?:All)?\s*\(\s*['\"]#([^'\"]+)['\"]", code))
+    return ids
+
+
+def parse_html_classes(code: str) -> set[str]:
+    classes: set[str] = set()
+    for m in re.finditer(r"class\s*=\s*['\"]([^'\"]+)['\"]", code):
+        classes.update(m.group(1).split())
+    return classes
+
+
+def parse_js_classes(code: str) -> set[str]:
+    classes: set[str] = set()
+    for m in re.finditer(r"class(?:Name)?\s*=\s*['\"]([^'\"]+)['\"]", code):
+        classes.update(m.group(1).split())
+    for m in re.finditer(r"classList\.(?:add|toggle|remove)\(\s*['\"]([^'\"]+)['\"]", code):
+        classes.add(m.group(1))
+    return classes
+
+
+def parse_css_classes(code: str) -> set[str]:
+    """Class selectors declared in a CSS file (selector part before '{' only)."""
+    classes: set[str] = set()
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("/*", "*", "//")):
+            continue
+        if "{" not in stripped:
+            continue
+        selector = stripped.split("{")[0]
+        for m in re.finditer(r"\.([a-zA-Z_][\w-]*)", selector):
+            classes.add(m.group(1))
+    return classes
+
+
+def parse_js_response_field_usage(code: str) -> dict[str, set[str]]:
+    """
+    Map every variable that received `await response.json()` (plus its
+    forEach/map/filter loop variables) to the set of entity fields read off it.
+    Used to verify frontend response-field usage against the API response schema.
+    """
+    resp_vars: set[str] = set(re.findall(r"\bconst\s+(\w+)\s*=\s*await\s+\w+\.json\s*\(\)", code))
+    fields_by_var: dict[str, set[str]] = {v: set() for v in resp_vars}
+    if not resp_vars:
+        return fields_by_var
+
+    loop_vars: dict[str, str] = {}
+    for v in resp_vars:
+        for m in re.finditer(
+            r"\b" + re.escape(v) + r"\.(?:forEach|map|filter|find)\s*\(\s*(?:\(?(\w+)\)?\s*=>|function\s*\((\w+)\))",
+            code,
+        ):
+            loop_vars[m.group(1) or m.group(2)] = v
+        for m in re.finditer(
+            r"\bfor\s*\(\s*(?:const|let|var)\s+(\w+)\s+of\s+" + re.escape(v), code
+        ):
+            loop_vars[m.group(1)] = v
+
+    for v in resp_vars:
+        fields_by_var[v].update(
+            f for f in re.findall(r"\b" + re.escape(v) + r"\.(\w+)", code)
+            if f not in _JS_MEMBER_SAFE
+        )
+    for lv, v in loop_vars.items():
+        fields_by_var[v].update(
+            f for f in re.findall(r"\b" + re.escape(lv) + r"\.(\w+)", code)
+            if f not in _JS_MEMBER_SAFE
+        )
+    return fields_by_var
+
+
+def match_backend_route(fetch_path: str, fetch_method: str, routes: list[dict]) -> tuple[Optional[dict], list[dict]]:
+    """
+    Match a frontend fetch call against the backend's actual route list.
+    Returns (matched_route_or_None, close_candidates). Paths are normalized
+    (trailing slash, {x}->:x) and matched exactly; close candidates are
+    same-method routes whose path token-similarity is high.
+    """
+    fp = normalize_api_path(fetch_path)
+    fp_tokens = set(re.findall(r"[a-zA-Z0-9]+", fp.lower()))
+    candidates = []
+    for r in routes:
+        rp = normalize_api_path(r["path"])
+        if fp == rp:
+            if r["method"] == fetch_method:
+                return r, candidates
+            candidates.append({**r, "_match": "method", "_score": 1.0})
+            continue
+        r_tokens = set(re.findall(r"[a-zA-Z0-9]+", rp.lower()))
+        if not r_tokens:
+            continue
+        score = len(fp_tokens & r_tokens) / len(fp_tokens | r_tokens)
+        if score >= 0.5:
+            candidates.append({**r, "_match": "path", "_score": score})
+    candidates.sort(key=lambda c: (c.get("_match") == "method", c.get("_score", 0.0)), reverse=True)
+    return None, candidates[:3]
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -931,6 +1221,646 @@ class IntegrationAgent(BaseAgent):
         return conflicts
 
 
+    # ── Phase 1D: Cross-layer semantic checks (A1–A6) ─────────────────────────
+
+    def _collect_backend_routes(self, state: ProjectState) -> tuple[list[dict], set[str]]:
+        """
+        Ground-truth backend route list. When routers are mounted under an api
+        prefix (app.include_router(..., prefix=...)), only the PREFIXED routes
+        are actually served — raw router paths are excluded so frontend calls
+        that miss the prefix get flagged instead of silently matching.
+        Returns (served_routes, api_prefixes).
+        """
+        api_prefixes: set[str] = set()
+        for path in state.generated_code.backend:
+            code = get_file_code(path, state.code_manifest.files.get(path), state)
+            if not code:
+                continue
+            for m in re.finditer(r"include_router\s*\([^)]*?prefix\s*=\s*['\"]([^'\"]+)['\"]", code):
+                api_prefixes.add(m.group(1).rstrip("/"))
+
+        raw_routes: list[dict] = []
+        for path in state.generated_code.backend:
+            code = get_file_code(path, state.code_manifest.files.get(path), state)
+            if not code:
+                continue
+            static = ("FileResponse" in code or "HTMLResponse" in code or "StaticFiles" in code)
+            # Only ROUTER files (those defining an APIRouter) are mounted under
+            # api prefixes via include_router — app-level routes (app.get, ...)
+            # are not prefixed.
+            prefixed = "APIRouter" in code
+            for r in parse_backend_routes(code):
+                raw_routes.append({**r, "static": static, "prefixed": prefixed})
+
+        if api_prefixes:
+            routes: list[dict] = []
+            for r in raw_routes:
+                if r.get("prefixed"):
+                    for ap in api_prefixes:
+                        routes.append({**r, "path": ap + r["path"]})
+                else:
+                    routes.append(r)
+        else:
+            routes = raw_routes
+        return routes, api_prefixes
+
+    def _collect_schema_fields(self, state: ProjectState) -> dict[str, set[str]]:
+        """
+        {ClassName -> {fields}} across all backend files. When a class name is
+        defined in both a schemas/ module and a router, the schemas/ definition
+        wins (single-source rule, Phase C).
+        """
+        by_name: dict[str, tuple[str, set[str]]] = {}
+        for path in state.generated_code.backend:
+            code = get_file_code(path, state.code_manifest.files.get(path), state)
+            if not code:
+                continue
+            for name, fields in parse_pydantic_schemas(code).items():
+                cur = by_name.get(name)
+                is_schema_file = "/schemas/" in path
+                if cur is None or (is_schema_file and "/schemas/" not in cur[0]):
+                    by_name[name] = (path, fields)
+        return {name: fields for name, (_, fields) in by_name.items()}
+
+    def _check_startup_assets(self, state: ProjectState) -> list[dict]:
+        """
+        A1 (STARTUP) — StaticFiles(directory=...)/FileResponse(...) paths must
+        resolve from the layer root the app is run from. Catches static
+        directories that point at the wrong base folder.
+        """
+        conflicts: list[dict] = []
+        if not any("frontend" in p for p in state.code_manifest.files):
+            return conflicts
+        all_written = all(
+            fm.written for p, fm in state.code_manifest.files.items() if "frontend" in p
+        )
+        if not all_written:
+            return conflicts  # disk layout not final yet — avoid false positives
+
+        for path, fm in state.code_manifest.files.items():
+            if not fm.written or not path.endswith(".py"):
+                continue
+            root = layer_root_for(path)
+            if not root:
+                continue
+            code = get_file_code(path, fm, state)
+            if not code:
+                continue
+            refs: list[str] = []
+            refs += [m.group(1) for m in re.finditer(
+                r"StaticFiles\s*\(\s*directory\s*=\s*['\"]([^'\"]+)['\"]", code)]
+            refs += [m.group(1) for m in re.finditer(
+                r"FileResponse\s*\(\s*['\"]([^'\"]+)['\"]", code)]
+            refs += [m.group(1) for m in re.finditer(
+                r"HTMLResponse\s*\(\s*(?:content\s*=\s*)?open\s*\(\s*['\"]([^'\"]+)['\"]", code)]
+            for ref in refs:
+                layer_abs = os.path.join(_root_dir, root.strip("/"))
+                cand = os.path.normpath(os.path.join(layer_abs, ref))
+                if os.path.exists(cand):
+                    continue
+                alt = os.path.normpath(os.path.join(_root_dir, OUTPUT_DIR, ref.lstrip("/")))
+                location = f"'{alt}'" if os.path.exists(alt) else "(nowhere in the workspace)"
+                conflicts.append({
+                    "type": "STARTUP",
+                    "filepath": path,
+                    "task_id": fm.task_id,
+                    "expected": f"Asset path '{ref}' exists relative to the '{root}' layer root",
+                    "actual": "missing",
+                    "reason": (
+                        f"'{root}{ref.lstrip('/')}' does not exist on disk. Assets appear to "
+                        f"live at {location}. Use a path relative to the layer root "
+                        f"(e.g. '../frontend/static')."
+                    ),
+                })
+        return conflicts
+
+    def _check_model_schema_consistency(self, state: ProjectState) -> list[dict]:
+        """
+        A2 (SCHEMA_COLUMN) — every attribute read off an ORM model and every
+        constructor kwarg of a model/schema must exist on it. Catches
+        `TodoItem.user_id` / `TodoResponse(completed=...)` style drift.
+        """
+        conflicts: list[dict] = []
+        models: dict[str, set[str]] = {}
+        schemas: dict[str, set[str]] = {}
+        for path in state.generated_code.backend:
+            code = get_file_code(path, state.code_manifest.files.get(path), state)
+            if not code:
+                continue
+            models.update(parse_sqlalchemy_models(code))
+            schemas.update(parse_pydantic_schemas(code))
+        # schemas/ definitions win over router-local duplicates (single source).
+        for name, fields in self._collect_schema_fields(state).items():
+            schemas[name] = fields
+
+        for path in state.generated_code.backend:
+            fm = state.code_manifest.files.get(path)
+            code = get_file_code(path, fm, state)
+            if not code:
+                continue
+            for model, columns in models.items():
+                for m in re.finditer(r"\b" + re.escape(model) + r"\s*\.\s*(\w+)", code):
+                    attr = m.group(1)
+                    if attr in columns or attr in {"query", "metadata", "select", "registry", "objects"}:
+                        continue
+                    conflicts.append({
+                        "type": "SCHEMA_COLUMN",
+                        "filepath": path,
+                        "task_id": fm.task_id if fm else "unknown",
+                        "expected": f"Column '{attr}' on ORM model '{model}'",
+                        "actual": "undefined column",
+                        "reason": (
+                            f"'{path}' accesses '{model}.{attr}' but the model only defines "
+                            f"columns: {sorted(columns) or '(none)'}. Fix the attribute name "
+                            f"or add the column to the model."
+                        ),
+                    })
+                for m in re.finditer(r"\b" + re.escape(model) + r"\s*\(([^)]*)\)", code):
+                    for kw in re.finditer(r"(\w+)\s*=", m.group(1)):
+                        key = kw.group(1)
+                        if key in columns:
+                            continue
+                        conflicts.append({
+                            "type": "SCHEMA_COLUMN",
+                            "filepath": path,
+                            "task_id": fm.task_id if fm else "unknown",
+                            "expected": f"Column '{key}' on ORM model '{model}'",
+                            "actual": "undefined column",
+                            "reason": (
+                                f"'{path}' constructs '{model}' with field '{key}' but the "
+                                f"model only defines columns: {sorted(columns) or '(none)'}."
+                            ),
+                        })
+            for schema, fields in schemas.items():
+                for m in re.finditer(r"\b" + re.escape(schema) + r"\s*\(([^)]*)\)", code):
+                    for kw in re.finditer(r"(\w+)\s*=", m.group(1)):
+                        key = kw.group(1)
+                        if key in fields or key in {"model_config"}:
+                            continue
+                        conflicts.append({
+                            "type": "SCHEMA_COLUMN",
+                            "filepath": path,
+                            "task_id": fm.task_id if fm else "unknown",
+                            "expected": f"Field '{key}' on schema '{schema}'",
+                            "actual": "unknown field",
+                            "reason": (
+                                f"'{path}' constructs '{schema}' with field '{key}' but the "
+                                f"schema only defines: {sorted(fields) or '(none)'}."
+                            ),
+                        })
+        return conflicts
+
+    def _check_layer_wiring(self, state: ProjectState) -> list[dict]:
+        """
+        A3 (WIRING) — structural integrity of the backend layer:
+        no schema redefinitions next to a schemas/ module, no unimported modules
+        when an entrypoint exists, and no inline data-access in routers when a
+        services layer exists and is unused.
+        """
+        conflicts: list[dict] = []
+        files = state.code_manifest.files
+        backend_paths = [p for p in files if files[p].agent == "backend" and p.endswith(".py")]
+        if not backend_paths:
+            return conflicts
+
+        manifest_files = list(files.keys())
+        internal_prefixes = {p.split("/")[0] for p in manifest_files if p.split("/")[0]}
+
+        # 1. Schema duplication vs a shared schemas/ module.
+        schema_names: dict[str, list[str]] = {}
+        for p in backend_paths:
+            code = get_file_code(p, files.get(p), state)
+            if not code:
+                continue
+            for name in parse_pydantic_schemas(code):
+                schema_names.setdefault(name, []).append(p)
+        for name, owners in schema_names.items():
+            schema_file = next((p for p in owners if "/schemas/" in p), None)
+            if not schema_file:
+                continue
+            for p in owners:
+                if "/schemas/" in p:
+                    continue
+                code = get_file_code(p, files.get(p), state)
+                if re.search(r"from\s+[\w.]*schemas[\w.]*\s+import", code or ""):
+                    continue
+                conflicts.append({
+                    "type": "WIRING",
+                    "filepath": p,
+                    "task_id": files[p].task_id,
+                    "expected": f"Schema '{name}' imported from the shared schemas module",
+                    "actual": "redefined locally",
+                    "reason": (
+                        f"'{p}' redefines schema class '{name}' which already exists in "
+                        f"'{schema_file}'. Define it once in the schemas module and import "
+                        f"it here — never redefine request/response models in routers."
+                    ),
+                })
+
+        # 2. Dead modules — only when the layer has an entrypoint to run.
+        entrypoints = {p for p in backend_paths if os.path.basename(p) in ("main.py", "app.py", "server.py")}
+        has_entrypoint = bool(entrypoints)
+        imported_paths: set[str] = set()
+        if has_entrypoint:
+            for p in backend_paths:
+                code = get_file_code(p, files.get(p), state)
+                if not code:
+                    continue
+                for imp in parse_python_imports(code):
+                    resolved = resolve_import_path(imp, p, manifest_files, internal_prefixes)
+                    if resolved:
+                        imported_paths.add(resolved)
+            for p in backend_paths:
+                if p in entrypoints or p in imported_paths:
+                    continue
+                if os.path.basename(p) == "__init__.py":
+                    continue
+                conflicts.append({
+                    "type": "WIRING",
+                    "filepath": p,
+                    "task_id": files[p].task_id,
+                    "expected": "Module is imported by at least one other backend file",
+                    "actual": "never imported",
+                    "reason": (
+                        f"'{p}' is not imported by any other backend file — it is dead "
+                        f"code. Either wire it into the entrypoint/router or remove it."
+                    ),
+                })
+
+        # 3. Inline data-access in routers while an unused services layer exists.
+        service_paths = [p for p in backend_paths if "/services/" in p]
+        if service_paths and (not has_entrypoint or not any(p in imported_paths for p in service_paths)):
+            business = re.compile(
+                r"\.commit\(|\.rollback\(|db\.query|SessionLocal|create_engine|sessionmaker|"
+                r"mock_db|\.append\(|\.pop\(|\.save\(|\.delete\(|\.filter\("
+            )
+            for p in backend_paths:
+                if not any(k in p.lower() for k in ("/routers/", "/routes/", "controller")):
+                    continue
+                code = get_file_code(p, files.get(p), state)
+                if not code or ("@router." not in code and "@app." not in code):
+                    continue
+                if business.search(code):
+                    conflicts.append({
+                        "type": "WIRING",
+                        "filepath": p,
+                        "task_id": files[p].task_id,
+                        "expected": "Routers delegate data access to the services layer",
+                        "actual": "inline data access in router",
+                        "reason": (
+                            f"'{p}' performs data-access/business logic inline while a "
+                            f"services layer exists ({', '.join(service_paths)}) that is "
+                            f"never imported. Routers must be thin: import and call the "
+                            f"service functions."
+                        ),
+                    })
+        return conflicts
+
+    def _check_frontend_backend_contracts(self, state: ProjectState) -> list[dict]:
+        """
+        A4 (FRONTEND_HTTP) — frontend fetch calls must match the backend's ACTUAL
+        routes: path (incl. /api prefix), HTTP verb, request-body fields and
+        response fields read by the UI.
+        """
+        conflicts: list[dict] = []
+        frontend_paths = [
+            p for p, fm in state.code_manifest.files.items()
+            if fm.agent == "frontend" and p.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html"))
+        ]
+        if not frontend_paths:
+            return conflicts
+        routes, api_prefixes = self._collect_backend_routes(state)
+        schemas = self._collect_schema_fields(state)
+
+        for path in frontend_paths:
+            fm = state.code_manifest.files.get(path)
+            if not fm or not fm.written:
+                continue
+            code = get_file_code(path, fm, state)
+            if not code or "fetch" not in code:
+                continue
+            for fetch in parse_frontend_fetches(code):
+                route, close = match_backend_route(fetch["path"], fetch["method"], routes)
+                prefix_issue = None
+                if route is None and api_prefixes:
+                    # Missing /api prefix? e.g. calls '/todos' but served at '/api/todos'.
+                    # Fall through to body/static checks against the prefixed match.
+                    for ap in api_prefixes:
+                        match, _ = match_backend_route(ap + fetch["path"], fetch["method"], routes)
+                        if match:
+                            route = match
+                            prefix_issue = ap
+                            break
+                if route is None:
+                    close_str = "; ".join(f"{c['method']} {c['path']}" for c in close[:3])
+                    conflicts.append({
+                        "type": "FRONTEND_HTTP",
+                        "filepath": path,
+                        "task_id": fm.task_id,
+                        "expected": f"Backend route for '{fetch['method']} {fetch['path']}'",
+                        "actual": "no matching route",
+                        "reason": (
+                            f"Frontend '{path}' calls '{fetch['method']} {fetch['path']}' but "
+                            f"no backend route matches."
+                            + (f" Closest backend routes: {close_str}." if close_str else "")
+                        ),
+                    })
+                    continue
+
+                if prefix_issue:
+                    conflicts.append({
+                        "type": "FRONTEND_HTTP",
+                        "filepath": path,
+                        "task_id": fm.task_id,
+                        "expected": f"Backend route for '{fetch['method']} {fetch['path']}'",
+                        "actual": "missing api prefix",
+                        "reason": (
+                            f"Frontend '{path}' calls '{fetch['method']} {fetch['path']}' "
+                            f"but the backend mounts its routers under '{prefix_issue}' — use "
+                            f"'{prefix_issue}{fetch['path']}' instead."
+                        ),
+                    })
+
+                # Static/HTML endpoint parsed as JSON in the fetch's own handling?
+                if route.get("static") and ".json()" in fetch.get("after", ""):
+                    conflicts.append({
+                        "type": "FRONTEND_HTTP",
+                        "filepath": path,
+                        "task_id": fm.task_id,
+                        "expected": f"JSON response from '{route['method']} {route['path']}'",
+                        "actual": "endpoint returns HTML",
+                        "reason": (
+                            f"Frontend '{path}' parses the response of "
+                            f"'{route['method']} {route['path']}' as JSON (.json()), but the "
+                            f"backend endpoint serves static/HTML content."
+                        ),
+                    })
+
+                # Request-body fields vs the route's request model.
+                if fetch["body_keys"] and route.get("request_model"):
+                    fields = schemas.get(route["request_model"])
+                    if fields:
+                        for key in fetch["body_keys"]:
+                            if key in fields:
+                                continue
+                            conflicts.append({
+                                "type": "FRONTEND_HTTP",
+                                "filepath": path,
+                                "task_id": fm.task_id,
+                                "expected": f"Request field '{key}' accepted by '{route['method']} {route['path']}'",
+                                "actual": "unknown field",
+                                "reason": (
+                                    f"Frontend sends body field '{key}' to "
+                                    f"'{route['method']} {route['path']}', but request model "
+                                    f"'{route['request_model']}' only accepts: {sorted(fields)}."
+                                ),
+                            })
+
+                # Response fields the UI reads vs the route's response model.
+                # Only checked when THIS fetch parses JSON — otherwise the used
+                # fields come from an unrelated fetch and the flag is noise.
+                if (
+                    route.get("response_model") and schemas.get(route["response_model"])
+                    and ".json()" in fetch.get("after", "")
+                ):
+                    resp_fields = schemas[route["response_model"]]
+                    for var, used in parse_js_response_field_usage(code).items():
+                        for f in used:
+                            if f in resp_fields:
+                                continue
+                            conflicts.append({
+                                "type": "FRONTEND_HTTP",
+                                "filepath": path,
+                                "task_id": fm.task_id,
+                                "expected": f"Response field '{f}' on '{route['response_model']}'",
+                                "actual": "unknown field",
+                                "reason": (
+                                    f"Frontend reads field '{var}.{f}' from the response of "
+                                    f"'{route['method']} {route['path']}', but response model "
+                                    f"'{route['response_model']}' only has: {sorted(resp_fields)}."
+                                ),
+                            })
+        return conflicts
+
+    def _check_frontend_dom(self, state: ProjectState) -> list[dict]:
+        """
+        A5 (FRONTEND_DOM) — JS element ids must exist in HTML; classes used in
+        HTML/JS must be defined in CSS; every JS/CSS file must be loaded by an
+        HTML entrypoint (and every referenced asset must exist).
+        """
+        conflicts: list[dict] = []
+        files = state.code_manifest.files
+        html_paths = [p for p in files if p.endswith((".html", ".htm"))]
+        js_paths = [p for p in files if p.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"))]
+        css_paths = [p for p in files if p.endswith((".css", ".scss", ".sass"))]
+        if not html_paths:
+            return conflicts
+
+        html_code: dict[str, str] = {}
+        html_ids: set[str] = set()
+        html_classes: set[str] = set()
+        for p in html_paths:
+            code = get_file_code(p, files.get(p), state)
+            if code:
+                html_code[p] = code
+                html_ids |= parse_html_ids(code)
+                html_classes |= parse_html_classes(code)
+
+        # 1. JS-referenced element ids must exist.
+        for p in js_paths:
+            fm = files.get(p)
+            code = get_file_code(p, fm, state)
+            if not code:
+                continue
+            for i in parse_js_used_ids(code):
+                if i in html_ids:
+                    continue
+                conflicts.append({
+                    "type": "FRONTEND_DOM",
+                    "filepath": p,
+                    "task_id": fm.task_id if fm else "unknown",
+                    "expected": f"Element with id='{i}' in an HTML file",
+                    "actual": "missing",
+                    "reason": (
+                        f"JS '{p}' references element id '{i}' but no HTML file defines it. "
+                        f"Defined ids: {sorted(html_ids) or '(none)'}."
+                    ),
+                })
+
+        # 2. Classes used in HTML/JS must be defined in CSS.
+        css_classes: set[str] = set()
+        for p in css_paths:
+            code = get_file_code(p, files.get(p), state)
+            if code:
+                css_classes |= parse_css_classes(code)
+        if css_classes:
+            used = set(html_classes)
+            for p in js_paths:
+                code = get_file_code(p, files.get(p), state)
+                used |= parse_js_classes(code or "")
+            for c in sorted(used):
+                if c in css_classes:
+                    continue
+                conflicts.append({
+                    "type": "FRONTEND_DOM",
+                    "filepath": p if any(c in (html_code.get(p, "") or "") for p in html_code) else (js_paths[0] if js_paths else html_paths[0]),
+                    "task_id": "unknown",
+                    "expected": f"CSS class '.{c}'",
+                    "actual": "undefined in CSS",
+                    "reason": (
+                        f"Class '{c}' is used in HTML/JS but never defined in any CSS "
+                        f"file (defined: {sorted(css_classes)[:12] or '(none)'})."
+                    ),
+                })
+
+        # 3. Asset loading: every JS/CSS file must be referenced by some HTML.
+        asset_exts = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".css", ".scss", ".sass")
+        loaded: set[str] = set()
+        for p in html_paths:
+            code = html_code.get(p, "")
+            for m in re.finditer(r"(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", code):
+                ref = m.group(1)
+                if ref.startswith(("http://", "https://", "//", "data:", "#")) or "{{" in ref:
+                    continue
+                base_dir = os.path.dirname(p)
+                loaded.add(os.path.normpath(os.path.join(base_dir, ref)).replace("\\", "/"))
+        for p in list(js_paths) + list(css_paths):
+            fm = files.get(p)
+            normalized = p.lstrip("./")
+            if p in loaded or normalized in {x.lstrip("./") for x in loaded}:
+                continue
+            conflicts.append({
+                "type": "FRONTEND_DOM",
+                "filepath": p,
+                "task_id": fm.task_id if fm else "unknown",
+                "expected": f"'{p}' is loaded by an HTML entrypoint",
+                "actual": "not referenced",
+                "reason": (
+                    f"Script/stylesheet '{p}' is never referenced by any HTML file — no "
+                    f"<script src> or <link href> points at it. Wire it into the HTML "
+                    f"entrypoint (and do NOT duplicate its logic inline in HTML)."
+                ),
+            })
+        return conflicts
+
+    def _ensure_package_init_files(self, state: ProjectState) -> list[str]:
+        """
+        Deterministically create missing `__init__.py` for every Python package
+        directory under output/ backend layers (namespace packages are fragile).
+        """
+        py_dirs: set[str] = set()
+        for p, fm in state.code_manifest.files.items():
+            if not fm.written or not p.endswith(".py"):
+                continue
+            root = layer_root_for(p)
+            if not root:
+                continue
+            d = os.path.dirname(p)
+            root_dir = root.rstrip("/")
+            while d and d != root_dir and len(d) > len(root_dir):
+                py_dirs.add(d)
+                d = os.path.dirname(d)
+        applied: list[str] = []
+        for d in sorted(py_dirs):
+            init_path = f"{d}/__init__.py"
+            if init_path in state.code_manifest.files:
+                continue
+            applied.extend(self._apply_repairs(state, [{
+                "conflict_index": 0,
+                "action": "fix",
+                "rationale": "Missing package __init__.py (Phase A file-set)",
+                "fix": {
+                    "action": "create_file",
+                    "filepath": init_path,
+                    "replacement_content": "",
+                },
+            }], [{"task_id": "auto-fix"}]))
+        if applied:
+            logger.info("[IntegrationAgent] Auto-created %d package __init__.py file(s).", len(applied))
+        return applied
+
+    def _check_file_set(self, state: ProjectState) -> list[dict]:
+        """
+        A6 (FILE_SET) — every file the planner committed to (state.required_files)
+        must be planned, written, and present on disk.
+        """
+        conflicts: list[dict] = []
+        for req in (state.required_files or []):
+            fm = state.code_manifest.files.get(req)
+            if not fm:
+                conflicts.append({
+                    "type": "FILE_SET",
+                    "filepath": req,
+                    "task_id": "planner",
+                    "expected": f"Required project file '{req}' is planned in the manifest",
+                    "actual": "missing",
+                    "reason": f"Required project file '{req}' is not planned in the code manifest.",
+                })
+            elif not fm.written:
+                conflicts.append({
+                    "type": "FILE_SET",
+                    "filepath": req,
+                    "task_id": fm.task_id,
+                    "expected": f"Required project file '{req}' is written",
+                    "actual": "planned but not written",
+                    "reason": f"Required project file '{req}' is planned but was never written by its owning agent.",
+                })
+            else:
+                abs_p = os.path.join(_root_dir, _normalize_output_path(req))
+                if not os.path.exists(abs_p):
+                    conflicts.append({
+                        "type": "FILE_SET",
+                        "filepath": req,
+                        "task_id": fm.task_id,
+                        "expected": f"Required project file '{req}' exists on disk",
+                        "actual": "missing on disk",
+                        "reason": f"Required project file '{req}' is marked written but missing on disk.",
+                    })
+        return conflicts
+
+    def _check_file_corruption(self, state: ProjectState) -> list[dict]:
+        """
+        A7 — statically detect corrupted generated content (repeated-block
+        duplication / JSON-escape leakage) in every in-memory file.
+        """
+        conflicts: list[dict] = []
+        code_map = getattr(state, "generated_code", None)
+        if code_map is None:
+            return conflicts
+        for layer in ("backend", "frontend", "database", "devops"):
+            for filepath, code in (getattr(code_map, layer, {}) or {}).items():
+                conflicts.extend(detect_corruption(code or "", filepath))
+        return conflicts
+
+    def _run_phase_a_checks(self, state: ProjectState) -> list[dict]:
+        """Run all cross-layer semantic checks (A1–A7); never crash on a bad fixture."""
+        checks = [
+            ("startup-assets", self._check_startup_assets),
+            ("model-schema", self._check_model_schema_consistency),
+            ("layer-wiring", self._check_layer_wiring),
+            ("frontend-backend", self._check_frontend_backend_contracts),
+            ("frontend-dom", self._check_frontend_dom),
+            ("file-set", self._check_file_set),
+            ("file-corruption", self._check_file_corruption),
+        ]
+        conflicts: list[dict] = []
+        for name, check in checks:
+            try:
+                conflicts.extend(check(state))
+            except Exception as exc:
+                logger.error("[IntegrationAgent] Phase A check '%s' failed: %s", name, exc)
+        # Deduplicate identical findings (e.g. the same bad column used 4 times).
+        seen: set[tuple] = set()
+        unique: list[dict] = []
+        for c in conflicts:
+            key = (c.get("type"), c.get("filepath"), c.get("expected"), c.get("actual"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(c)
+        return unique
+
+
     # ── Phase 2: Deterministic word-match repair ─────────────────────────────
 
     def _resolve_by_word_match(self, state: ProjectState, conflicts: list[dict]) -> tuple[list[dict], list[str]]:
@@ -1124,9 +2054,14 @@ class IntegrationAgent(BaseAgent):
             if action == "create_file":
                 content = fix.get("replacement_content", "")
                 try:
-                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                    with open(abs_path, "w", encoding="utf-8") as f:
-                        f.write(content)
+                    written_code = safe_write(
+                        filepath, content,
+                        on_corrupt=lambda fp, c: record_corrupt_write(state, fp, c),
+                    )
+                    if written_code is None:
+                        logger.warning("[IntegrationAgent] Refused corrupted create_file for %s", filepath)
+                        continue
+                    content = written_code
 
                     if agent == "backend":
                         state.generated_code.backend[filepath] = content
@@ -1169,9 +2104,14 @@ class IntegrationAgent(BaseAgent):
                 if target in code:
                     new_code = code.replace(target, replacement)
                     try:
-                        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                        with open(abs_path, "w", encoding="utf-8") as f:
-                            f.write(new_code)
+                        written_code = safe_write(
+                            filepath, new_code,
+                            on_corrupt=lambda fp, c: record_corrupt_write(state, fp, c),
+                        )
+                        if written_code is None:
+                            logger.warning("[IntegrationAgent] Refused corrupted replace_text for %s", filepath)
+                            continue
+                        new_code = written_code
 
                         if agent == "backend":
                             state.generated_code.backend[filepath] = new_code
@@ -1344,6 +2284,9 @@ class IntegrationAgent(BaseAgent):
         ps.integration_rework_rounds += 1
 
         logger.info("[IntegrationAgent] Starting Phase 1 checks…")
+        # Phase 0 — deterministic package __init__.py creation (PEP-420 is fragile).
+        self._ensure_package_init_files(ps)
+
         conflicts = self._run_deterministic_checks(ps)
 
         # Phase 1A — deterministic word-match repair (no LLM).
@@ -1366,6 +2309,35 @@ class IntegrationAgent(BaseAgent):
         if syntax_conflicts:
             logger.info("[IntegrationAgent] Syntax smoke found %d real error(s).", len(syntax_conflicts))
         conflicts = conflicts + syntax_conflicts
+
+        # Phase 1D — cross-layer semantic checks (A1–A7): startup assets, model/
+        # schema columns, layer wiring, frontend↔backend routes, DOM/CSS and the
+        # planner-committed file set. All of them are REWORK_ONLY — the owning
+        # coding agents resolve them, integration never guesses a cross-file fix.
+        phase_a_conflicts = self._run_phase_a_checks(ps)
+        if phase_a_conflicts:
+            logger.info("[IntegrationAgent] Phase A found %d cross-layer conflict(s).", len(phase_a_conflicts))
+        conflicts = conflicts + phase_a_conflicts
+
+        # Phase 1E — refusals recorded by the coding agents' safe-write guard
+        # (corrupted content that never reached disk). Converted into
+        # FILE_CORRUPTION conflicts that route straight back for REWORK.
+        refused = list(getattr(ps, "corrupt_writes", []) or [])
+        if refused:
+            logger.warning("[IntegrationAgent] %d corrupted write(s) refused by coding agents.", len(refused))
+            seen_refused: set[str] = set()
+            for c_str in refused:
+                key = (c_str or "").split("| Reason:")[0]
+                if key in seen_refused:
+                    continue
+                seen_refused.add(key)
+                conflicts.append({
+                    "type": "FILE_CORRUPTION",
+                    "filepath": _extract_refused_filepath(c_str),
+                    "expected": "single clean copy of the file content",
+                    "actual": "corrupted content refused at write time",
+                    "reason": c_str,
+                })
 
         # Phase 2 — batched LLM repair on static/contract conflicts only.
         # SYNTAX / IMPORT_NAME conflicts bypass the LLM (REWORK_ONLY_TYPES).
@@ -1400,10 +2372,22 @@ class IntegrationAgent(BaseAgent):
         ]
 
         # Group truly-unresolved conflicts by owning agent for the graph REWORK edge.
+        # Files that have failed more than `rework_file_max` rounds stop routing
+        # back (they stay listed in `conflicts` for the run summary) so a single
+        # stubborn file cannot consume the remaining global rounds.
         conflicts_by_agent: dict[str, list[str]] = {}
         rework_targets: dict[str, list[str]] = {}
+        rework_file_max = int(getattr(ps, "rework_file_max", 0) or 0)
         for c, c_str in zip(conflicts, conflict_strings):
             fpath = c.get("filepath", "")
+            fails = int(ps.rework_failures.get(fpath, 0) or 0) + 1
+            ps.rework_failures[fpath] = fails
+            if rework_file_max and fails > rework_file_max:
+                logger.warning(
+                    "[IntegrationAgent] Giving up on %s after %d failed round(s) — left unresolved in the run summary.",
+                    fpath, fails,
+                )
+                continue
             fm = ps.code_manifest.files.get(fpath)
             agent = fm.agent if fm else "backend"
             if "frontend" in fpath:
@@ -1507,9 +2491,10 @@ if __name__ == "__main__":
     code_user = "class User:\n    pass\n"
     code_auth = """\
 from backend.app.model.user import User
-# @router.post("/api/v1/auth/login")
-# email: str
-def login_router():
+from fastapi import APIRouter
+router = APIRouter()
+@router.post("/api/v1/auth/login")
+async def login_router(email: str):
     pass
 """
     code_login = """\

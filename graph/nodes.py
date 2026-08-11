@@ -221,3 +221,17 @@ def integration_node(state: dict) -> dict:
     )
     return agent.run(state)
 
+
+def finalize_node(state: dict) -> dict:
+    """
+    Finalize node: persists the run summary (manifest + conflicts + fingerprints)
+    next to the generated project as `output/run_summary.json`. Never fails the run.
+    """
+    from agents.utils import write_run_summary
+
+    logger.info("[GraphNode] Finalizing — writing run summary...")
+    ps = _state_from_dict(state)
+    path = write_run_summary(ps)
+    logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
+    return {}
+

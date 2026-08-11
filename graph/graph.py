@@ -19,6 +19,7 @@ from graph.nodes import (
     backend_node,
     frontend_node,
     integration_node,
+    finalize_node,
 )
 from graph.edges import route_after_requirements, route_after_integration
 
@@ -34,6 +35,7 @@ workflow.add_node("database", database_node)
 workflow.add_node("backend", backend_node)
 workflow.add_node("frontend", frontend_node)
 workflow.add_node("integration", integration_node)
+workflow.add_node("finalize", finalize_node)
 
 # Add Edges
 workflow.add_edge(START, "requirements")
@@ -65,7 +67,7 @@ workflow.add_edge("frontend", "integration")
 workflow.add_edge("database", "integration")
 
 # Mod 1 — integration REWORK loop back to the coding agents when conflicts remain,
-# else END. Capped by integration_rework_rounds / max_integration_rounds.
+# else END via the finalize node (persists the run summary next to output/).
 workflow.add_conditional_edges(
     "integration",
     route_after_integration,
@@ -73,9 +75,10 @@ workflow.add_conditional_edges(
         "backend": "backend",
         "frontend": "frontend",
         "database": "database",
-        "__end__": END,
+        "__end__": "finalize",
     },
 )
+workflow.add_edge("finalize", END)
 
 
 memory = MemorySaver()

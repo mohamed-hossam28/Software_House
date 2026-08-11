@@ -33,11 +33,11 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
-from agents.utils import write_to_disk, _write_to_disk, parse_metadata, resolve_stages
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -302,9 +302,14 @@ class FrontendAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item, default_return_type="void")
             try:
-                _write_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[FrontendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[FrontendAgent] Batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -363,9 +368,14 @@ class FrontendAgent(BaseAgent):
                 logger.warning("[FrontendAgent] Rework batch: empty code for %s", fm.filepath)
                 continue
             try:
-                _write_to_disk(fm.filepath, code)
+                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[FrontendAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
+                written_code = None
+            if written_code is None:
+                logger.warning("[FrontendAgent] Rework batch: corrupted content refused for %s", fm.filepath)
+                continue
+            code = written_code
             with lock:
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
@@ -431,14 +441,18 @@ class FrontendAgent(BaseAgent):
         else:
             classes, functions = parse_metadata(data, default_return_type="void")
 
-        # Write to disk
+        # Write to disk (safe-write guard refuses corrupted content)
         try:
-            _write_to_disk(filepath, code)
+            written_code = safe_write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[FrontendAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:
                 state.log_error(self.name, f"Disk write failed for {filepath}: {exc}")
-
+            written_code = None
+        if written_code is None:
+            logger.error("[FrontendAgent] Corrupted content refused for %s — file not written", filepath)
+            return
+        code = written_code
         # Update state (thread-safe)
         with lock:
             state.generated_code.frontend[filepath] = code
