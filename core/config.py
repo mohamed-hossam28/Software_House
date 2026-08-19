@@ -11,7 +11,11 @@ class Settings(BaseSettings):
     )
 
     # API Keys with fallbacks/aliases
-    openai_api: Optional[str] = Field(None, validation_alias=AliasChoices("openai_api_key", "OPENAI_API_KEY", "open_router_api"))
+    open_router_api: Optional[str] = Field(None, validation_alias=AliasChoices("open_router_api", "OPEN_ROUTER_API_KEY", "OPENAI_API_KEY"))
+    
+    orca_router_api: Optional[str] = Field(None, validation_alias=AliasChoices("orca_router_api", "orca_router_api_key", "ORCA_ROUTER_API"))
+    
+    token_router_api: Optional[str] = Field(None, validation_alias=AliasChoices("token_router_api", "token_router_api_key", "TOKEN_ROUTER_API"))
     
     gemini_api: Optional[str] = Field(None, validation_alias=AliasChoices("gemini_api", "gemini_api_key", "GEMINI_API_KEY"))
     
@@ -24,8 +28,12 @@ class Settings(BaseSettings):
 
     # Provider and model settings
     # Support both DEFAULY_PROVIDER (as requested) and standard DEFAULT_PROVIDER
-    default_provider: str = Field("openai", validation_alias=AliasChoices("DEFAULY_PROVIDER", "default_provider", "DEFAULT_PROVIDER"))
+    default_provider: str = Field("open_router", validation_alias=AliasChoices("DEFAULY_PROVIDER", "default_provider", "DEFAULT_PROVIDER"))
     default_model: Optional[str] = Field(None, validation_alias=AliasChoices("default_model", "DEFAULT_MODEL"))
+
+    # Coding agent (backend / frontend / database) overrides — fall back to default when unset
+    coding_provider: Optional[str] = Field(None, validation_alias=AliasChoices("CODING_PROVIDER", "coding_provider"))
+    coding_model: Optional[str] = Field(None, validation_alias=AliasChoices("CODING_MODEL", "coding_model"))
 
     default_max_tokens: Optional[int] = Field(None, validation_alias=AliasChoices("DEFAULT_MAX_TOKENS", "default_max_tokens"))
     default_retries: Optional[int]    = Field(None, validation_alias=AliasChoices("DEFAULT_RETRIES", "default_retries"))
@@ -89,12 +97,24 @@ class Settings(BaseSettings):
             return "claude-sonnet-4-6"
         elif provider == "glm":
             return "z-ai/glm-5.2"
-        elif provider=="openai":
+        elif provider in ("open_router", "openrouter"):
             return "openai/gpt-oss-120b:free"
+        elif provider == "orca_router":
+            return "qwen/qwen3.8-27b-free"
+        elif provider == "token_router":
+            return "deepseek/deepseek-v4-pro-0813-free"
         elif provider == "nara":
             return "mistral-large"
         else:
             return "openai/gpt-oss-120b:free"
+
+    @property
+    def coding_model_name(self) -> str:
+        return self.coding_model or self.model_name
+
+    @property
+    def coding_provider_name(self) -> str:
+        return self.coding_provider or self.default_provider
 
     @property
     def api_key(self) -> Optional[str]:
@@ -103,8 +123,12 @@ class Settings(BaseSettings):
             return self.gemini_api
         elif provider == "anthropic":
             return self.anthropic_api
-        elif provider == "openai":
-            return self.openai_api
+        elif provider in ("open_router", "openrouter"):
+            return self.open_router_api
+        elif provider == "orca_router":
+            return self.orca_router_api
+        elif provider == "token_router":
+            return self.token_router_api
         elif provider in ("groq", "qrok"):
             return self.groq_api
         elif provider == "glm":

@@ -14,7 +14,7 @@ class OpenAIProvider(BaseLLMProvider):
         from core.config import settings
         key = (
             api_key 
-            or (settings.api_key if settings.default_provider.lower().strip() == "openai" else None)
+            or (settings.api_key if settings.default_provider.lower().strip() in ("open_router", "openrouter") else None)
             or os.environ.get("OPENAI_API_KEY") 
             or os.environ.get("open_router_api")
         )
@@ -27,7 +27,7 @@ class OpenAIProvider(BaseLLMProvider):
     
     @property
     def provider_name(self) -> str:
-        return "openai"
+        return "open_router"
  
     def complete(
         self,

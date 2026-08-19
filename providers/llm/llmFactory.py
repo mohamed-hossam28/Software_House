@@ -5,7 +5,9 @@ from providers.llm.base import BaseLLMProvider
 # Add a new provider here when you add a new file
 _REGISTRY: dict[str, str] = {
     "anthropic": "providers.llm.anthropic.AnthropicProvider",
-    "openai":    "providers.llm.openai.OpenAIProvider",
+    "open_router": "providers.llm.open_router.OpenAIProvider",
+    "orca_router": "providers.llm.orca_router.OrcaRouterProvider",
+    "token_router": "providers.llm.token_router.TokenRouterProvider",
     "gemini":    "providers.llm.gemini.GeminiProvider",
     "glm":       "providers.llm.glm.GLMProvider",
     "nara":      "providers.llm.nara_router.NaraRouterProvider",
@@ -20,7 +22,7 @@ class LLMFactory:
         Returns an instantiated LLM provider.
  
         Args:
-            provider_name:  one of "anthropic", "openai", "gemini", "glm", "nara"
+            provider_name:  one of "anthropic", "open_router", "orca_router", "token_router", "gemini", "glm", "nara"
             api_key:        optional — if None, each provider reads from env
  
         Raises:

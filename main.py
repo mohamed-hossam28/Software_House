@@ -33,6 +33,7 @@ def run_pipeline(prompt: str, project_name: str = "MySoftwareProject", max_round
     print(f"Project Name      : {project_name}")
     print(f"Initial Prompt    : {prompt}")
     print(f"Max HITL Rounds   : {max_rounds}")
+    print(f"Model Name        : {settings.model_name}")
     print("=" * 60 + "\n")
 
     # 1. Initialize project state
@@ -117,6 +118,7 @@ def run_pipeline(prompt: str, project_name: str = "MySoftwareProject", max_round
     print("=" * 60)
     print(f"Final Status        : {current_state.status}")
     print(f"Clarification Rounds: {current_state.clarfication_rounds}/{current_state.max_clarfication_rounds}")
+    print(f"Model Name          : {settings.model_name}")
     print(f"Functional Reqs Cnt : {len(current_state.requirements.functional_requirements)}")
     print(f"System Components   : {len(current_state.architecture.system_components)}")
     print(f"Tasks Generated     : {len(current_state.tasks.tasks)}")

@@ -64,6 +64,17 @@ REWORK_ONLY_TYPES = frozenset({
 #: Pydantic base-model names that mark a class as a request/response schema.
 _PYDANTIC_BASES = ("BaseModel", "PydanticBaseModel", "BaseSettings")
 
+#: Conventional app-layer directory names. Imports whose first segment is one
+#: of these are INTERNAL even when the planner never registered the module
+#: (e.g. `from api.routes import router` with no api/ package on disk) — they
+#: must be flagged so the owning agent is told to create the module or fix the
+#: import, instead of silently passing as a third-party package.
+_LAYER_DIR_NAMES = frozenset({
+    "api", "routers", "routes", "app", "services", "models", "schemas",
+    "db", "crud", "database", "controllers", "views", "utils", "core",
+    "middleware", "config", "static", "assets", "migrations",
+})
+
 #: HTTP verbs that routers can declare.
 _HTTP_VERBS = ("get", "post", "put", "patch", "delete")
 
@@ -170,13 +181,21 @@ def parse_python_imported_names(code: str) -> list[tuple[str, list[str], bool]]:
     reports the *exported* name 'A' (what the target must define).
     """
     results: list[tuple[str, list[str], bool]] = []
-    for match in re.finditer(r"^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+(.+?)\s*$", code, re.MULTILINE):
+    for match in re.finditer(r"^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+([^\n]*)", code, re.MULTILINE):
         module_src = match.group(1).strip()
         import_part = match.group(2).strip()
         if import_part == "*":
             continue
+        # Multiline parenthesized import: `from x import (\n    a,\n    b,\n)`
+        if "(" in import_part:
+            if ")" in import_part:
+                import_part = import_part[import_part.index("(") + 1: import_part.rindex(")")]
+            else:
+                rest = code[match.end():]
+                close = rest.find(")")
+                import_part = import_part[import_part.index("(") + 1:] + (rest[:close] if close != -1 else "")
         names: list[str] = []
-        for item in import_part.split(","):
+        for item in import_part.replace("\n", " ").split(","):
             item = item.strip()
             if not item:
                 continue
@@ -281,8 +300,15 @@ def resolve_import_path(import_source: str, current_file: str, manifest_files: l
                 # under output/backend/). Try resolving against the current file's
                 # layer root before giving up.
                 root = layer_root_for(current_file)
+                candidates = [import_source]
                 if root:
-                    candidate = root + import_source.replace('.', '/')
+                    root_name = root.strip('/').split('/')[-1]
+                    if first_part == root_name:
+                        # `backend.schemas.todo` from a file under output/backend/
+                        # means the app runs with the layer root on sys.path.
+                        candidates.append(import_source.split('.', 1)[1])
+                for src in candidates:
+                    candidate = (root + src.replace('.', '/')) if root else (src.replace('.', '/'))
                     candidate = candidate.strip('/')
                     for ext in ['.py', '/__init__.py']:
                         path_with_ext = candidate + ext
@@ -315,6 +341,16 @@ def resolve_import_path(import_source: str, current_file: str, manifest_files: l
             # Check absolute workspace import path
             first_part = import_source.split('/')[0]
             if first_part in internal_prefixes:
+                return check_js_ts_extensions(import_source, manifest_files)
+            if first_part in _LAYER_DIR_NAMES:
+                # Conventional layer-relative import (e.g. `api/todo` from a
+                # frontend module): try the current file's layer root, then the
+                # workspace frontend roots, before declaring it third-party.
+                root = layer_root_for(current_file)
+                if root:
+                    resolved = check_js_ts_extensions(root + import_source, manifest_files)
+                    if resolved:
+                        return resolved
                 return check_js_ts_extensions(import_source, manifest_files)
             return None  # Third-party npm package
 
@@ -355,7 +391,7 @@ def extract_actual_definitions(code: str, filepath: str) -> set[str]:
                 if name not in _PY_KEYWORDS and not name.startswith('__'):
                     defs.add(name)
     elif filepath.endswith(('.js', '.jsx', '.ts', '.tsx')):
-        for match in re.finditer(r"\bexport\s+(?:default\s+)?(?:class|function|const|let|var)\s+([a-zA-Z0-9_]+)", code):
+        for match in re.finditer(r"\bexport\s+(?:default\s+)?(?:async\s+)?(?:class|function|const|let|var)\s+([a-zA-Z0-9_]+)", code):
             defs.add(match.group(1))
         for match in re.finditer(r"\bexport\s+default\s+(?!function|class|const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)", code):
             defs.add(match.group(1))
@@ -415,41 +451,185 @@ def count_passed_arguments(args_str: str) -> int:
     return count
 
 
+def extract_call_arg_strings(code: str, name: str) -> list[str]:
+    """
+    Inner argument strings of every call to `name(` in `code`, extracted with a
+    balanced-paren, quote-aware scan (unlike a naive regex, which stops at the
+    first ')' — e.g. inside `str(x)` — and miscounts nested calls).
+    `def name(` declarations are skipped; attribute/import usages never match
+    because a '(' must directly follow the name.
+    """
+    results: list[str] = []
+    pattern = re.compile(r"\b" + re.escape(name) + r"\s*\(")
+    pos = 0
+    while True:
+        m = pattern.search(code, pos)
+        if not m:
+            break
+        if re.search(r"\bdef\s+$", code[: m.start()]):
+            pos = m.end()
+            continue
+        depth = 0
+        in_quote = False
+        quote_char = None
+        escaped = False
+        idx = m.end() - 1
+        while idx < len(code):
+            ch = code[idx]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_quote:
+                if ch == quote_char:
+                    in_quote = False
+            elif ch in ('"', "'", "`"):
+                in_quote = True
+                quote_char = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    results.append(code[m.end() : idx])
+                    break
+            idx += 1
+        pos = m.end()
+    return results
+
+
 def normalize_api_path(path: str) -> str:
+    # Path-typed params ({file_path:path}) are catch-alls — drop the param
+    # entirely so `/static/{file_path:path}` normalizes to `/static`.
+    path = re.sub(r'\{[^}]*:\w+\}', '', path)
     path = re.sub(r'\{([^}]+)\}', r':\1', path)
     # Parameter NAMES are irrelevant to matching — `{id}` == `{todo_id}`.
     path = re.sub(r':\w+', ':', path)
     return path.strip().rstrip('/')
 
 
-def check_type_consistency(field: str, expected_type: str, code: str) -> Optional[str]:
-    expected_type_lower = expected_type.lower()
-    # Pattern to search for "field: type" or "field?: type" or "field = ... as type"
-    pattern = r"\b" + re.escape(field) + r"\b\s*\??\s*:\s*([a-zA-Z0-9_\[\]]+)"
-    match = re.search(pattern, code)
-    if not match:
-        if field not in code:
-            return f"Field '{field}' is missing entirely."
+def strip_leading_api(path: str) -> str:
+    """Remove a conventional leading `api/` segment, if present."""
+    if path.startswith("/api/"):
+        return path[4:]
+    return path
+
+
+_PRIMITIVE_TYPE_SETS: dict[str, frozenset[str]] = {
+    "string": frozenset({"str"}), "str": frozenset({"str"}), "varchar": frozenset({"str"}),
+    "text": frozenset({"str"}), "char": frozenset({"str"}),
+    "int": frozenset({"num"}), "integer": frozenset({"num"}), "number": frozenset({"num"}),
+    "float": frozenset({"num"}), "double": frozenset({"num"}), "decimal": frozenset({"num"}),
+    "bool": frozenset({"bool"}), "boolean": frozenset({"bool"}),
+    "uuid": frozenset({"uuid"}),
+    "datetime": frozenset({"date"}), "date": frozenset({"date"}), "timestamp": frozenset({"date"}),
+    "time": frozenset({"date"}),
+    "object": frozenset({"obj"}), "dict": frozenset({"obj"}), "record": frozenset({"obj"}),
+    "any": frozenset({"obj"}), "json": frozenset({"obj"}),
+    "array": frozenset({"arr"}), "list": frozenset({"arr"}), "sequence": frozenset({"arr"}),
+    "none": frozenset({"none"}), "null": frozenset({"none"}),
+}
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split on commas that are not nested inside [] or ()."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in text:
+        if ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current or not parts:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _type_sets(annotation: str) -> frozenset[str]:
+    """Normalize a type annotation/contract type into a set of primitive tokens.
+    Handles Optional[x], Union[a, b], a | b, List[x], typing. prefixes and
+    JS-style 'string|null'. Unknown names (model classes etc.) are kept as-is
+    and compared literally."""
+    token = (annotation or "").strip().lower().replace(" ", "")
+    token = re.sub(r"\btyping\.", "", token)
+
+    def expand(s: str) -> set[str]:
+        s = s.strip()
+        if not s:
+            return set()
+        if s.startswith("optional") and s.endswith("]"):
+            return expand(s[len("optional["):-1]) | {"none"}
+        if s.startswith("union") and s.endswith("]"):
+            out: set[str] = set()
+            for part in _split_top_level_commas(s[len("union["):-1]):
+                out |= expand(part)
+            return out
+        if "|" in s:
+            out = set()
+            for part in s.split("|"):
+                out |= expand(part)
+            return out
+        if s.startswith("list") and s.endswith("]"):
+            return expand(s[len("list["):-1]) | {"arr"}
+        if s.startswith("dict") and s.endswith("]"):
+            return expand(s[4:s.rfind("[")]) | {"obj"}
+        if s in _PRIMITIVE_TYPE_SETS:
+            return set(_PRIMITIVE_TYPE_SETS[s])
+        return {s}
+
+    return frozenset(expand(token))
+
+
+def _capture_annotation(code: str, field: str) -> Optional[str]:
+    """Capture a `field: <annotation>` token, balancing [] so Union/Optional
+    generics (which contain commas) are not truncated at depth 0."""
+    m = re.search(r"(?<![\w-])\b" + re.escape(field) + r"\b\s*\??\s*:\s*", code)
+    if not m:
         return None
+    start = m.end()
+    i = start
+    depth = 0
+    while i < len(code):
+        ch = code[i]
+        if depth == 0 and ch in ",=)#" or (depth == 0 and ch == ":" and i > start):
+            break
+        if ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth = max(0, depth - 1)
+        i += 1
+    return code[start:i].strip() or None
 
-    actual_type = match.group(1).strip()
-    actual_type_lower = actual_type.lower()
 
-    is_match = False
-    if "string" in expected_type_lower or "varchar" in expected_type_lower or "text" in expected_type_lower:
-        is_match = actual_type_lower in ["str", "string", "varchar", "text"]
-    elif "int" in expected_type_lower or "integer" in expected_type_lower or "number" in expected_type_lower:
-        is_match = actual_type_lower in ["int", "number", "float", "integer"]
-    elif "bool" in expected_type_lower:
-        is_match = actual_type_lower in ["bool", "boolean"]
-    elif "uuid" in expected_type_lower:
-        is_match = actual_type_lower in ["uuid", "str", "string"]
-    else:
-        is_match = expected_type_lower in actual_type_lower or actual_type_lower in expected_type_lower
+def check_type_consistency(field: str, expected_type: str, code: str) -> Optional[str]:
+    """Check a contract field's declared type against its annotation in code.
+    Comparisons are set-based with nullable tolerance: `Optional[str]`,
+    `Union[str, None]`, `str | None` all satisfy a contract of `string|null`;
+    a nullable actual also satisfies a non-null contract."""
+    actual_type = _capture_annotation(code, field)
+    if actual_type is None:
+        if re.search(r"(?<![\w-])\b" + re.escape(field) + r"\b", code):
+            return None
+        return f"Field '{field}' is missing entirely."
 
-    if not is_match:
+    exp_set = _type_sets(expected_type)
+    act_set = _type_sets(actual_type)
+    if not exp_set or not act_set:
+        if expected_type.lower().strip() == actual_type.lower().strip():
+            return None
         return f"Type mismatch for '{field}': expected '{expected_type}', found '{actual_type}'"
-    return None
+
+    if exp_set == act_set:
+        return None
+    if exp_set - {"none"} == act_set - {"none"} and ({"none"} & exp_set or {"none"} & act_set):
+        return None
+    return f"Type mismatch for '{field}': expected '{expected_type}', found '{actual_type}'"
 
 
 def _normalize_output_path(filepath: str) -> str:
@@ -549,12 +729,14 @@ def parse_sqlalchemy_models(code: str) -> dict[str, set[str]]:
 def parse_pydantic_schemas(code: str) -> dict[str, set[str]]:
     """
     Parse Pydantic request/response models: {ClassName -> {field names}}.
+    Subclasses of other schema classes are included even without their own
+    fields (e.g. `class TodoItemCreate(TodoItemBase):` with only a docstring),
+    so route -> model resolution finds the defining file for every model.
     """
-    schemas: dict[str, set[str]] = {}
-    for m in re.finditer(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", code, re.MULTILINE):
+    header = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", re.MULTILINE)
+    decls: list[tuple[str, str, set[str]]] = []
+    for m in header.finditer(code):
         name, bases = m.group(1), m.group(2)
-        if not any(b in bases for b in _PYDANTIC_BASES):
-            continue
         body = _class_body_lines(code, m.end())
         fields: set[str] = set()
         for line in body.splitlines():
@@ -562,9 +744,19 @@ def parse_pydantic_schemas(code: str) -> dict[str, set[str]]:
                  re.match(r"^\s{4}(\w+)\s*=\s*Field\s*\(", line)
             if fm and fm.group(1) != "model_config":
                 fields.add(fm.group(1))
-        if fields:
-            schemas[name] = fields
-    return schemas
+        decls.append((name, bases, fields))
+    accepted: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, bases, _ in decls:
+            if name in accepted:
+                continue
+            base_names = re.findall(r"[\w.]+", bases)
+            if any(b in _PYDANTIC_BASES for b in base_names) or any(b in accepted for b in base_names):
+                accepted.add(name)
+                changed = True
+    return {name: fields for name, _, fields in decls if name in accepted}
 
 
 def _class_body_lines(code: str, header_end: int) -> str:
@@ -632,52 +824,98 @@ def parse_backend_routes(code: str) -> list[dict]:
     return routes
 
 
+def _fetch_base_urls(code: str) -> dict[str, str]:
+    """Discover base-URL assignments: `const API_URL = '...'`, `this.API_BASE_URL = '...'`.
+    Returns {name: url} with 'this.X' keys for member assignments."""
+    bases: dict[str, str] = {}
+    for m in re.finditer(r"\b(?:const|let|var)\s+(\w+)\s*=\s*['\"]([^'\"]+)['\"]", code):
+        if re.search(r"(api|base|url|host|endpoint)", m.group(1), re.I):
+            bases[m.group(1)] = m.group(2).rstrip("/")
+    for m in re.finditer(r"this\.(\w+)\s*=\s*['\"]([^'\"]+)['\"]", code):
+        if re.search(r"(api|base|url|host|endpoint)", m.group(1), re.I):
+            bases["this." + m.group(1)] = m.group(2).rstrip("/")
+    return bases
+
+
+def _resolve_fetch_segment(inner: str, bases: dict[str, str]) -> str:
+    """Resolve one `${...}` template segment (or bare identifier) to a path
+    fragment: known base → its url; unknown base-like → '' (dropped, the route
+    tail stays); anything else → a path parameter '{id}'."""
+    expr = inner.strip()
+    key = expr if expr.startswith("this.") else expr.split(".")[-1] if "." in expr else expr
+    if key in bases:
+        return bases[key]
+    member = expr[5:] if expr.startswith("this.") else expr
+    if re.fullmatch(r"\w+", member) and re.search(r"(api|base|url|host|endpoint)", member, re.I):
+        return ""
+    return "/{id}"
+
+
 def parse_frontend_fetches(code: str) -> list[dict]:
     """
     Parse frontend `fetch(...)` calls: [{"path", "method", "body_keys", "after"}].
-    Resolves simple template-literal URL building (const API_BASE_URL + ${id}).
-    "after" is the code following the call (used to scope response handling).
+    Resolves template-literal URL building (`${API_BASE_URL}/${id}`) and bare
+    identifier args (`fetch(this.API_BASE_URL)`). Unresolvable base segments are
+    dropped instead of being faked as parameters; unverifiable dynamic fetches
+    yield no entry.
     """
-    base_url = ""
-    bm = re.search(
-        r"\b(?:const|let|var)\s+(\w+)\s*=\s*['\"]([^'\"]+)['\"]", code)
-    if bm and ("api" in bm.group(1).lower() or "base" in bm.group(1).lower() or "url" in bm.group(1).lower()):
-        base_url = bm.group(2).rstrip("/")
+    bases = _fetch_base_urls(code)
 
     fetches: list[dict] = []
     for m in re.finditer(r"\bfetch\s*\(\s*([`'\"])([^`'\"]*)\1", code):
-        raw_path = m.group(2)
-        # Template-literal segments: substitute known constants, then params.
-        resolved = raw_path.replace("${" + (bm.group(1) if bm else "") + "}", base_url) if bm else raw_path
-        resolved = re.sub(r"\$\{[^}]*\}", "/{id}", resolved)
-        resolved = re.sub(r"/{2,}", "/", resolved)  # collapse accidental // from joins
-        resolved = resolved.strip()
+        raw = m.group(2)
+        resolved = re.sub(
+            r"\$\{([^}]*)\}",
+            lambda mm: _resolve_fetch_segment(mm.group(1), bases),
+            raw,
+        )
+        resolved = re.sub(r"/{2,}", "/", resolved)
+        resolved = resolved.strip().strip("'\"`")
         if not resolved:
             continue
+        _append_fetch(fetches, code, m.end(), resolved)
 
-        method = "GET"
-        body_keys: list[str] = []
-        window = code[m.end():m.end() + 500]
-        mm = re.search(r"method\s*:\s*['\"]([A-Za-z]+)['\"]", window)
-        if mm:
-            method = mm.group(1).upper()
-        sm = re.search(r"JSON\.stringify\s*\(\s*\{([^}]*)\}", window)
-        if sm:
-            for item in re.split(r",", sm.group(1)):
-                item = item.strip()
-                if not item:
-                    continue
-                key = item.split(":")[0].strip().strip("'\"")
-                if key:
-                    body_keys.append(key)
+    for m in re.finditer(r"\bfetch\s*\(\s*([A-Za-z_$][\w.$]*)\s*[,)]", code):
+        key = m.group(1).strip()
+        resolved = _resolve_fetch_segment(key, bases)
+        if not resolved:
+            continue
+        _append_fetch(fetches, code, m.end(), resolved)
 
-        fetches.append({
-            "path": resolved,
-            "method": method,
-            "body_keys": body_keys,
-            "after": window,
-        })
-    return fetches
+    # drop duplicates the two loops may have produced
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for f in fetches:
+        k = (f["path"], f["method"])
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(f)
+    return unique
+
+
+def _append_fetch(fetches: list[dict], code: str, after_start: int, path: str) -> None:
+    method = "GET"
+    body_keys: list[str] = []
+    window = code[after_start:after_start + 500]
+    mm = re.search(r"method\s*:\s*['\"]([A-Za-z]+)['\"]", window)
+    if mm:
+        method = mm.group(1).upper()
+    sm = re.search(r"JSON\.stringify\s*\(\s*\{([^}]*)\}", window)
+    if sm:
+        for item in re.split(r",", sm.group(1)):
+            item = item.strip()
+            if not item:
+                continue
+            key = item.split(":")[0].strip().strip("'\"")
+            if key:
+                body_keys.append(key)
+    fetches.append({
+        "path": path,
+        "method": method,
+        "body_keys": body_keys,
+        "after": window,
+    })
 
 
 def parse_html_ids(code: str) -> set[str]:
@@ -757,19 +995,25 @@ def parse_js_response_field_usage(code: str) -> dict[str, set[str]]:
     return fields_by_var
 
 
-def match_backend_route(fetch_path: str, fetch_method: str, routes: list[dict]) -> tuple[Optional[dict], list[dict]]:
+def match_backend_route(fetch_path: str, fetch_method: str, routes: list[dict],
+                        allow_api_prefix: bool = False) -> tuple[Optional[dict], list[dict]]:
     """
     Match a frontend fetch call against the backend's actual route list.
     Returns (matched_route_or_None, close_candidates). Paths are normalized
     (trailing slash, {x}->:x) and matched exactly; close candidates are
-    same-method routes whose path token-similarity is high.
+    same-method routes whose path token-similarity is high. When
+    allow_api_prefix is set, a conventional leading `api/` segment on either
+    side is tolerated (frontend/backend often agree on `/api/...` even though
+    the architecture contract spelled the path without it).
     """
     fp = normalize_api_path(fetch_path)
+    fp_alt = strip_leading_api(fp) if allow_api_prefix else None
     fp_tokens = set(re.findall(r"[a-zA-Z0-9]+", fp.lower()))
     candidates = []
     for r in routes:
         rp = normalize_api_path(r["path"])
-        if fp == rp:
+        rp_alt = strip_leading_api(rp) if allow_api_prefix else None
+        if fp == rp or (fp_alt is not None and (fp_alt == rp or (rp_alt is not None and fp == rp_alt))):
             if r["method"] == fetch_method:
                 return r, candidates
             candidates.append({**r, "_match": "method", "_score": 1.0})
@@ -782,6 +1026,42 @@ def match_backend_route(fetch_path: str, fetch_method: str, routes: list[dict]) 
             candidates.append({**r, "_match": "path", "_score": score})
     candidates.sort(key=lambda c: (c.get("_match") == "method", c.get("_score", 0.0)), reverse=True)
     return None, candidates[:3]
+
+
+
+def _check_promised_exports(filepath: str, fm: FileManifest, code: str, conflicts: list[dict]) -> None:
+    """Verify a code file's actual definitions against its promised manifest exports.
+    A promised export may be satisfied by a definition OR a re-export
+    (e.g. `__init__.py` doing `from .user import User`)."""
+    actual_defs = extract_actual_definitions(code, filepath)
+    reexport_names: set[str] = set()
+    if filepath.endswith('.py'):
+        for _, names, _ in parse_python_imported_names(code):
+            reexport_names.update(names)
+    else:
+        for _, names, _ in parse_js_ts_imported_names(code):
+            reexport_names.update(names)
+    for promised in fm.exports:
+        if promised not in actual_defs and promised not in reexport_names:
+            conflicts.append({
+                "filepath": filepath,
+                "task_id": fm.task_id,
+                "expected": promised,
+                "actual": "missing",
+                "reason": f"File '{filepath}' promised to export '{promised}', but it is missing in the generated code."
+            })
+
+    # Check for extra exports in code not declared in manifest exports.
+    for actual in actual_defs:
+        # Filter out local helpers that aren't expected to be exported, but if JS/TS explicitly marks them as 'export', they are actual exports.
+        if filepath.endswith(('.js', '.jsx', '.ts', '.tsx')) and actual not in fm.exports:
+            conflicts.append({
+                "filepath": filepath,
+                "task_id": fm.task_id,
+                "expected": "not exported in manifest",
+                "actual": actual,
+                "reason": f"Export '{actual}' found in code of '{filepath}' but not declared in manifest exports list."
+            })
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -832,37 +1112,11 @@ class IntegrationAgent(BaseAgent):
             return conflicts, []
 
         # 1. Verify actual exports vs promised exports.
-        #    A promised export may be satisfied by a definition OR a re-export
-        #    (e.g. `__init__.py` doing `from .user import User`).
-        actual_defs = extract_actual_definitions(code, filepath)
-        reexport_names = set()
-        if filepath.endswith('.py'):
-            for _, names, _ in parse_python_imported_names(code):
-                reexport_names.update(names)
-        else:
-            for _, names, _ in parse_js_ts_imported_names(code):
-                reexport_names.update(names)
-        for promised in fm.exports:
-            if promised not in actual_defs and promised not in reexport_names:
-                conflicts.append({
-                    "filepath": filepath,
-                    "task_id": fm.task_id,
-                    "expected": promised,
-                    "actual": "missing",
-                    "reason": f"File '{filepath}' promised to export '{promised}', but it is missing in the generated code."
-                })
-
-        # Check for extra exports in code not declared in manifest exports
-        for actual in actual_defs:
-            # Filter out local helpers that aren't expected to be exported, but if JS/TS explicitly marks them as 'export', they are actual exports.
-            if filepath.endswith(('.js', '.jsx', '.ts', '.tsx')) and actual not in fm.exports:
-                conflicts.append({
-                    "filepath": filepath,
-                    "task_id": fm.task_id,
-                    "expected": "not exported in manifest",
-                    "actual": actual,
-                    "reason": f"Export '{actual}' found in code of '{filepath}' but not declared in manifest exports list."
-                })
+        #    Only importable code files can export symbols — README.md,
+        #    requirements.txt, .env.example, SQL and stylesheets promise
+        #    "exports" but are never importable, so they are not verified.
+        if filepath.endswith((".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")):
+            _check_promised_exports(filepath, fm, code, conflicts)
 
         # 2. Verify imports resolve and verify function/method call signatures
         imports = []
@@ -876,15 +1130,22 @@ class IntegrationAgent(BaseAgent):
             resolved = resolve_import_path(imp, filepath, manifest_files, internal_prefixes)
             # If internal import but unable to resolve, it's a mismatch
             is_relative = imp.startswith('.') or imp.startswith('@/')
-            is_internal_name = imp.split('.')[0] in internal_prefixes if filepath.endswith('.py') else imp.split('/')[0] in internal_prefixes
+            first_seg = imp.split('.')[0] if filepath.endswith('.py') else imp.split('/')[0]
+            is_internal_name = first_seg in internal_prefixes or first_seg in _LAYER_DIR_NAMES
 
             if (is_relative or is_internal_name) and not resolved:
+                hint = (
+                    f" First segment '{first_seg}' matches a conventional app-layer "
+                    f"directory — create the module or rewrite the import so it points "
+                    f"at an existing file."
+                    if first_seg in _LAYER_DIR_NAMES else ""
+                )
                 conflicts.append({
                     "filepath": filepath,
                     "task_id": fm.task_id,
                     "expected": f"Resolvable module path for '{imp}'",
                     "actual": "unresolved",
-                    "reason": f"Import '{imp}' in '{filepath}' cannot be resolved to any manifest file path."
+                    "reason": f"Import '{imp}' in '{filepath}' cannot be resolved to any manifest file path.{hint}"
                 })
             elif resolved:
                 resolved_paths.append(resolved)
@@ -898,9 +1159,7 @@ class IntegrationAgent(BaseAgent):
                         sigs[f.name] = f.arguments
 
                     for name, args in sigs.items():
-                        pattern = r"\b" + re.escape(name) + r"\s*\((.*?)\)"
-                        for match in re.finditer(pattern, code, re.DOTALL):
-                            args_str = match.group(1)
+                        for args_str in extract_call_arg_strings(code, name):
                             passed_count = count_passed_arguments(args_str)
                             min_args = sum(1 for a in args if not a.default)
                             max_args = len(args)
@@ -1050,172 +1309,163 @@ class IntegrationAgent(BaseAgent):
             if visited.get(node, 0) == 0:
                 dfs(node)
 
-        # 3. Cross-check Frontend and Backend API Contracts
-        api_conflicts = self._check_api_contracts(state)
-        conflicts.extend(api_conflicts)
-
         return conflicts
 
-    def _check_api_contracts(self, state: ProjectState) -> list[dict]:
-        conflicts = []
-        contracts = state.architecture.api_contracts
+    def _check_contract_coverage(self, state: ProjectState) -> list[dict]:
+        """
+        A8 (CONTRACT_COVERAGE) — parse-based replacement for the legacy substring
+        `_check_api_contracts`. Every architecture API contract must be
+        implemented by a PARSED backend route (incl. StaticFiles mounts, which
+        satisfy HTML-serving contracts). Field/type conformance is checked only
+        against the route's owning file plus the files defining its
+        request/response models — never against README/css/requirements text.
+        Frontend coverage: a backend-implemented contract not called from any
+        frontend fetch is flagged (static/asset routes are exempt — the browser
+        references them, not fetch()).
+        """
+        conflicts: list[dict] = []
+        contracts = state.architecture.api_contracts or []
         if not contracts:
             return conflicts
 
-        backend_files = list(state.generated_code.backend.items())
-        frontend_files = list(state.generated_code.frontend.items())
+        routes, _api_prefixes = self._collect_backend_routes(state)
+        schemas = self._collect_schema_fields(state)
+
+        # Class name → defining file (schemas/ wins where duplicated).
+        model_to_file: dict[str, str] = {}
+        for path in state.generated_code.backend:
+            code = get_file_code(path, state.code_manifest.files.get(path), state)
+            if not code:
+                continue
+            for name in parse_pydantic_schemas(code):
+                if "/schemas/" in path or name not in model_to_file:
+                    model_to_file[name] = path
+
+        # All fetch calls across written frontend files.
+        frontend_fetches: list[dict] = []
+        for path, fm in state.code_manifest.files.items():
+            if (
+                fm.agent != "frontend" or not fm.written
+                or not path.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"))
+            ):
+                continue
+            code = get_file_code(path, fm, state)
+            if not code:
+                continue
+            for fetch in parse_frontend_fetches(code):
+                frontend_fetches.append({**fetch, "filepath": path, "task_id": fm.task_id})
 
         for c in contracts:
-            path = c.path.strip()
-            path_norm = normalize_api_path(path)
             method = c.method.upper()
+            contract_path = c.path.strip()
+            path_key = normalize_api_path(contract_path)
 
-            # Check backend
-            backend_found = False
-            for filepath, code in backend_files:
-                if path_norm in normalize_api_path(code) or path.rstrip('/') in code or path in code:
-                    backend_found = True
-
-                    # 1. Path slash consistency
-                    has_contract_slash = path.endswith('/')
-                    for quote in ["'", '"', '`']:
-                        target_slash = path + '/' if not has_contract_slash else path
-                        target_no_slash = path.rstrip('/') if has_contract_slash else path
-                        if (quote + target_slash + quote) in code and not has_contract_slash:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Path without trailing slash: '{path}'",
-                                "actual": f"Path with trailing slash: '{path}/'",
-                                "reason": f"Trailing slash mismatch on route '{path}' in backend file '{filepath}'."
-                            })
-                            break
-                        elif (quote + target_no_slash + quote) in code and has_contract_slash:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Path with trailing slash: '{path}'",
-                                "actual": f"Path without trailing slash: '{path.rstrip('/')}'",
-                                "reason": f"Trailing slash mismatch on route '{path}' in backend file '{filepath}'."
-                            })
-                            break
-
-                    # 2. HTTP method
-                    method_pattern = r"\b" + re.escape(method.lower()) + r"\b|\b" + re.escape(method.upper()) + r"\b"
-                    if not re.search(method_pattern, code):
-                        conflicts.append({
-                            "filepath": filepath,
-                            "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                            "expected": f"HTTP method '{method}'",
-                            "actual": "Method not found or mismatched",
-                            "reason": f"Backend route in '{filepath}' does not declare or use the HTTP method '{method}' for path '{path}'."
-                        })
-
-                    # 3. Request fields & types
-                    for field, ftype in c.request_body.items():
-                        err = check_type_consistency(field, ftype, code)
-                        if err:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Request field '{field}' ({ftype})",
-                                "actual": err,
-                                "reason": f"Backend file '{filepath}' for path '{path}' has contract field issue: {err}."
-                            })
-
-                    # 4. Response fields & types
-                    for field, ftype in c.response_body.items():
-                        err = check_type_consistency(field, ftype, code)
-                        if err:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Response field '{field}' ({ftype})",
-                                "actual": err,
-                                "reason": f"Backend file '{filepath}' for path '{path}' has contract field issue: {err}."
-                            })
-
-            if not backend_found:
+            route, candidates = match_backend_route(contract_path, method, routes, allow_api_prefix=True)
+            if route is None:
+                # Attribute to the closest-matching route's OWNER when a
+                # similar route exists (e.g. path/prefix drift): the router file
+                # is the only file whose rework can fix the path. Fall back to
+                # the backend ENTRYPOINT so the conflict always lands in a real
+                # file's per-file rework instructions (a virtual "backend" key
+                # is never delivered to any file).
+                owner = "backend"
+                hint = ""
+                if candidates:
+                    owner = candidates[0].get("filepath") or "backend"
+                    hint = f" Closest route is '{candidates[0]['method']} {candidates[0]['path']}' in '{owner}' — align the path (prefix/params), don't duplicate."
+                if owner == "backend" or owner not in state.code_manifest.files:
+                    owner = next(
+                        (p for p in state.code_manifest.files
+                         if p.endswith(("main.py", "app.py", "server.py")) and "backend" in p),
+                        "backend",
+                    )
                 conflicts.append({
-                    "filepath": "backend",
-                    "task_id": "unknown",
-                    "expected": f"Backend implementation for endpoint '{method} {path}'",
+                    "type": "CONTRACT_COVERAGE",
+                    "filepath": owner,
+                    "task_id": state.code_manifest.files.get(owner).task_id if owner in state.code_manifest.files else "unknown",
+                    "expected": f"Backend implementation for endpoint '{method} {contract_path}'",
                     "actual": "Missing",
-                    "reason": f"API contract endpoint '{method} {path}' is not implemented in any backend file."
+                    "reason": f"API contract endpoint '{method} {contract_path}' is not implemented in any backend file.{hint}",
                 })
+                continue
 
-            # Check frontend
-            frontend_found = False
-            for filepath, code in frontend_files:
-                if path_norm in normalize_api_path(code) or path.rstrip('/') in code or path in code:
-                    frontend_found = True
+            owner = route.get("filepath") or "backend"
+            if route.get("is_mount"):
+                # An HTML static mount satisfies an HTML-serving contract — the
+                # page itself is the frontend's domain, so no field checks and
+                # no fetch() requirement.
+                continue
+            if route.get("static"):
+                # File/HTML-serving routes are referenced by the browser (link/
+                # script/img), not via fetch() — skip the frontend-call check.
+                pass
 
-                    # 1. Path slash consistency
-                    has_contract_slash = path.endswith('/')
-                    for quote in ["'", '"', '`']:
-                        target_slash = path + '/' if not has_contract_slash else path
-                        target_no_slash = path.rstrip('/') if has_contract_slash else path
-                        if (quote + target_slash + quote) in code and not has_contract_slash:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Path without trailing slash: '{path}'",
-                                "actual": f"Path with trailing slash: '{path}/'",
-                                "reason": f"Trailing slash mismatch on API fetch of '{path}' in frontend file '{filepath}'."
-                            })
-                            break
-                        elif (quote + target_no_slash + quote) in code and has_contract_slash:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Path with trailing slash: '{path}'",
-                                "actual": f"Path without trailing slash: '{path.rstrip('/')}'",
-                                "reason": f"Trailing slash mismatch on API fetch of '{path}' in frontend file '{filepath}'."
-                            })
-                            break
-
-                    # 2. HTTP method
-                    method_pattern = r"\b" + re.escape(method.lower()) + r"\b|\b" + re.escape(method.upper()) + r"\b"
-                    if not re.search(method_pattern, code):
+            scope_files = set()
+            if owner in state.code_manifest.files:
+                scope_files.add(owner)
+            for model in (route.get("request_model") or "", route.get("response_model") or ""):
+                if model and model in model_to_file:
+                    scope_files.add(model_to_file[model])
+            scoped_code = "\n".join(
+                get_file_code(p, state.code_manifest.files.get(p), state) or ""
+                for p in scope_files
+            )
+            if scoped_code.strip():
+                for field, ftype in c.request_body.items():
+                    err = check_type_consistency(field, ftype, scoped_code)
+                    if err:
                         conflicts.append({
-                            "filepath": filepath,
-                            "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                            "expected": f"HTTP method '{method}' for call to '{path}'",
-                            "actual": "Method not found or mismatched",
-                            "reason": f"Frontend file '{filepath}' references route '{path}' but does not seem to specify HTTP method '{method}'."
+                            "type": "CONTRACT_COVERAGE",
+                            "filepath": owner,
+                            "task_id": state.code_manifest.files.get(owner).task_id if owner in state.code_manifest.files else "unknown",
+                            "expected": f"Request field '{field}' ({ftype})",
+                            "actual": err,
+                            "reason": f"Backend file '{owner}' for path '{contract_path}' has contract field issue: {err}.",
+                        })
+                for field, ftype in c.response_body.items():
+                    err = check_type_consistency(field, ftype, scoped_code)
+                    if err:
+                        conflicts.append({
+                            "type": "CONTRACT_COVERAGE",
+                            "filepath": owner,
+                            "task_id": state.code_manifest.files.get(owner).task_id if owner in state.code_manifest.files else "unknown",
+                            "expected": f"Response field '{field}' ({ftype})",
+                            "actual": err,
+                            "reason": f"Backend file '{owner}' for path '{contract_path}' has contract field issue: {err}.",
                         })
 
-                    # 3. Request fields & types
-                    for field, ftype in c.request_body.items():
-                        err = check_type_consistency(field, ftype, code)
-                        if err:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Request field '{field}' ({ftype})",
-                                "actual": err,
-                                "reason": f"Frontend file '{filepath}' for API call '{path}' has contract field issue: {err}."
-                            })
-
-                    # 4. Response fields & types
-                    for field, ftype in c.response_body.items():
-                        err = check_type_consistency(field, ftype, code)
-                        if err:
-                            conflicts.append({
-                                "filepath": filepath,
-                                "task_id": state.code_manifest.files.get(filepath).task_id if filepath in state.code_manifest.files else "unknown",
-                                "expected": f"Response field '{field}' ({ftype})",
-                                "actual": err,
-                                "reason": f"Frontend file '{filepath}' for API call '{path}' has contract field issue: {err}."
-                            })
-
-            if not frontend_found and backend_found:
+            # Frontend coverage: a backend-implemented contract must be called
+            # from some frontend fetch — unless it is a static/asset route.
+            if route.get("static"):
+                continue
+            called = any(
+                fetch["method"].upper() == method
+                and (
+                    normalize_api_path(fetch["path"]) == path_key
+                    or strip_leading_api(normalize_api_path(fetch["path"])) == path_key
+                    or normalize_api_path(fetch["path"]) == strip_leading_api(path_key)
+                )
+                for fetch in frontend_fetches
+            )
+            if not called:
+                # Attribute to the first written frontend module so the conflict
+                # is delivered through per-file rework instructions.
+                frontend_target = next(
+                    (f["filepath"] for f in frontend_fetches),
+                    next(
+                        (p for p, fm in state.code_manifest.files.items()
+                         if fm.agent == "frontend" and fm.written
+                         and p.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"))),
+                        "frontend",
+                    ),
+                )
                 conflicts.append({
-                    "filepath": "frontend",
-                    "task_id": "unknown",
-                    "expected": f"Frontend call/reference to endpoint '{method} {path}'",
+                    "type": "CONTRACT_COVERAGE",
+                    "filepath": frontend_target,
+                    "task_id": state.code_manifest.files.get(frontend_target).task_id if frontend_target in state.code_manifest.files else "unknown",
+                    "expected": f"Frontend call/reference to endpoint '{method} {contract_path}'",
                     "actual": "Missing",
-                    "reason": f"API contract endpoint '{method} {path}' is implemented in backend but not called/referenced in any frontend file."
+                    "reason": f"API contract endpoint '{method} {contract_path}' is implemented in backend but not called/referenced in any frontend file.",
                 })
 
         return conflicts
@@ -1250,7 +1500,27 @@ class IntegrationAgent(BaseAgent):
             # are not prefixed.
             prefixed = "APIRouter" in code
             for r in parse_backend_routes(code):
-                raw_routes.append({**r, "static": static, "prefixed": prefixed})
+                raw_routes.append({**r, "static": static, "prefixed": prefixed, "filepath": path})
+            # StaticFiles mounts serve GET (html=True → the dir index too). They
+            # are recorded so HTML-serving contracts (e.g. `GET /`) are satisfied
+            # by the mount instead of flagged as missing.
+            for m in re.finditer(
+                r"\.mount\s*\(\s*['\"]([^'\"]*)['\"]\s*,\s*StaticFiles\s*\(",
+                code,
+            ):
+                mount_path = m.group(1).rstrip("/") or "/"
+                mount_html = bool(re.search(r"html\s*=\s*True", code[m.end():m.end() + 120]))
+                raw_routes.append({
+                    "method": "GET",
+                    "path": mount_path,
+                    "request_model": "",
+                    "response_model": "",
+                    "static": True,
+                    "prefixed": False,
+                    "filepath": path,
+                    "is_mount": True,
+                    "mount_html": mount_html,
+                })
 
         if api_prefixes:
             routes: list[dict] = []
@@ -1475,11 +1745,15 @@ class IntegrationAgent(BaseAgent):
                     continue
                 if os.path.basename(p) == "__init__.py":
                     continue
+                # Attribute to the entrypoint: it is the only file whose rework
+                # can add the missing import (reworking the dead module itself
+                # can never make it imported).
+                target = next(iter(sorted(entrypoints))) if entrypoints else p
                 conflicts.append({
                     "type": "WIRING",
-                    "filepath": p,
-                    "task_id": files[p].task_id,
-                    "expected": "Module is imported by at least one other backend file",
+                    "filepath": target,
+                    "task_id": files[target].task_id if target in files else files[p].task_id,
+                    "expected": f"Module '{p}' is imported by at least one other backend file",
                     "actual": "never imported",
                     "reason": (
                         f"'{p}' is not imported by any other backend file — it is dead "
@@ -1514,6 +1788,56 @@ class IntegrationAgent(BaseAgent):
                             f"service functions."
                         ),
                     })
+        return conflicts
+
+    def _check_router_prefixes(self, state: ProjectState) -> list[dict]:
+        """
+        A9 (WIRING) — a router mounted under app.include_router(prefix=...) that
+        ALSO declares its own APIRouter(prefix=...) produces doubled served
+        paths (e.g. '/api' + '/api/todos' → '/api/api/todos'). Flag the router
+        file so rework removes one of the two prefixes; contracts can then be
+        satisfied at the canonical path.
+        """
+        conflicts: list[dict] = []
+        files = state.code_manifest.files
+        include_prefixes: set[str] = set()
+        for p in files:
+            if files[p].agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, files.get(p), state)
+            if not code:
+                continue
+            for m in re.finditer(r"include_router\s*\([^)]*?prefix\s*=\s*['\"]([^'\"]+)['\"]", code):
+                include_prefixes.add(m.group(1).rstrip("/"))
+        if not include_prefixes:
+            return conflicts
+
+        for p in files:
+            fm = files[p]
+            if fm.agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, fm, state)
+            if not code or "APIRouter" not in code:
+                continue
+            for m in re.finditer(r"APIRouter\s*\([^)]*?prefix\s*=\s*['\"]([^'\"]+)['\"]", code):
+                rp = m.group(1).rstrip("/")
+                for ip in include_prefixes:
+                    if rp != ip and not rp.startswith(ip + "/"):
+                        continue
+                    conflicts.append({
+                        "type": "WIRING",
+                        "filepath": p,
+                        "task_id": fm.task_id,
+                        "expected": f"Router mounted under include_router(prefix='{ip}') without its own prefix",
+                        "actual": f"duplicate prefix: APIRouter(prefix='{rp}')",
+                        "reason": (
+                            f"'{p}' declares APIRouter(prefix='{rp}') while the layer mounts it via "
+                            f"include_router(prefix='{ip}') — every route is served under the doubled "
+                            f"path '{ip}{rp}'. Remove the router's own prefix (keep bare paths like "
+                            f"'/todos') and let the include_router prefix supply the API root."
+                        ),
+                    })
+                    break
         return conflicts
 
     def _check_frontend_backend_contracts(self, state: ProjectState) -> list[dict]:
@@ -1701,10 +2025,17 @@ class IntegrationAgent(BaseAgent):
             for c in sorted(used):
                 if c in css_classes:
                     continue
+                # Attribute to a CSS file — the only place the class can be
+                # defined. (Attributing to app.js/index.html just reworked the
+                # wrong file forever.)
+                css_target = css_paths[0] if css_paths else (
+                    p if any(c in (html_code.get(p, "") or "") for p in html_code)
+                    else (js_paths[0] if js_paths else html_paths[0])
+                )
                 conflicts.append({
                     "type": "FRONTEND_DOM",
-                    "filepath": p if any(c in (html_code.get(p, "") or "") for p in html_code) else (js_paths[0] if js_paths else html_paths[0]),
-                    "task_id": "unknown",
+                    "filepath": css_target,
+                    "task_id": files.get(css_target).task_id if css_target in files else "unknown",
                     "expected": f"CSS class '.{c}'",
                     "actual": "undefined in CSS",
                     "reason": (
@@ -1718,11 +2049,18 @@ class IntegrationAgent(BaseAgent):
         loaded: set[str] = set()
         for p in html_paths:
             code = html_code.get(p, "")
+            layer = layer_root_for(p)
             for m in re.finditer(r"(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", code):
                 ref = m.group(1)
                 if ref.startswith(("http://", "https://", "//", "data:", "#")) or "{{" in ref:
                     continue
-                base_dir = os.path.dirname(p)
+                if ref.startswith("/"):
+                    # Web-root-relative reference — resolve against the layer root
+                    # (output/frontend/ for index.html → /static/... works).
+                    base_dir = layer or os.path.dirname(p)
+                    ref = ref.lstrip("/")
+                else:
+                    base_dir = os.path.dirname(p)
                 loaded.add(os.path.normpath(os.path.join(base_dir, ref)).replace("\\", "/"))
         for p in list(js_paths) + list(css_paths):
             fm = files.get(p)
@@ -1838,7 +2176,9 @@ class IntegrationAgent(BaseAgent):
             ("startup-assets", self._check_startup_assets),
             ("model-schema", self._check_model_schema_consistency),
             ("layer-wiring", self._check_layer_wiring),
+            ("router-prefixes", self._check_router_prefixes),
             ("frontend-backend", self._check_frontend_backend_contracts),
+            ("contract-coverage", self._check_contract_coverage),
             ("frontend-dom", self._check_frontend_dom),
             ("file-set", self._check_file_set),
             ("file-corruption", self._check_file_corruption),
@@ -2153,11 +2493,23 @@ class IntegrationAgent(BaseAgent):
             return [{"line": 0, "col": 0, "msg": f"parse failure: {exc}", "src_line": ""}]
 
     @staticmethod
+    def _looks_like_esm(code: str) -> bool:
+        """True when the code uses top-level ESM syntax (import/export), which
+        node's stdin `--check` only accepts with --input-type=module."""
+        return bool(re.search(
+            r"(^|\n)\s*(export\s+(default\s+)?(const|let|var|function|class|async\s+function|\{|\*)|"
+            r"import\s+(type\s+)?['\"\w*{}])",
+            code,
+        ))
+
+    @staticmethod
     def _syntax_check_js(code: str, node_bin: str) -> list[dict]:
-        """`node --check` via stdin — pure syntax validation, no npm/node_modules/disk."""
+        """`node --check` via stdin — pure syntax validation, no npm/node_modules/disk.
+        ESM-style files (import/export) are checked as ES modules, plain files as CJS."""
+        cmd = [node_bin, "--input-type=module", "--check"] if IntegrationAgent._looks_like_esm(code) else [node_bin, "--check"]
         try:
             proc = subprocess.run(
-                [node_bin, "--check"],
+                cmd,
                 input=code,
                 capture_output=True,
                 text=True,
@@ -2321,8 +2673,22 @@ class IntegrationAgent(BaseAgent):
 
         # Phase 1E — refusals recorded by the coding agents' safe-write guard
         # (corrupted content that never reached disk). Converted into
-        # FILE_CORRUPTION conflicts that route straight back for REWORK.
+        # FILE_CORRUPTION conflicts that route straight back for REWORK. A
+        # refusal is only meaningful while the file is still missing/corrupt:
+        # once the file holds clean content, its old refusal records are stale
+        # and must not keep the file in an endless rework loop.
         refused = list(getattr(ps, "corrupt_writes", []) or [])
+        if refused:
+            fresh_paths: set[str] = set()
+            for fp, fm in (getattr(ps, "code_manifest", None) or {}).files.items():
+                code = get_file_code(fp, fm, ps)
+                if code and not detect_corruption(code, fp):
+                    fresh_paths.add(fp)
+            if fresh_paths:
+                ps.corrupt_writes[:] = [
+                    c for c in refused if _extract_refused_filepath(c) not in fresh_paths
+                ]
+                refused = list(ps.corrupt_writes)
         if refused:
             logger.warning("[IntegrationAgent] %d corrupted write(s) refused by coding agents.", len(refused))
             seen_refused: set[str] = set()
@@ -2341,9 +2707,22 @@ class IntegrationAgent(BaseAgent):
 
         # Phase 2 — batched LLM repair on static/contract conflicts only.
         # SYNTAX / IMPORT_NAME conflicts bypass the LLM (REWORK_ONLY_TYPES).
-        llm_repairable = [c for c in conflicts if c.get("type") not in REWORK_ONLY_TYPES]
+        # Files already past their rework cap are excluded so repair tokens are
+        # never spent on files we have already given up on.
+        rework_file_max = int(getattr(ps, "rework_file_max", 0) or 0)
+        manifest_paths = set(ps.code_manifest.files.keys())
+        over_limit: set[str] = set()
+        if rework_file_max:
+            over_limit = {
+                f for f, n in (getattr(ps, "rework_failures", {}) or {}).items()
+                if f in manifest_paths and n > rework_file_max
+            }
+        llm_repairable = [
+            c for c in conflicts
+            if c.get("type") not in REWORK_ONLY_TYPES and c.get("filepath") not in over_limit
+        ]
         if llm_repairable:
-            max_repair_rounds = 2
+            max_repair_rounds = 3
             for round_idx in range(max_repair_rounds):
                 logger.info(
                     "[IntegrationAgent] Repair round %d/%d — %d conflicts. Running batched LLM repair…",
@@ -2356,9 +2735,13 @@ class IntegrationAgent(BaseAgent):
 
                 applied = self._apply_repairs(ps, repairs, llm_repairable)
                 conflicts = self._run_deterministic_checks(ps)
+                conflicts = conflicts + self._run_phase_a_checks(ps)
                 conflicts = conflicts + self._run_syntax_smoke(ps)
 
-                llm_repairable = [c for c in conflicts if c.get("type") not in REWORK_ONLY_TYPES]
+                llm_repairable = [
+                    c for c in conflicts
+                    if c.get("type") not in REWORK_ONLY_TYPES and c.get("filepath") not in over_limit
+                ]
                 if not llm_repairable:
                     break
                 if not applied:
@@ -2372,22 +2755,27 @@ class IntegrationAgent(BaseAgent):
         ]
 
         # Group truly-unresolved conflicts by owning agent for the graph REWORK edge.
-        # Files that have failed more than `rework_file_max` rounds stop routing
-        # back (they stay listed in `conflicts` for the run summary) so a single
-        # stubborn file cannot consume the remaining global rounds.
+        # Files that have failed more than `rework_file_max` ROUNDS (counted once
+        # per integration run, not once per conflict line) stop routing back (they
+        # stay listed in `conflicts` for the run summary) so a single stubborn
+        # file cannot consume the remaining global rounds.
         conflicts_by_agent: dict[str, list[str]] = {}
         rework_targets: dict[str, list[str]] = {}
-        rework_file_max = int(getattr(ps, "rework_file_max", 0) or 0)
+        counted: set[str] = set()
         for c, c_str in zip(conflicts, conflict_strings):
             fpath = c.get("filepath", "")
-            fails = int(ps.rework_failures.get(fpath, 0) or 0) + 1
-            ps.rework_failures[fpath] = fails
-            if rework_file_max and fails > rework_file_max:
-                logger.warning(
-                    "[IntegrationAgent] Giving up on %s after %d failed round(s) — left unresolved in the run summary.",
-                    fpath, fails,
-                )
-                continue
+            if fpath in manifest_paths:
+                if fpath not in counted:
+                    counted.add(fpath)
+                    fails = int(ps.rework_failures.get(fpath, 0) or 0) + 1
+                    ps.rework_failures[fpath] = fails
+                    if rework_file_max and fails == rework_file_max + 1:
+                        logger.warning(
+                            "[IntegrationAgent] Giving up on %s after %d failed round(s) — left unresolved in the run summary.",
+                            fpath, fails,
+                        )
+                if rework_file_max and int(ps.rework_failures.get(fpath, 0) or 0) > rework_file_max:
+                    continue
             fm = ps.code_manifest.files.get(fpath)
             agent = fm.agent if fm else "backend"
             if "frontend" in fpath:
@@ -2431,6 +2819,59 @@ if __name__ == "__main__":
     assert count_passed_arguments("a, fn(b, c), d") == 3
     assert count_passed_arguments("'a, b', c") == 2
     assert count_passed_arguments("") == 0
+
+    # \u2500\u2500 1b. Balanced call extraction: nested parens + multiline + def-skip \u2500\u2500
+    nested = (
+        "class S:\n  def f(self):\n    return TodoResponse(\n        id=str(db_todo.id),\n"
+        "        title=todo.title,\n        description=todo.description,\n        completed=todo.completed,\n"
+        "        created_at=todo.created_at.isoformat(),\n        updated_at=todo.updated_at.isoformat()\n    )\n"
+        "def TodoResponse(x): return x\n"
+        "TodoResponse(1, 2)\n"
+    )
+    args_list = extract_call_arg_strings(nested, "TodoResponse")
+    assert len(args_list) == 2, args_list
+    assert count_passed_arguments(args_list[0]) == 6, count_passed_arguments(args_list[0])
+    assert count_passed_arguments(args_list[1]) == 2
+    assert extract_call_arg_strings("s.log(fn(a, b), c);", "log") == ["fn(a, b), c"]
+
+    # \u2500\u2500 1c. normalize_api_path: {x:path} catch-alls, param-name irrelevance \u2500\u2500
+    assert normalize_api_path("/static/{file_path:path}") == "/static"
+    assert normalize_api_path("/todos/{id}") == normalize_api_path("/todos/{todo_id}")
+    assert normalize_api_path("/api/todos/{id}") != normalize_api_path("/todos")
+
+    # \u2500\u2500 1c-bis. extract_actual_definitions: export async function, schema subclasses \u2500\u2500
+    assert "fetchTodos" in extract_actual_definitions(
+        "export async function fetchTodos() {\n  return await fetch('/todos');\n}\n", "x.js")
+    assert "TodoItemCreate" in parse_pydantic_schemas(
+        "class TodoBase(BaseModel):\n    title: str\nclass TodoItemCreate(TodoBase):\n    pass\n")
+
+    # \u2500\u2500 1c-ter. layer-root-prefixed imports (`backend.schemas.todo`) resolve \u2500\u2500
+    assert resolve_import_path(
+        "backend.schemas.todo", "output/backend/api/routes/todo.py",
+        ["output/backend/schemas/todo.py"], {"output"}) == "output/backend/schemas/todo.py"
+    assert resolve_import_path(
+        "backend.models.todo", "output/backend/api/routes/todo.py",
+        ["output/backend/schemas/todo.py"], {"output"}) is None
+
+    # ── 1d. Multiline parenthesized `from x import (\n a,\n b,\n)` parses ──
+    ml = parse_python_imported_names(
+        "from ..services.todo import (\n    create_todo_service,\n    get_all_todos_service,\n"
+        "    TodoCreate as TC,\n    TodoItem,\n)\n"
+    )
+    assert ml == [("..services.todo", ["create_todo_service", "get_all_todos_service",
+                                       "TodoCreate", "TodoItem"], False)], ml
+    assert parse_python_imported_names("from x import (a, b)\n") == [("x", ["a", "b"], False)]
+    print("[PASS] parse_python_imported_names — multiline parenthesized imports (no '(' junk)")
+
+    # \u2500\u2500 1d. match_backend_route api-prefix tolerance (coverage-only) \u2500\u2500
+    routes = [{"method": "GET", "path": "/todos", "prefixed": False, "static": False},
+              {"method": "GET", "path": "/static", "static": True, "is_mount": True}]
+    r, _ = match_backend_route("/api/todos", "GET", routes, allow_api_prefix=True)
+    assert r is not None
+    r, _ = match_backend_route("/api/todos", "GET", routes, allow_api_prefix=False)
+    assert r is None, "strict matching must reject the api-prefixed path"
+    r, _ = match_backend_route("/static", "GET", routes)
+    assert r is not None and r.get("is_mount")
     print("[PASS] count_passed_arguments — complex nested cases correct")
 
     # ── 2. Mock integration check run ─────────────────────────────────────────
@@ -2547,6 +2988,182 @@ export const LoginPage = () => {
     assert {"App", "API_URL"} <= js_defs, js_defs
     print("[PASS] extract_actual_definitions — module-level constants + bare default export")
 
+    # ── 5a. Type-set consistency (Union / Optional / nullable tolerance) ────
+    assert check_type_consistency("description", "string|null",
+                                  "class Todo:\n    description: Union[str, None] = None\n") is None
+    assert check_type_consistency("description", "string",
+                                  "class Todo:\n    description: Optional[str] = None\n") is None
+    assert check_type_consistency("description", "string|null",
+                                  "class Todo:\n    description: str | None = None\n") is None
+    assert check_type_consistency("description", "boolean",
+                                  "class Todo:\n    description: str = ''\n") is not None
+    assert check_type_consistency("count", "integer",
+                                  "class Todo:\n    count: int = 0\n") is None
+    assert check_type_consistency("content", "string",
+                                  "body { justify-content: space-between; }\n") is not None, \
+        "CSS property-like text must not satisfy a field check"
+    assert check_type_consistency("missing_field", "string", "x = 1\n") is not None
+    print("[PASS] check_type_consistency — Union/Optional/|, nullable tolerance, no CSS false matches")
+
+    # ── 5a-bis. Fetch parser: base-member resolution, no {id}/{id} duplication ──
+    fe = parse_frontend_fetches(
+        "class A {\n  constructor() { this.API_BASE_URL = '/api/todos'; }\n"
+        "  async del(id) { await fetch(`${this.API_BASE_URL}/${id}`, { method: 'DELETE' }); }\n"
+        "  async list() { await fetch(this.API_BASE_URL, { method: 'GET' }); }\n"
+        "  async patch(id) { await fetch(`/api/todos/${id}`, { method: 'PATCH', body: JSON.stringify({ title: 'x' }) }); }\n}\n"
+    )
+    paths = {(f["path"], f["method"]) for f in fe}
+    assert ("/api/todos/{id}", "DELETE") in paths, paths
+    assert ("/api/todos", "GET") in paths, paths
+    assert ("/api/todos/{id}", "PATCH") in paths, paths
+    assert not any("/{id}/{id}" in p for p, _ in paths), paths
+    assert any("title" in f["body_keys"] for f in fe)
+    fe_dyn = parse_frontend_fetches("fetch(`${this.UNKNOWN_BASE}/x`, { method: 'GET' });\n")
+    assert fe_dyn and fe_dyn[0]["path"] == "/x", fe_dyn
+    print("[PASS] parse_frontend_fetches — this.API_BASE_URL member, bare identifiers, no {id}/{id} junk")
+
+    # ── 5b. Contract coverage: mounts satisfy HTML contracts; non-code files immune ──
+    from core.state import APIContract as APIContractSchema
+    state4 = ProjectState(project_id="int-test4", project_name="Int Test 4")
+    fm_main = FileManifest(agent="backend", task_id="be-m", filepath="app/main.py",
+                           purpose="Main", exports=["app"], written=True)
+    fm_model = FileManifest(agent="backend", task_id="be-model", filepath="app/models/todo.py",
+                            purpose="Todo", exports=["TodoCreate"], written=True,
+                            classes=[ClassName(name="TodoCreate", arguments=[], docstring="")])
+    fm_readme = FileManifest(agent="backend", task_id="be-r", filepath="app/README.md",
+                             purpose="Docs", exports=["readme"], written=True)
+    fm_fe = FileManifest(agent="frontend", task_id="fe-a", filepath="app/static/app.js",
+                         purpose="UI", exports=[], written=True)
+    state4.code_manifest = CodeManifest(files={
+        "app/main.py": fm_main, "app/models/todo.py": fm_model,
+        "app/README.md": fm_readme, "app/static/app.js": fm_fe,
+    })
+    state4.architecture = ArchData(
+        tech_stack={"backend": "FastAPI", "frontend": "vanilla JS"},
+        api_contracts=[
+            APIContractSchema(method="GET", path="/", auth_required=False,
+                              description="Serve the page", request_body={},
+                              response_body={"content": "string (HTML)"}),
+            APIContractSchema(method="POST", path="/todos", auth_required=False,
+                              description="Create a todo", request_body={"description": "string|null"},
+                              response_body={}),
+            APIContractSchema(method="DELETE", path="/todos/{id}", auth_required=False,
+                              description="Delete a todo", request_body={}, response_body={}),
+        ],
+    )
+    code_main4 = """\
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+app = FastAPI()
+app.mount("", StaticFiles(directory="app/static", html=True), name="frontend")
+@app.post("/todos")
+async def create_todo(todo: TodoCreate):
+    return {"ok": True}
+"""
+    code_model4 = """\
+from pydantic import BaseModel
+class TodoCreate(BaseModel):
+    description: Optional[str] = None
+"""
+    code_readme4 = "GET / returns the app page. content served as html.\n"
+    code_fe4 = """\
+fetch('/todos', { method: 'POST', body: JSON.stringify({ description: 'x' }) });
+"""
+    state4.generated_code = CodeMap(
+        backend={"app/main.py": code_main4, "app/models/todo.py": code_model4, "app/README.md": code_readme4},
+        frontend={"app/static/app.js": code_fe4},
+    )
+    agent4 = IntegrationAgent(provider=MockLLM())
+    agent4.run(state4)
+    missing = [c for c in state4.integration.conflicts if "DELETE /todos" in c]
+    assert len(missing) == 1 and "not implemented in any backend file" in missing[0], \
+        state4.integration.conflicts
+    assert not any("README" in c or "app/static/app.js" in c for c in state4.integration.conflicts), \
+        "README/css/js must not be scanned as backend route implementations"
+    assert not any("Trailing slash" in c or "GET /" in c for c in state4.integration.conflicts), \
+        "Static mount must satisfy the HTML-serving GET / contract"
+    print("[PASS] _check_contract_coverage — mounts satisfy HTML contracts, non-code files immune, missing endpoint flagged")
+
+    # Add the missing DELETE route → must merge cleanly.
+    code_main4b = ("from app.models.todo import TodoCreate\n" + code_main4
+                   + "@app.delete('/todos/{todo_id}') \nasync def delete_todo(todo_id: str):\n    return {'deleted': True}\n")
+    state4.generated_code.backend["app/main.py"] = code_main4b
+    agent4.run(state4)
+    assert state4.integration.merged, state4.integration.conflicts
+    print("[PASS] _check_contract_coverage — full contract set satisfied parses to clean merge")
+
+    # ── 5c. Give-up counts rounds, not conflict lines ──────────
+    state5 = ProjectState(project_id="int-test5", project_name="Int Test 5",
+                          rework_file_max=2)
+    fm_x = FileManifest(agent="backend", task_id="be-x", filepath="app/stubborn.py",
+                        purpose="Stubborn", exports=["thing"], written=True)
+    state5.code_manifest = CodeManifest(files={
+        "app/stubborn.py": fm_x,
+    })
+    state5.generated_code = CodeMap(backend={
+        "app/stubborn.py": "from app.models import A, B, C\n",
+    })
+    agent5 = IntegrationAgent(provider=MockLLM())
+    agent5.run(state5)
+    assert state5.rework_failures.get("app/stubborn.py", 0) == 1, \
+        "One round with 3 conflict lines must count as ONE failed round"
+    assert "app/stubborn.py" in state5.integration.rework_targets
+    agent5.run(state5)  # round 2 — still under the cap (2)
+    assert state5.rework_failures.get("app/stubborn.py", 0) == 2, state5.rework_failures
+    assert "app/stubborn.py" in state5.integration.rework_targets
+    agent5.run(state5)  # round 3 — past the cap: excluded from routing
+    assert state5.rework_failures.get("app/stubborn.py", 0) == 3
+    assert "app/stubborn.py" not in state5.integration.rework_targets, state5.integration.rework_targets
+    assert not any("backend" in a for a in state5.integration.conflicts_by_agent), \
+        state5.integration.conflicts_by_agent
+    print("[PASS] Give-up counting — rounds not lines; excluded from rework at cap+1")
+
+    # ── 4b. Layer-name imports (`api.routes`, `app.models`, ...) are internal ──
+    state_layer = ProjectState(project_id="int-layer", project_name="Layer")
+    fm_main = FileManifest(agent="backend", task_id="be-a", filepath="app/main.py",
+                           purpose="main", exports=["app"], written=True)
+    state_layer.code_manifest = CodeManifest(files={"app/main.py": fm_main})
+    state_layer.generated_code = CodeMap(backend={"app/main.py": "from api.routes import router\n"})
+    IntegrationAgent(provider=MockLLM()).run(state_layer)
+    layer_conflicts = [c for c in state_layer.integration.conflicts if "api.routes" in c]
+    assert layer_conflicts and all("cannot be resolved" in c for c in layer_conflicts), \
+        state_layer.integration.conflicts
+    # A real third-party import must NOT be flagged.
+    state_layer.generated_code = CodeMap(backend={"app/main.py": "import requests\n"})
+    IntegrationAgent(provider=MockLLM()).run(state_layer)
+    assert not any("requests" in c for c in state_layer.integration.conflicts), \
+        state_layer.integration.conflicts
+    print("[PASS] Layer-name imports flagged unresolved; third-party imports left alone")
+
+    # ── 4c. Doubled API prefix (include_router + APIRouter prefix) flagged ──
+    state_pfx = ProjectState(project_id="int-pfx", project_name="Pfx")
+    fm_main = FileManifest(agent="backend", task_id="be-main", filepath="output/backend/main.py",
+                           purpose="main", exports=["app"], written=True)
+    fm_rtr = FileManifest(agent="backend", task_id="be-rtr", filepath="output/backend/routers/todo.py",
+                          purpose="todo router", exports=["router"], written=True)
+    state_pfx.code_manifest = CodeManifest(files={"output/backend/main.py": fm_main,
+                                                  "output/backend/routers/todo.py": fm_rtr})
+    state_pfx.generated_code = CodeMap(backend={
+        "output/backend/main.py": "app.include_router(todo_router, prefix='/api', tags=['todos'])\n",
+        "output/backend/routers/todo.py":
+            "router = APIRouter(prefix='/api/todos', tags=['todos'])\n"
+            "@router.get('')\nasync def read_todos(): return []\n",
+    })
+    agent_pfx = IntegrationAgent(provider=MockLLM())
+    pfx_conflicts = [c for c in agent_pfx._check_router_prefixes(state_pfx)
+                     if "duplicate prefix" in str(c.get("actual", ""))]
+    assert pfx_conflicts and pfx_conflicts[0]["filepath"] == "output/backend/routers/todo.py", \
+        pfx_conflicts
+    # Router WITHOUT its own prefix is clean.
+    state_pfx.generated_code = CodeMap(backend={
+        "output/backend/main.py": "app.include_router(todo_router, prefix='/api', tags=['todos'])\n",
+        "output/backend/routers/todo.py":
+            "router = APIRouter(tags=['todos'])\n@router.get('/todos')\nasync def read_todos(): return []\n",
+    })
+    assert not any("duplicate prefix" in str(c.get("actual", ""))
+                   for c in agent_pfx._check_router_prefixes(state_pfx))
+    print("[PASS] Doubled API prefix flagged on the router; clean prefix stays clean")
+
     # ── 5. Syntax smoke helpers ──────────────────────────────────────────────
     assert IntegrationAgent._syntax_check_python("def f(:\n    pass\n"), "expected a SyntaxError from broken python"
     errs = IntegrationAgent._syntax_check_python("def f(:\n    pass\n")
@@ -2556,6 +3173,12 @@ export const LoginPage = () => {
     if node_bin:
         assert IntegrationAgent._syntax_check_js("const x = 1;\n", node_bin) == []
         assert IntegrationAgent._syntax_check_js("const x = ;\n", node_bin), "expected a SyntaxError from broken js"
+        assert IntegrationAgent._syntax_check_js("export const x = 1;\n", node_bin) == [], \
+            "ESM module syntax must parse under --input-type=module"
+        assert IntegrationAgent._syntax_check_js("export const x = ;\n", node_bin), \
+            "broken ESM must still be a SyntaxError"
+        assert IntegrationAgent._looks_like_esm("import { x } from './x';\n")
+        assert not IntegrationAgent._looks_like_esm("const x = require('x');\n")
     else:
         print("[WARN] node unavailable — skipping node --check assertions")
     print("[PASS] Syntax smoke helpers — ast.parse + node --check")

@@ -399,6 +399,111 @@ def _inject_scaffold_tasks(
     return next_tasks, next_manifest
 
 
+def _inject_router_task(
+    tasks: list[Task],
+    manifest_files: dict[str, FileManifest],
+    arch: Any,
+) -> tuple[list[Task], dict[str, FileManifest]]:
+    """
+    Deterministically commit to an API-route module whenever the architecture
+    declares API contracts but the planned file set contains no router-shaped
+    file (Problem-2 guard: main.py must register routers that actually exist).
+
+    Created only when ALL hold:
+      - at least one backend task exists (a FastAPI layer),
+      - arch.api_contracts is non-empty,
+      - no existing backend file already looks router-shaped
+        (paths containing /api/, /routers/, /routes/, or router-style basenames).
+
+    The router task depends on every other backend task (runs last in its
+    layer) and the backend entrypoint's depends_on is re-wired to include it,
+    so main.py always registers this module and deviations are caught by the
+    FILE_SET / import checks in the integration agent.
+    """
+    if not arch or not getattr(arch, "api_contracts", None):
+        return tasks, manifest_files
+    backend_task_ids = [t.id for t in tasks if t.agent == "backend"]
+    if not backend_task_ids:
+        return tasks, manifest_files
+
+    backend_root = _detect_backend_root(manifest_files) or "output/backend/"
+    be_prefix = backend_root.rstrip("/") + "/"
+
+    def _router_shaped(path: str) -> bool:
+        base = path.split("/")[-1]
+        return (
+            "/api/" in path or path.endswith("/api")
+            or "/routers/" in path or "/routes/" in path
+            or base in ("routes.py", "router.py", "api.py")
+            or base.startswith("r_")
+            or base.endswith("_routes.py") or base.endswith("_router.py")
+        )
+
+    if any(p.startswith(be_prefix) and _router_shaped(p) for p in manifest_files):
+        return tasks, manifest_files
+
+    existing_ids = {t.id for t in tasks}
+    next_tasks = list(tasks)
+    next_manifest = dict(manifest_files)
+
+    def _next_id(prefix: str) -> str:
+        n = 900
+        while f"{prefix}-{n:03d}" in existing_ids:
+            n += 1
+        return f"{prefix}-{n:03d}"
+
+    # Module name from the first contract path segment (e.g. /api/todos → todos).
+    module_name = ""
+    for c in arch.api_contracts:
+        segs = [s for s in c.path.strip("/").split("/") if s and s != "api"]
+        cand = re.sub(r"[^a-zA-Z0-9_]", "", segs[0]) if segs else ""
+        if cand:
+            module_name = cand
+            break
+    module_name = module_name or "api"
+
+    router_path = f"{backend_root}api/routes/{module_name}.py"
+    if router_path in next_manifest:
+        return tasks, manifest_files
+
+    contracts_block = "\n".join(
+        f"- {c.method.upper()} {c.path}  "
+        f"request={c.request_body or None}  response={c.response_body or None}"
+        for c in arch.api_contracts
+    )
+    tid = _next_id("be")
+    existing_ids.add(tid)
+    next_tasks.append(Task(
+        id=tid, agent="backend",
+        title=f"FastAPI router ({module_name})",
+        description=(
+            f"Router module implementing the app's entire API surface. "
+            f"Create thin HTTP handlers for EVERY contract below (verb + path + "
+            f"request/response fields must match exactly) and DELEGATE data access "
+            f"to the services layer — never inline business logic. "
+            f"Export the APIRouter instance as 'router' (it is registered by "
+            f"main.py).\nContracts:\n{contracts_block}"
+        ),
+        depends_on=[t.id for t in tasks if t.agent == "backend"],
+        priority=AGENT_PRIORITY["backend"], status="pending",
+    ))
+    next_manifest[router_path] = FileManifest(
+        agent="backend", task_id=tid, filepath=router_path,
+        purpose="FastAPI router — implements every documented API contract, delegating to the services layer.",
+        exports=["router"],
+    )
+
+    # Backend entrypoint must depend on (and thus run after) the router task.
+    be_main = f"{backend_root}main.py"
+    main_fm = next_manifest.get(be_main)
+    if main_fm:
+        for t in next_tasks:
+            if t.id == main_fm.task_id and tid not in t.depends_on:
+                t.depends_on = t.depends_on + [tid]
+
+    return next_tasks, next_manifest
+
+
 def _inject_project_files(
     tasks: list[Task],
     manifest_files: dict[str, FileManifest],
@@ -631,6 +736,10 @@ class PlannerAgent(BaseAgent):
         # Inject mandatory wiring/scaffold tasks (Problem 2) — run last per agent.
         tasks, manifest_files = _inject_scaffold_tasks(tasks, manifest_files)
 
+        # Commit to an API-route module whenever API contracts exist but no
+        # router shape was planned (main.py must register routers that exist).
+        tasks, manifest_files = _inject_router_task(tasks, manifest_files, arch)
+
         # Inject the committed project-scaffolding file set (Phase C3) and
         # record it on state so the integration agent can enforce it (FILE_SET).
         tasks, manifest_files, required_files = _inject_project_files(tasks, manifest_files)
@@ -778,6 +887,42 @@ if __name__ == "__main__":
     assert cm.files["backend/app/routes/auth.py"].written is True
     assert cm.files["backend/app/routes/auth.py"].exports == ["router", "login"]
     print("[PASS] FileManifest/CodeManifest — planner exports preserved after mark_written")
+
+    # ── _inject_router_task ─────────────────────────────────────────────────────
+    from core.state import ArchData, APIContract
+    arch_w_contracts = ArchData(api_contracts=[
+        APIContract(method="GET", path="/api/todos", description="List"),
+        APIContract(method="POST", path="/api/todos", description="Create"),
+    ])
+    tasks_m = [_make_task("be-001", agent="backend")]
+    mf_m = {
+        "output/backend/services/todo.py": FileManifest(
+            agent="backend", task_id="be-001", filepath="output/backend/services/todo.py",
+            purpose="svc", exports=["svc"]),
+    }
+    t2, m2 = _inject_scaffold_tasks(tasks_m, mf_m)
+    t2, m2 = _inject_router_task(t2, m2, arch_w_contracts)
+    router_file = next(p for p in m2 if "/api/routes/" in p)
+    assert router_file == "output/backend/api/routes/todos.py", router_file
+    assert m2[router_file].exports == ["router"]
+    main_fm = m2["output/backend/main.py"]
+    main_task = next(t for t in t2 if t.id == main_fm.task_id)
+    router_tid = m2[router_file].task_id
+    assert router_tid in main_task.depends_on, main_task.depends_on
+    router_task = next(t for t in t2 if t.id == router_tid)
+    assert "be-001" in router_task.depends_on
+    assert "/api/todos" in router_task.description and "router" in m2[router_file].exports
+    print("[PASS] _inject_router_task — router committed w/ contracts, main.py rewired to depend on it")
+
+    mf_has_router = dict(mf_m)
+    mf_has_router["output/backend/api/routes/auth.py"] = FileManifest(
+        agent="backend", task_id="be-999", filepath="output/backend/api/routes/auth.py",
+        purpose="auth routes", exports=["router"])
+    t3, m3 = _inject_router_task(tasks_m, mf_has_router, arch_w_contracts)
+    assert set(m3) == set(mf_has_router), "no injection when a router shape already exists"
+    t4, m4 = _inject_router_task(tasks_m, mf_m, ArchData(api_contracts=[]))
+    assert set(m4) == set(mf_m), "no injection without API contracts"
+    print("[PASS] _inject_router_task — skipped when router exists or contracts absent")
 
     print("\n" + "=" * 60)
     print("All PlannerAgent smoke-tests PASSED")
