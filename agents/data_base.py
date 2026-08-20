@@ -371,7 +371,7 @@ class DatabaseAgent(BaseAgent):
                 if rework and current_code:
                     entries.append((fm.filepath, current_code, rework))
                     valid_tasks.append(t)
-            user_prompt = build_rework_batch_prompt(entries, output_key="migration_code")
+            user_prompt = build_rework_batch_prompt(entries, output_key="migration_code", manifest=manifest)
 
         filepaths = [fp for fp, _, _ in entries]
         logger.info("[DBAgent] Batch rework call: %s", filepaths)
@@ -476,8 +476,12 @@ class DatabaseAgent(BaseAgent):
             code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
             current_code = code_bucket.get(filepath, "")
             if rework and current_code:
-                # Lean REWORK path: send only the conflict notes + current file content.
-                user_prompt = build_rework_prompt(filepath, current_code, rework, output_key="migration_code")
+                # Lean REWORK path: conflict notes + current file content, plus the
+                # deterministic Import Contract + file tree for import/wiring rounds.
+                user_prompt = build_rework_prompt(
+                    filepath, current_code, rework, output_key="migration_code",
+                    manifest=state.code_manifest, task=task,
+                )
             else:
                 user_prompt = _build_file_prompt(
                     filepath, task, state.code_manifest, arch, db_tech, orm_block, rework_instructions=rework
@@ -725,6 +729,26 @@ if __name__ == "__main__":
     assert len(written_fm.classes[0].arguments) == 4, "Columns count mismatch"
     assert not state.errors, f"Unexpected errors: {state.errors}"
     print("[PASS] DatabaseAgent mock run — migration written, manifest in state classes, no errors")
+
+    # ── 4. Rework prompt ground truth (Phase 3) ───────────────────────────────
+    from agents.base import build_rework_prompt
+    db_manifest = CodeManifest(files={
+        "output/backend/db/models.py": FileManifest(
+            agent="database", task_id="db-x", filepath="output/backend/db/models.py",
+            purpose="ORM models", exports=["TodoItem"], written=True,
+        ),
+    })
+    db_conflict = (
+        "[WIRING] File: output/backend/db/models.py | duplicate foundation "
+        "definition 'engine' — re-export it from the canonical module"
+    )
+    db_rp = build_rework_prompt(
+        "output/backend/db/models.py",
+        "engine = create_engine('sqlite:///./app.db')\n",
+        db_conflict, manifest=db_manifest, output_key="migration_code",
+    )
+    assert "PROJECT FILE TREE" in db_rp and "db/models.py" in db_rp, db_rp
+    print("[PASS] Rework prompt ground truth — file tree injected for wiring rework (Phase 3)")
 
     # Cleanup
     import shutil

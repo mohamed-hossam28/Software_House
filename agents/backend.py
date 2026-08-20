@@ -380,7 +380,7 @@ class BackendAgent(BaseAgent):
                 if rework and current_code:
                     entries.append((fm.filepath, current_code, rework))
                     valid_tasks.append(t)
-            user_prompt = build_rework_batch_prompt(entries, output_key="code")
+            user_prompt = build_rework_batch_prompt(entries, output_key="code", manifest=manifest)
 
         filepaths = [fp for fp, _, _ in entries]
         logger.info("[BackendAgent] Batch rework call: %s", filepaths)
@@ -480,8 +480,12 @@ class BackendAgent(BaseAgent):
             current_code = code_bucket.get(filepath, "")
 
         if rework and current_code:
-            # Lean REWORK path: send only the conflict notes + current file content.
-            user_prompt = build_rework_prompt(filepath, current_code, rework, output_key="code")
+            # Lean REWORK path: conflict notes + current file content, plus the
+            # deterministic Import Contract + file tree for import/wiring rounds.
+            user_prompt = build_rework_prompt(
+                filepath, current_code, rework, output_key="code",
+                manifest=manifest, task=task,
+            )
         else:
             user_prompt = _build_file_prompt(file_manifest.filepath, manifest, arch, task, rework_instructions=rework)
 
@@ -768,4 +772,39 @@ if __name__ == "__main__":
     assert "`TodoItem`:" in pc_prompt and "is_completed: BOOLEAN" in pc_prompt
     assert build_pending_contracts(pc_manifest, "output/backend/db/models.py") == ""
     print("[PASS] _build_file_prompt — Pending Contracts section injected (Phase 2)")
+
+    # ── Test 4: Rework prompt ground truth (Phase 3) ──────────────────────────
+    from agents.base import build_rework_prompt, build_rework_batch_prompt
+    rtr_manifest = CodeManifest(files={
+        "output/backend/api/todo.py": FileManifest(
+            agent="backend", task_id="be-004", filepath="output/backend/api/todo.py",
+            purpose="router", exports=["router"],
+            imports_from={"output/backend/crud/todo.py": ["TodoService"]},
+            written=True,
+        ),
+        "output/backend/crud/todo.py": FileManifest(
+            agent="backend", task_id="be-003", filepath="output/backend/crud/todo.py",
+            purpose="crud", exports=["TodoService"], written=True,
+        ),
+    })
+    import_conflict = (
+        "[IMPORT_NAME] File: output/backend/api/todo.py | Import "
+        "'from backend.services.todo_service import TodoService' cannot be resolved"
+    )
+    rp = build_rework_prompt(
+        "output/backend/api/todo.py",
+        "from backend.services.todo_service import TodoService\n",
+        import_conflict, manifest=rtr_manifest,
+    )
+    assert "IMPORT CONTRACT" in rp and "from crud.todo import TodoService" in rp, rp
+    assert "PROJECT FILE TREE" in rp
+    syntax_conflict = "[SYNTAX] File: output/backend/api/todo.py | Syntax error line 3"
+    rp2 = build_rework_prompt("output/backend/api/todo.py", "x = 1\n", syntax_conflict, manifest=rtr_manifest)
+    assert "IMPORT CONTRACT" not in rp2, "pure-syntax rework must stay lean"
+    rbp = build_rework_batch_prompt(
+        [("output/backend/api/todo.py", "from backend.services.todo_service import TodoService\n", import_conflict)],
+        manifest=rtr_manifest,
+    )
+    assert "IMPORT CONTRACT" in rbp and "PROJECT FILE TREE" in rbp
+    print("[PASS] build_rework_prompt/batch — Import Contract + file tree appended for import/wiring rework only")
     print("=" * 60 + "\n")

@@ -351,7 +351,7 @@ class FrontendAgent(BaseAgent):
                 if rework and current_code:
                     entries.append((fm.filepath, current_code, rework))
                     valid_tasks.append(t)
-            user_prompt = build_rework_batch_prompt(entries, output_key="code")
+            user_prompt = build_rework_batch_prompt(entries, output_key="code", manifest=manifest)
 
         filepaths = [fp for fp, _, _ in entries]
         logger.info("[FrontendAgent] Batch rework call: %s", filepaths)
@@ -448,8 +448,12 @@ class FrontendAgent(BaseAgent):
         code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
         current_code = code_bucket.get(filepath, "")
         if rework and current_code:
-            # Lean REWORK path: send only the conflict notes + current file content.
-            user_prompt = build_rework_prompt(filepath, current_code, rework, output_key="code")
+            # Lean REWORK path: conflict notes + current file content, plus the
+            # deterministic Import Contract + file tree for import/wiring rounds.
+            user_prompt = build_rework_prompt(
+                filepath, current_code, rework, output_key="code",
+                manifest=manifest, task=task,
+            )
         else:
             user_prompt = _build_file_prompt(filepath, manifest, arch, frontend_tech, task, rework_instructions=rework)
         sys_prompt  = _build_system_prompt(frontend_tech)
@@ -696,6 +700,38 @@ if __name__ == "__main__":
     assert ":root" in state.generated_code.frontend["output/frontend/global.css"]
     assert not state.errors, f"Unexpected errors: {state.errors}"
     print("[PASS] FrontendAgent mock run — both files written, CSS present, no errors")
+
+    # ── 4. Rework prompt ground truth (Phase 3) ───────────────────────────────
+    from agents.base import build_rework_prompt, build_rework_batch_prompt
+    fe_manifest = CodeManifest(files={
+        "output/frontend/src/todoList.ts": FileManifest(
+            agent="frontend", task_id="fe-x", filepath="output/frontend/src/todoList.ts",
+            purpose="component", exports=["TodoList"], written=True,
+        ),
+        "output/frontend/src/app.ts": FileManifest(
+            agent="frontend", task_id="fe-y", filepath="output/frontend/src/app.ts",
+            purpose="app", exports=["renderApp"],
+            imports_from={"output/frontend/src/todoList.ts": ["TodoList"]},
+            written=True,
+        ),
+    })
+    fe_conflict = (
+        "[IMPORT_NAME] File: output/frontend/src/app.ts | Import "
+        "'./components/TodoList' in 'app.ts' cannot be resolved"
+    )
+    fe_rp = build_rework_prompt(
+        "output/frontend/src/app.ts",
+        "import { TodoList } from './components/TodoList';\n",
+        fe_conflict, manifest=fe_manifest,
+    )
+    assert "IMPORT CONTRACT" in fe_rp and "from './todoList'" in fe_rp, fe_rp
+    assert "PROJECT FILE TREE" in fe_rp
+    fe_batch = build_rework_batch_prompt(
+        [("output/frontend/src/app.ts", "import { TodoList } from './components/TodoList';\n", fe_conflict)],
+        manifest=fe_manifest,
+    )
+    assert "IMPORT CONTRACT" in fe_batch
+    print("[PASS] Rework prompt ground truth — frontend relative import contract injected (Phase 3)")
 
     # Cleanup test output dirs
     import shutil

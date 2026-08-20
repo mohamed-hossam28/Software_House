@@ -78,6 +78,11 @@ _LAYER_DIR_NAMES = frozenset({
 #: HTTP verbs that routers can declare.
 _HTTP_VERBS = ("get", "post", "put", "patch", "delete")
 
+#: DB foundation symbols that must be defined in EXACTLY ONE backend file.
+#: Two files defining them (e.g. db/models.py + db/init_db.py) create duplicate
+#: connections + two declarative bases and the import graph never converges.
+_FOUNDATION_SYMBOLS = ("engine", "Base", "SessionLocal")
+
 _REFUSED_FILEPATH_RE = re.compile(r"File:\s*([^\s|]+)")
 
 
@@ -637,6 +642,18 @@ def _normalize_output_path(filepath: str) -> str:
     if not rel.startswith("output/") and not rel.startswith("output\\") and rel != "output":
         return f"output/{rel}"
     return rel
+
+
+def _module_path_for(src: str) -> str:
+    """Layer-root-relative dotted Python module for a manifest path:
+    'output/backend/db/models.py' → 'db.models'; 'output/backend/db/__init__.py' → 'db'."""
+    root = layer_root_for(src)
+    rel = src[len(root):] if root and src.startswith(root) else src.lstrip("/").lstrip("\\")
+    if rel.endswith(".py"):
+        rel = rel[:-3]
+    if rel.endswith("/__init__"):
+        rel = rel[: -len("/__init__")].rstrip("/")
+    return rel.replace("/", ".").replace("\\", ".")
 
 
 def get_file_code(filepath: str, fm: FileManifest, state: ProjectState) -> str:
@@ -1899,6 +1916,72 @@ class IntegrationAgent(BaseAgent):
                     break
         return conflicts
 
+    def _check_duplicate_foundation(self, state: ProjectState) -> list[dict]:
+        """
+        Phase 3 (WIRING) — two+ backend files defining the same DB foundation
+        symbol (engine / Base / SessionLocal) produce duplicate connections and
+        two declarative bases; the import graph can never converge. Flag the
+        non-canonical file so the owning agent removes the duplicate definition
+        and imports the symbol from the canonical module instead.
+        """
+        conflicts: list[dict] = []
+        files = state.code_manifest.files
+        owners: dict[str, list[str]] = {s: [] for s in _FOUNDATION_SYMBOLS}
+        for p in files:
+            fm = files[p]
+            if fm.agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, fm, state)
+            if not code:
+                continue
+            for sym in _FOUNDATION_SYMBOLS:
+                if re.search(r"^" + sym + r"\s*=", code, re.MULTILINE):
+                    owners[sym].append(p)
+
+        for sym, paths in owners.items():
+            if len(paths) < 2:
+                continue
+            canonical = self._canonical_foundation_file(state, paths)
+            mod = _module_path_for(canonical)
+            for p in paths:
+                if p == canonical:
+                    continue
+                conflicts.append({
+                    "type": "WIRING",
+                    "filepath": p,
+                    "task_id": files[p].task_id,
+                    "expected": f"'{sym}' defined once (in '{canonical}')",
+                    "actual": "duplicate foundation definition",
+                    "reason": (
+                        f"'{p}' redefines '{sym}' which is already defined in '{canonical}'. "
+                        f"DB foundation modules must define engine/Base/SessionLocal ONCE — "
+                        f"remove the duplicate definition here and import it: "
+                        f"'from {mod} import {sym}'."
+                    ),
+                })
+        return conflicts
+
+    def _canonical_foundation_file(self, state: ProjectState, paths: list[str]) -> str:
+        """
+        Deterministic pick of the single file that owns DB foundation symbols:
+        a dedicated foundation module name first (session.py / database.py /
+        db.py / base.py / init_db.py), then the file defining the most
+        foundation symbols, then the lexicographically smallest path.
+        """
+        dedicated = {"session.py", "database.py", "db.py", "base.py", "init_db.py"}
+        for p in sorted(paths):
+            if os.path.basename(p).lower() in dedicated:
+                return p
+
+        def count(p: str) -> int:
+            code = get_file_code(p, state.code_manifest.files.get(p), state)
+            return sum(
+                1 for s in _FOUNDATION_SYMBOLS
+                if code and re.search(r"^" + s + r"\s*=", code, re.MULTILINE)
+            )
+
+        return max(paths, key=lambda p: (count(p), -len(p), p))
+
     def _check_frontend_backend_contracts(self, state: ProjectState) -> list[dict]:
         """
         A4 (FRONTEND_HTTP) — frontend fetch calls must match the backend's ACTUAL
@@ -2236,6 +2319,7 @@ class IntegrationAgent(BaseAgent):
             ("model-schema", self._check_model_schema_consistency),
             ("layer-wiring", self._check_layer_wiring),
             ("router-prefixes", self._check_router_prefixes),
+            ("duplicate-foundation", self._check_duplicate_foundation),
             ("frontend-backend", self._check_frontend_backend_contracts),
             ("contract-coverage", self._check_contract_coverage),
             ("frontend-dom", self._check_frontend_dom),
@@ -2415,6 +2499,167 @@ class IntegrationAgent(BaseAgent):
             "target_content": import_src,
             "replacement_content": import_path,
         }
+
+    # ── Phase 3: Deterministic wiring fixes (no LLM) ──────────────────────────
+
+    def _fix_duplicate_foundations(self, state: ProjectState) -> list[str]:
+        """
+        Phase 3 — collapse duplicate DB-foundation definitions (engine / Base /
+        SessionLocal) into ONE canonical module. Every other file's module-level
+        definition line is replaced by a deterministic re-export import from the
+        canonical module, so the symbol stays available in that file AND to any
+        importer. Skipped (→ WIRING rework) when the definition is not a single
+        line or when the canonical module already imports the duplicate file
+        (a re-export would create a cycle).
+        """
+        applied: list[str] = []
+        files = state.code_manifest.files
+        by_sym: dict[str, dict[str, str]] = {s: {} for s in _FOUNDATION_SYMBOLS}
+        for p in files:
+            fm = files[p]
+            if fm.agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, fm, state)
+            if not code:
+                continue
+            for sym in _FOUNDATION_SYMBOLS:
+                if re.search(r"^" + sym + r"\s*=", code, re.MULTILINE):
+                    by_sym[sym][p] = code
+
+        internal_prefixes = {p.split("/")[0] for p in files if p.split("/")[0]}
+        for sym, owners in by_sym.items():
+            if len(owners) < 2:
+                continue
+            canonical = self._canonical_foundation_file(state, list(owners))
+            canon_code = owners.get(canonical) or get_file_code(canonical, files.get(canonical), state)
+            canon_resolved = {
+                resolve_import_path(i, canonical, list(files), internal_prefixes)
+                for i in (parse_python_imports(canon_code) if canon_code else [])
+            }
+            mod = _module_path_for(canonical)
+            for dup_path, code in owners.items():
+                if dup_path == canonical:
+                    continue
+                # A re-export import between the two files would close a 2-cycle
+                # if EITHER file already imports the other — leave for rework.
+                dup_resolved = {
+                    resolve_import_path(i, dup_path, list(files), internal_prefixes)
+                    for i in parse_python_imports(code)
+                }
+                if canon_resolved and dup_path in canon_resolved:
+                    continue  # canonical imports the duplicate — re-export would cycle
+                if dup_resolved and canonical in dup_resolved:
+                    continue  # duplicate imports canonical — re-export would cycle
+                dup_syms = [
+                    s for s in _FOUNDATION_SYMBOLS
+                    if re.search(r"^" + s + r"\s*=", code, re.MULTILINE)
+                ]
+                if not dup_syms:
+                    continue
+                lines: dict[str, str] = {}
+                ok = True
+                for s in dup_syms:
+                    m = re.search(r"^" + s + r"\s*=\s*[^\n]*", code, re.MULTILINE)
+                    if not m or m.group(0).rstrip().endswith(("(", ",")):
+                        ok = False  # multiline definition — do not half-rewrite
+                        break
+                    lines[s] = m.group(0)
+                if not ok:
+                    continue
+                repairs = [
+                    {
+                        "conflict_index": 0,
+                        "action": "fix",
+                        "rationale": f"Collapse duplicate '{s}' foundation definition into a re-export from the canonical module",
+                        "fix": {
+                            "action": "replace_text",
+                            "filepath": dup_path,
+                            "target_content": lines[s],
+                            "replacement_content": f"from {mod} import {s}",
+                        },
+                    }
+                    for s in dup_syms
+                ]
+                applied_here = self._apply_repairs(state, repairs, [{}] * len(repairs))
+                applied.extend(applied_here)
+                if applied_here:
+                    logger.info(
+                        "[IntegrationAgent] Collapsed duplicate '%s' foundation definition(s) in %s → re-export from %s",
+                        sym, dup_path, canonical,
+                    )
+        return applied
+
+    def _fix_router_prefix_duplication(self, state: ProjectState) -> list[str]:
+        """
+        Phase 3 — strip a router's OWN APIRouter(prefix=...) when the layer
+        mounts it via app.include_router(..., prefix=...) and the router prefix
+        duplicates (or nests under) the mount prefix — otherwise every route is
+        served under a doubled path (/api + /api/todos = /api/api/todos).
+        Deterministic replace_text: removes only the prefix= argument (plus a
+        dangling comma) from the call; nothing else in the file is touched.
+        """
+        applied: list[str] = []
+        files = state.code_manifest.files
+        include_prefixes: set[str] = set()
+        for p in files:
+            if files[p].agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, files.get(p), state)
+            if not code:
+                continue
+            for m in re.finditer(r"include_router\s*\([^)]*?prefix\s*=\s*['\"]([^'\"]+)['\"]", code):
+                include_prefixes.add(m.group(1).rstrip("/"))
+        if not include_prefixes:
+            return applied
+
+        for p in files:
+            fm = files[p]
+            if fm.agent != "backend" or not p.endswith(".py"):
+                continue
+            code = get_file_code(p, fm, state)
+            if not code or "APIRouter" not in code:
+                continue
+            for m in re.finditer(r"APIRouter\s*\(([^)]*)\)", code, re.DOTALL):
+                call = m.group(0)
+                pm = re.search(r"prefix\s*=\s*(['\"])([^'\"]+)\1", call)
+                if not pm:
+                    continue
+                rp = pm.group(2).rstrip("/")
+                if not any(rp == ip or rp.startswith(ip + "/") for ip in include_prefixes):
+                    continue
+                target = pm.group(0)
+                span_start, span_end = pm.start(), pm.end()
+                if span_end < len(call) and call[span_end] == ",":
+                    span_end += 1
+                    if span_end < len(call) and call[span_end] == " ":
+                        span_end += 1
+                elif span_start > 0 and call[span_start - 1] == ",":
+                    span_start -= 1
+                elif span_start > 1 and call[span_start - 1] == " " and call[span_start - 2] == ",":
+                    span_start -= 2
+                target = call[span_start:span_end]
+                applied.extend(self._apply_repairs(state, [{
+                    "conflict_index": 0,
+                    "action": "fix",
+                    "rationale": "Strip router's own prefix duplicated by include_router(prefix=...)",
+                    "fix": {
+                        "action": "replace_text",
+                        "filepath": p,
+                        "target_content": target,
+                        "replacement_content": "",
+                    },
+                }], [{}]))
+                logger.info("[IntegrationAgent] Stripped duplicated router prefix '%s' from %s", rp, p)
+        return applied
+
+    def _apply_deterministic_wiring_fixes(self, state: ProjectState) -> list[str]:
+        """Phase 3 — run the deterministic duplicate-foundation + doubled-prefix
+        fixes BEFORE the checks that flag them, so only ambiguous leftovers
+        consume rework rounds."""
+        applied: list[str] = []
+        applied.extend(self._fix_duplicate_foundations(state))
+        applied.extend(self._fix_router_prefix_duplication(state))
+        return applied
 
     # ── Phase 3: Batched LLM repair ───────────────────────────────────────────
 
@@ -2716,6 +2961,13 @@ class IntegrationAgent(BaseAgent):
         # so generated code is root-relative to its own layer folder.
         if self._normalize_workspace_imports(ps):
             logger.info("[IntegrationAgent] Re-checking after import normalization…")
+            conflicts = self._run_deterministic_checks(ps)
+
+        # Phase 3 — deterministic wiring fixes (duplicate DB foundation modules,
+        # doubled router prefixes). Applied BEFORE the checks that flag them, so
+        # only ambiguous leftovers consume rework rounds.
+        if self._apply_deterministic_wiring_fixes(ps):
+            logger.info("[IntegrationAgent] Re-checking after deterministic wiring fixes…")
             conflicts = self._run_deterministic_checks(ps)
 
         # Phase 1B — grounded syntax/compile smoke. Real parser errors are routed
@@ -3226,6 +3478,70 @@ fetch('/todos', { method: 'POST', body: JSON.stringify({ description: 'x' }) });
     assert not any("duplicate prefix" in str(c.get("actual", ""))
                    for c in agent_pfx._check_router_prefixes(state_pfx))
     print("[PASS] Doubled API prefix flagged on the router; clean prefix stays clean")
+
+    # ── 4d. Phase 3: deterministic prefix strip fix ─────────────────────────
+    state_pfx.generated_code = CodeMap(backend={
+        "output/backend/main.py": "app.include_router(todo_router, prefix='/api', tags=['todos'])\n",
+        "output/backend/routers/todo.py":
+            "router = APIRouter(prefix='/api/todos', tags=['todos'])\n"
+            "@router.get('/todos')\nasync def read_todos(): return []\n",
+    })
+    prefix_logs = agent_pfx._fix_router_prefix_duplication(state_pfx)
+    assert prefix_logs, "deterministic prefix strip must apply a fix"
+    fixed_code = state_pfx.generated_code.backend["output/backend/routers/todo.py"]
+    assert "prefix='/api/todos'" not in fixed_code and "APIRouter(tags=['todos'])" in fixed_code, fixed_code
+    assert "APIRouter" in fixed_code and "@router.get('/todos')" in fixed_code
+    assert not any("duplicate prefix" in str(c.get("actual", ""))
+                   for c in agent_pfx._check_router_prefixes(state_pfx)), \
+        "after the mechanical strip the prefix check must be clean"
+    print("[PASS] Phase 3 prefix fix — router's own prefix stripped mechanically, check clean")
+
+    # ── 4e. Phase 3: duplicate DB foundation collapse ────────────────────────
+    state_fnd = ProjectState(project_id="int-fnd", project_name="Fnd")
+    fm_models = FileManifest(agent="backend", task_id="be-m", filepath="output/backend/db/models.py",
+                             purpose="ORM models", exports=["TodoItem", "Base"], written=True)
+    fm_init = FileManifest(agent="backend", task_id="be-i", filepath="output/backend/db/init_db.py",
+                           purpose="engine bootstrap", exports=["engine", "SessionLocal", "Base"], written=True)
+    state_fnd.code_manifest = CodeManifest(files={"output/backend/db/models.py": fm_models,
+                                                  "output/backend/db/init_db.py": fm_init})
+    code_models = (
+        "from sqlalchemy.orm import declarative_base\n"
+        "Base = declarative_base()\n"
+        "engine = create_engine('sqlite:///./app.db')\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "class TodoItem(Base):\n    __tablename__ = 'todos'\n    id = Column(Integer, primary_key=True)\n"
+    )
+    code_init = (
+        "from sqlalchemy import create_engine\n"
+        "from sqlalchemy.orm import sessionmaker, declarative_base\n"
+        "engine = create_engine('sqlite:///./app.db')\n"
+        "Base = declarative_base()\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "Base.metadata.create_all(engine)\n"
+    )
+    state_fnd.generated_code = CodeMap(backend={
+        "output/backend/db/models.py": code_models,
+        "output/backend/db/init_db.py": code_init,
+    })
+    agent_fnd = IntegrationAgent(provider=MockLLM())
+    dup_conflicts = agent_fnd._check_duplicate_foundation(state_fnd)
+    assert len(dup_conflicts) >= 3, dup_conflicts  # engine/Base/SessionLocal each flagged
+    canonical_targets = {c["filepath"] for c in dup_conflicts}
+    assert canonical_targets == {"output/backend/db/models.py"}, \
+        "models.py (non-canonical) must be the flagged file; init_db.py owns the symbols"
+    # Deterministic collapse: models.py re-exports from init_db.py, no cycle.
+    fnd_logs = agent_fnd._fix_duplicate_foundations(state_fnd)
+    assert fnd_logs, "duplicate foundation fix must apply"
+    fixed_models = state_fnd.generated_code.backend["output/backend/db/models.py"]
+    assert "from db.init_db import Base" in fixed_models, fixed_models
+    assert "from db.init_db import engine" in fixed_models, fixed_models
+    assert "from db.init_db import SessionLocal" in fixed_models, fixed_models
+    assert "class TodoItem(Base):" in fixed_models
+    assert not any(
+        c.get("filepath", "").startswith("output/backend/db/models.py")
+        for c in agent_fnd._check_duplicate_foundation(state_fnd)
+    ), "after the collapse, models.py must not be flagged anymore"
+    print("[PASS] Phase 3 foundation fix — duplicates collapsed into re-exports, canonical owns symbols")
 
     # ── 5. Syntax smoke helpers ──────────────────────────────────────────────
     assert IntegrationAgent._syntax_check_python("def f(:\n    pass\n"), "expected a SyntaxError from broken python"
