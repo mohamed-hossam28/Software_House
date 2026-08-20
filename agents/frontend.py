@@ -33,10 +33,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
@@ -188,6 +188,8 @@ def _build_file_prompt(
 
     scaffold_note = build_scaffold_context(manifest, filepath)
 
+    import_contract = build_import_contract(manifest, filepath)
+
     return f"""\
 ## File to Generate
 - **Path**     : `{filepath}`
@@ -204,6 +206,8 @@ def _build_file_prompt(
 {contracts}
 
 {scaffold_note}
+
+{import_contract}
 
 ## Project File Tree (capped)
 You may ONLY import from files listed here — use the EXACT export names shown.
@@ -291,7 +295,17 @@ class FrontendAgent(BaseAgent):
                 state.log_error(self.name, f"Batch JSON parse failed: {exc}")
             return
 
-        for item, task in zip(items, tasks):
+        aligned = align_batch_items(items, tasks, manifest)
+        if aligned is None:
+            logger.warning(
+                "[FrontendAgent] Batch response count mismatch (%d items for %d tasks) — falling back to per-file generation",
+                len(items), len(tasks),
+            )
+            for t in tasks:
+                self._process_task(t, state, lock)
+            return
+
+        for item, task in aligned:
             with lock:
                 fm = state.code_manifest.by_task(task.id)
             if not fm:
@@ -358,7 +372,17 @@ class FrontendAgent(BaseAgent):
                 state.log_error(self.name, f"Rework batch JSON parse failed: {exc}")
             return
 
-        for item, task in zip(items, valid_tasks):
+        aligned = align_batch_items(items, valid_tasks, manifest)
+        if aligned is None:
+            logger.warning(
+                "[FrontendAgent] Rework batch response count mismatch (%d items for %d tasks) — falling back to per-file rework",
+                len(items), len(valid_tasks),
+            )
+            for t in valid_tasks:
+                self._process_task(t, state, lock)
+            return
+
+        for item, task in aligned:
             with lock:
                 fm = manifest.by_task(task.id)
             if not fm:
@@ -397,6 +421,27 @@ class FrontendAgent(BaseAgent):
 
         filepath = fm.filepath
         logger.info("[FrontendAgent] Generating %s (task %s) …", filepath, task.id)
+
+        # Barrel files (`__init__.py`, `index.ts`) are pure re-exports — synthesize
+        # deterministically from the manifest. No LLM call, no guessing.
+        if is_barrel_file(filepath):
+            content = build_barrel_content(filepath, manifest)
+            try:
+                written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
+            except Exception as exc:
+                logger.error("[FrontendAgent] Barrel write failed for %s: %s", filepath, exc)
+                with lock:
+                    state.log_error(self.name, f"Barrel write failed for {filepath}: {exc}")
+                return
+            if written_code is None:
+                logger.warning("[FrontendAgent] Corrupted barrel content refused for %s", filepath)
+                return
+            with lock:
+                state.generated_code.frontend[filepath] = written_code
+                state.code_manifest.mark_written(filepath, [], [])
+                state.completed_task_ids.add(task.id)
+            logger.info("[FrontendAgent] ✓ barrel (deterministic): %s", filepath)
+            return
 
         frontend_tech = arch.tech_stack.get("frontend", "React 18 + TypeScript") if arch and arch.tech_stack else "React 18 + TypeScript"
         rework = build_rework_instructions(state.integration, filepath)
@@ -491,6 +536,7 @@ class FrontendAgent(BaseAgent):
                 return (
                     is_trivial_file(t, ps.code_manifest)
                     and not is_scaffold_file(getattr(fm, "filepath", ""))
+                    and not is_barrel_file(getattr(fm, "filepath", ""))
                 )
 
             def _is_trivial_rework(t: Task) -> bool:

@@ -691,6 +691,65 @@ def best_manifest_match(import_src: str, manifest_files: list[str], internal_pre
     return best_path
 
 
+def imported_names_for_code(code: str, import_src: str, filepath: str) -> list[str]:
+    """Names imported *from import_src* in *code* (exported-name form, alias-aware)."""
+    if not code:
+        return []
+    parser = parse_python_imported_names if filepath.endswith(".py") else parse_js_ts_imported_names
+    for mod, names, _ in parser(code):
+        if mod == import_src:
+            return names
+    return []
+
+
+def target_available_names(state: ProjectState, target_path: str) -> set[str]:
+    """
+    Names importable from *target_path*: manifest-promised exports + actual
+    definitions found in the written code (if any). Used to gate deterministic
+    import rewrites so a path guess never renames away the underlying bug.
+    """
+    names: set[str] = set()
+    t_fm = state.code_manifest.files.get(target_path)
+    if t_fm:
+        names.update(str(e) for e in (t_fm.exports or []))
+        t_code = get_file_code(target_path, t_fm, state)
+        if t_code:
+            names.update(extract_actual_definitions(t_code, target_path))
+    return names
+
+
+def unambiguous_import_target(
+    import_src: str,
+    current_file: str,
+    manifest_files: list[str],
+    state: ProjectState,
+    threshold: float = 0.25,
+) -> Optional[str]:
+    """
+    Deterministic import rewriter (no LLM): find the SINGLE manifest file that
+    both word-matches *import_src* and can provide every name imported from it
+    (promised exports or real definitions). Returns None when zero or several
+    candidates qualify — ambiguity goes to rework, never a blind rewrite.
+    """
+    candidate = import_src.replace(".", "/").strip("/")
+    wanted = []
+    cur_fm = state.code_manifest.files.get(current_file)
+    cur_code = get_file_code(current_file, cur_fm, state) if cur_fm else ""
+    wanted = imported_names_for_code(cur_code, import_src, current_file)
+
+    scored: list[tuple[float, str]] = []
+    for p in manifest_files:
+        s = word_match_score(candidate, p)
+        if s >= threshold:
+            scored.append((s, p))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    passing = [p for _, p in scored if all(w in target_available_names(state, p) for w in wanted)]
+    if len(passing) == 1:
+        return passing[0]
+    return None
+
+
 def dirname_matches(import_src: str, manifest_files: list[str]) -> Optional[str]:
     """
     If *import_src* looks like a Python package (e.g. 'backend.app.models') and any
@@ -2259,7 +2318,11 @@ class IntegrationAgent(BaseAgent):
                     fixed = True
                 else:
                     # 1b. Word-match the (wrong) import against every manifest path.
-                    best = best_manifest_match(candidate, manifest_files, internal_prefixes)
+                    # Only fix when EXACTLY ONE target both matches the path tokens
+                    # AND can provide every imported name (promised exports / real
+                    # definitions) — anything ambiguous goes to rework, never a
+                    # blind rewrite.
+                    best = unambiguous_import_target(import_src, current_file, manifest_files, state)
                     if best:
                         fix_target = self._import_fix_target(import_src, current_file, best)
                         if fix_target:

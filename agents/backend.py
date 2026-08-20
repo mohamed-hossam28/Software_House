@@ -34,10 +34,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
@@ -173,6 +173,10 @@ def _build_file_prompt(
     # Deterministic wiring for entrypoint files (Problem 2)
     scaffold_note = build_scaffold_context(manifest, filepath)
 
+    # Deterministic import contract (Planner's import graph) — the exact
+    # import statements this file may use. Never guessed.
+    import_contract = build_import_contract(manifest, filepath)
+
     # Phase C — architecture rules pinned by the planner:
     #   C1: request/response models live ONLY in a shared schemas/ module.
     #   C2: routers are thin; data access lives in the services/ layer.
@@ -218,6 +222,8 @@ def _build_file_prompt(
 {contracts_str}
 
 {scaffold_note}
+
+{import_contract}
 
 ## Layer Architecture Rules (MUST follow)
 {layer_rules_str}
@@ -312,7 +318,17 @@ class BackendAgent(BaseAgent):
                 state.log_error(self.name, f"Batch JSON parse failed: {exc}")
             return
 
-        for item, task in zip(items, tasks):
+        aligned = align_batch_items(items, tasks, manifest)
+        if aligned is None:
+            logger.warning(
+                "[BackendAgent] Batch response count mismatch (%d items for %d tasks) — falling back to per-file generation",
+                len(items), len(tasks),
+            )
+            for t in tasks:
+                self._process_task(t, state, lock)
+            return
+
+        for item, task in aligned:
             with lock:
                 fm = manifest.by_task(task.id)
             if not fm:
@@ -379,7 +395,17 @@ class BackendAgent(BaseAgent):
                 state.log_error(self.name, f"Rework batch JSON parse failed: {exc}")
             return
 
-        for item, task in zip(items, valid_tasks):
+        aligned = align_batch_items(items, valid_tasks, manifest)
+        if aligned is None:
+            logger.warning(
+                "[BackendAgent] Rework batch response count mismatch (%d items for %d tasks) — falling back to per-file rework",
+                len(items), len(valid_tasks),
+            )
+            for t in valid_tasks:
+                self._process_task(t, state, lock)
+            return
+
+        for item, task in aligned:
             with lock:
                 fm = manifest.by_task(task.id)
             if not fm:
@@ -418,6 +444,27 @@ class BackendAgent(BaseAgent):
 
         filepath = file_manifest.filepath
         logger.info("[BackendAgent] Generating code for %s (task: %s) ...", filepath, task.id)
+
+        # Barrel files (`__init__.py`, `index.ts`) are pure re-exports — synthesize
+        # deterministically from the manifest. No LLM call, no guessing.
+        if is_barrel_file(filepath):
+            content = build_barrel_content(filepath, manifest)
+            try:
+                written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
+            except Exception as exc:
+                logger.error("[BackendAgent] Barrel write failed for %s: %s", filepath, exc)
+                with lock:
+                    state.log_error(self.name, f"Barrel write failed for {filepath}: {exc}")
+                return
+            if written_code is None:
+                logger.warning("[BackendAgent] Corrupted barrel content refused for %s", filepath)
+                return
+            with lock:
+                state.generated_code.backend[filepath] = written_code
+                state.code_manifest.mark_written(filepath, [], [])
+                state.completed_task_ids.add(task.id)
+            logger.info("[BackendAgent] ✓ barrel (deterministic): %s", filepath)
+            return
 
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
         with lock:
@@ -511,6 +558,7 @@ class BackendAgent(BaseAgent):
                 return (
                     is_trivial_file(t, ps.code_manifest)
                     and not is_scaffold_file(getattr(fm, "filepath", ""))
+                    and not is_barrel_file(getattr(fm, "filepath", ""))
                 )
 
             def _is_trivial_rework(t: Task) -> bool:

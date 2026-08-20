@@ -288,6 +288,32 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             purpose=str(raw_item.get("description", ""))[:120],
             exports=[str(e) for e in raw_item.get("exports", [])],
         )
+
+    # Persist the Pass-1 import graph (imports_from) into each manifest entry.
+    # The coding agents read this to know their EXACT allowed imports — the LLM
+    # must never guess import paths. Sources are normalized to the manifest's
+    # workspace-relative form and validated against the final file set.
+    for task in tasks:
+        raw_item = raw_by_id.get(task.id, {})
+        fm = next((m for m in manifest_files.values() if m.task_id == task.id), None)
+        if fm is None:
+            continue
+        imports_from: dict[str, list[str]] = {}
+        for src_path, names in (raw_item.get("imports_from") or {}).items():
+            src = str(src_path).strip().lstrip("/").lstrip("\\")
+            if not src.startswith("output/") and not src.startswith("output\\"):
+                src = f"output/{src}"
+            src = src.replace("\\", "/")
+            if src == fm.filepath or src not in manifest_files:
+                if src not in manifest_files:
+                    logger.warning(
+                        "[PlannerAgent] task '%s' imports unknown file '%s' (phantom import) — dropped from import contract",
+                        task.id, src,
+                    )
+                continue
+            imports_from[src] = [str(n) for n in names if str(n).strip()]
+        fm.imports_from = imports_from
+
     return manifest_files
 
 
@@ -378,6 +404,10 @@ def _inject_scaffold_tasks(
             agent="backend", task_id=tid, filepath=be_main,
             purpose="FastAPI application entry point — registers all routers and middleware.",
             exports=["app"],
+            imports_from={
+                p: ["router"] for p, fm in manifest_files.items()
+                if fm.agent == "backend" and "router" in (fm.exports or [])
+            },
         )
 
     frontend_task_ids = [t.id for t in tasks if t.agent == "frontend"]
@@ -497,6 +527,7 @@ def _inject_router_task(
     be_main = f"{backend_root}main.py"
     main_fm = next_manifest.get(be_main)
     if main_fm:
+        main_fm.imports_from[router_path] = ["router"]
         for t in next_tasks:
             if t.id == main_fm.task_id and tid not in t.depends_on:
                 t.depends_on = t.depends_on + [tid]

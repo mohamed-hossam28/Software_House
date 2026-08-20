@@ -210,6 +210,205 @@ def is_scaffold_file(filepath: str | None) -> bool:
     return os.path.basename(filepath or "").lower() in _SCAFFOLD_NAMES
 
 
+_BARREL_NAMES = frozenset({
+    "__init__.py",
+    "index.ts", "index.tsx", "index.js", "index.jsx",  # barrel / re-export files
+})
+
+
+def is_barrel_file(filepath: str | None) -> bool:
+    """
+    True for package/barrel re-export files (`__init__.py`, `index.ts|js|tsx|jsx`).
+
+    These files do the actual WIRING between modules (re-exports), so they are
+    synthesized deterministically from the manifest — never sent to the LLM.
+    """
+    base = os.path.basename(filepath or "").lower()
+    return base in _BARREL_NAMES
+
+
+def _layer_root_for(filepath: str) -> str | None:
+    """Layer root dir of a workspace file, e.g. 'output/backend/' (mirrors integration.layer_root_for)."""
+    parts = (filepath or "").split("/")
+    if len(parts) >= 2 and parts[0] == "output":
+        return f"{parts[0]}/{parts[1]}/"
+    return None
+
+
+def _module_path_for(src: str) -> str:
+    """
+    Layer-root-relative dotted Python module for a manifest path.
+    'output/backend/api/todo.py' → 'api.todo'; 'output/backend/db/__init__.py' → 'db'.
+    """
+    root = _layer_root_for(src)
+    rel = src[len(root):] if root and src.startswith(root) else src.lstrip("/").lstrip("\\")
+    if rel.endswith(".py"):
+        rel = rel[:-3]
+    if rel.endswith("/__init__"):
+        rel = rel[: -len("/__init__")].rstrip("/")
+    return rel.replace("/", ".").replace("\\", ".")
+
+
+def _rel_import_path(from_file: str, to_file: str) -> str:
+    """JS/TS relative import path from *from_file* to *to_file* (extension stripped)."""
+    to_no_ext = to_file.replace("\\", "/")
+    for ext in (".tsx", ".ts", ".jsx", ".js"):
+        if to_no_ext.endswith(ext):
+            to_no_ext = to_no_ext[: -len(ext)]
+            break
+    from_dir = os.path.dirname(from_file.replace("\\", "/"))
+    rel = os.path.relpath(to_no_ext, from_dir).replace("\\", "/")
+    if not rel.startswith("."):
+        rel = "./" + rel
+    return rel
+
+
+def _normalized_src(src: str) -> str:
+    """Normalize a planned import source to the manifest's workspace-relative form."""
+    src = str(src).strip().lstrip("/").lstrip("\\").replace("\\", "/")
+    if not src.startswith("output/"):
+        src = f"output/{src}"
+    return src
+
+
+def build_import_contract(manifest: Any, filepath: str) -> str:
+    """
+    Deterministic IMPORT CONTRACT for *filepath*: the exact import lines it may
+    use, computed from the Planner's import graph (imports_from) + manifest
+    exports. Never guesses — every source must exist in the manifest.
+
+    Returns an empty string when the file declares no internal imports.
+    """
+    if not hasattr(manifest, "files"):
+        return ""
+    fm = manifest.files.get(filepath)
+    if fm is None:
+        return ""
+    imports_from = getattr(fm, "imports_from", {}) or {}
+
+    lines: list[str] = []
+    missing: list[str] = []
+    for src_raw, names in imports_from.items():
+        src = _normalized_src(src_raw)
+        if src not in manifest.files or src == filepath:
+            if src not in manifest.files:
+                missing.append(src)
+            continue
+        names = [str(n) for n in names if str(n).strip()]
+        if filepath.endswith(".py"):
+            mod = _module_path_for(src)
+            if names:
+                lines.append(f"from {mod} import {', '.join(names)}")
+            else:
+                lines.append(f"import {mod}")
+        else:
+            rel = _rel_import_path(filepath, src)
+            if names:
+                lines.append(f"import {{ {', '.join(names)} }} from '{rel}'")
+            else:
+                lines.append(f"import '{rel}'")
+
+    if not lines:
+        return ""
+
+    header = (
+        "## IMPORT CONTRACT (deterministic — use EXACTLY these imports)\n"
+        "Every line below is derived from the planner's import graph. Do NOT invent "
+        "other internal imports, modules, or paths.\n"
+    )
+    body = "\n".join(f"- `{l}`" for l in lines)
+    note = "\nUse exactly these import statements in your code (same modules, same names)."
+    if missing:
+        note += (
+            "\nNote: the following planned sources do not exist in the manifest and "
+            "were omitted: " + ", ".join(missing)
+        )
+    return header + body + note
+
+
+def build_barrel_content(filepath: str, manifest: Any) -> str:
+    """
+    Deterministic re-export content for a barrel file (`__init__.py` / `index.*`).
+    No LLM call — wiring-critical files must not be guessed.
+
+    Re-exports come from the Planner's import graph first; when the planner gave
+    no graph, falls back to re-exporting same-directory sibling exports.
+    """
+    if not hasattr(manifest, "files"):
+        return ""
+    fm = manifest.files.get(filepath)
+    if fm is None:
+        return ""
+    imports_from = getattr(fm, "imports_from", {}) or {}
+
+    sources: list[tuple[str, list[str]]] = []
+    for src_raw, names in imports_from.items():
+        src = _normalized_src(src_raw)
+        if src not in manifest.files or src == filepath:
+            continue
+        sources.append((src, [str(n) for n in names if str(n).strip()]))
+
+    if not sources:
+        sibling_dir = os.path.dirname(filepath)
+        for src, sfm in sorted(manifest.files.items()):
+            if src == filepath or os.path.dirname(src) != sibling_dir:
+                continue
+            ex = [e for e in (getattr(sfm, "exports", None) or []) if str(e).strip()]
+            if ex:
+                sources.append((src, list(ex)))
+
+    if not sources:
+        return ""
+
+    if filepath.endswith("__init__.py"):
+        lines: list[str] = []
+        for src, names in sources:
+            rel = _module_path_for(src)
+            if names:
+                lines.append(f"from {rel} import {', '.join(names)}")
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    lines = []
+    for src, names in sources:
+        rel = _rel_import_path(filepath, src)
+        if names:
+            lines.append(f"export {{ {', '.join(names)} }} from '{rel}'")
+        else:
+            lines.append(f"export * from '{rel}'")
+    return "\n".join(lines) + "\n"
+
+
+def align_batch_items(items: list[dict], tasks: list[Any], manifest: Any) -> list[tuple[dict, Any]] | None:
+    """
+    Pair batch LLM response items with their tasks.
+
+    Prefers filepath-based matching (the LLM echoes each filepath), falls back to
+    order-based pairing. Returns None on a count mismatch so the caller can fall
+    back to per-file generation instead of silently misassigning code.
+    """
+    if not items or len(items) != len(tasks):
+        return None
+
+    by_path: dict[str, dict] = {}
+    for it in items:
+        fp = str(it.get("filepath", "") or "").strip()
+        if fp:
+            by_path[fp] = it
+
+    if len(by_path) == len(items) and hasattr(manifest, "by_task"):
+        aligned: list[tuple[dict, Any]] = []
+        for t in tasks:
+            fm = manifest.by_task(t.id)
+            fp = getattr(fm, "filepath", None)
+            it = by_path.get(fp)
+            if it is None:
+                return None
+            aligned.append((it, t))
+        return aligned
+
+    return list(zip(items, tasks))
+
+
 def build_rework_instructions(integration: Any, filepath: str) -> str:
     """
     Build a prompt section for *filepath* describing integration conflicts that
@@ -417,9 +616,9 @@ def build_scaffold_context(manifest: Any, filepath: str) -> str:
                 continue
             exports = getattr(fm, "exports", []) or []
             if "router" in exports or "routes" in path.lower() or "controllers" in path.lower():
-                routers.append(f"- `{path}` → exports: {', '.join(exports)}")
+                routers.append(f"- `{path}` → `from {_module_path_for(path)} import router`")
         header = "## Scaffold Wiring — You MUST register these routers (their files already exist):"
-        note = "\n**IMPORT RULE**: Import each router relative to the layer root (e.g. `from api.routes.todo import router`), NEVER with the `output.backend.` / `output.` workspace prefix."
+        note = "\n**IMPORT RULE**: Import each router with the EXACT import line shown (layer-root-relative), NEVER with the `output.backend.` / `output.` workspace prefix."
         return header + note + ("\n" + "\n".join(routers) if routers else "\n(none found)")
     if base == "index.html":
         styles = sorted(

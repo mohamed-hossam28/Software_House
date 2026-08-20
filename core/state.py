@@ -272,6 +272,9 @@ class FileManifest(BaseModel):
     filepath: str  # exact path e.g. "backend/app/models/user.py"
     purpose:  str  # "User SQLAlchemy model" — what it should do
     exports:  list[str] = Field(default_factory=list)  # STRICT — what other files may import
+    #: Import graph derived by the Planner (Pass 1): {source module path -> names imported}.
+    #: The coding agents MUST use exactly these imports — never guessed paths.
+    imports_from: dict[str, list[str]] = Field(default_factory=dict)
 
     # ── Coding agent fills after writing ────────────────────────────────
     written:   bool = False
