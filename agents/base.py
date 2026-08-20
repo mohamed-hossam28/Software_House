@@ -326,6 +326,56 @@ def build_import_contract(manifest: Any, filepath: str) -> str:
     return header + body + note
 
 
+def build_pending_contracts(manifest: Any, filepath: str) -> str:
+    """
+    Phase 2 — deterministic PENDING CONTRACTS section for *filepath*.
+
+    For each not-yet-written dependency that carries a planner-derived field
+    contract (DB model or schema file), lists its planned exports + fields so the
+    coding agent matches DB columns / API bodies exactly while that file is being
+    generated in parallel. Returns "" when nothing applies.
+    """
+    if not hasattr(manifest, "files"):
+        return ""
+    fm = manifest.files.get(filepath)
+    if fm is None:
+        return ""
+    imports_from = getattr(fm, "imports_from", {}) or {}
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for src_raw in imports_from:
+        src = _normalized_src(src_raw)
+        if src not in manifest.files or src == filepath or src in seen:
+            continue
+        seen.add(src)
+        dep = manifest.files[src]
+        if getattr(dep, "written", False):
+            continue
+        contract = getattr(dep, "contract", {}) or {}
+        if not contract:
+            continue
+        lines = []
+        for export in getattr(dep, "exports", None) or []:
+            fields = contract.get(export)
+            if fields:
+                lines.append(
+                    f"  - `{export}`: " + ", ".join(f"{n}: {t}" for n, t in fields.items())
+                )
+        if lines:
+            blocks.append(f"### `{src}` (planned exports + fields)\n" + "\n".join(lines))
+
+    if not blocks:
+        return ""
+
+    return (
+        "## PENDING CONTRACTS — fields of not-yet-written dependencies\n"
+        "The files below are being generated in parallel. Their exports and fields "
+        "are FIXED by the planner — use EXACTLY these names (no guessing, no renaming):\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 def build_barrel_content(filepath: str, manifest: Any) -> str:
     """
     Deterministic re-export content for a barrel file (`__init__.py` / `index.*`).

@@ -314,7 +314,168 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             imports_from[src] = [str(n) for n in names if str(n).strip()]
         fm.imports_from = imports_from
 
+    # Phase 2 — deterministic cross-agent field contracts (no LLM). Backend agents
+    # read these to match DB columns / API bodies while the DB agent runs in parallel.
+    _populate_contracts(manifest_files, arch)
+
     return manifest_files
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  Phase 2 — deterministic cross-agent field contracts (no LLM)                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+#: Class-name suffixes stripped when matching an export to a DB table or API
+#: resource keyword (e.g. 'TodoItem' → 'todo', 'TodoCreate' → 'todo').
+_ENTITY_SUFFIXES: tuple[str, ...] = (
+    "create", "new", "insert", "in", "update", "put", "patch", "request",
+    "payload", "form", "response", "out", "read", "view", "item", "record",
+    "entity", "model", "table", "orm", "dto", "schema", "detail", "result",
+)
+
+_REQUEST_SUFFIXES: tuple[str, ...] = (
+    "create", "new", "insert", "in", "update", "put", "patch", "request", "payload", "form",
+)
+
+_RESPONSE_SUFFIXES: tuple[str, ...] = (
+    "response", "out", "read", "view", "item", "detail", "result",
+)
+
+
+def _norm_keyword(name: str) -> str:
+    """'TodoItem' → 'todoitem' (lowercase, alphanumerics only)."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _entity_forms(name: str) -> set[str]:
+    """
+    Normalized matching forms of a name: itself, its singular, and its
+    suffix-stripped stem (e.g. 'TodoItem' → {'todoitem', 'todo'},
+    'users' → {'users', 'user'}). Empty forms are dropped.
+    """
+    kw = _norm_keyword(name)
+    forms = {kw}
+    if kw.endswith("s"):
+        forms.add(kw[:-1])
+    stripped = kw
+    for suf in _ENTITY_SUFFIXES:
+        if stripped.endswith(suf):
+            stripped = stripped[: -len(suf)]
+            break
+    forms.add(stripped)
+    if stripped.endswith("s"):
+        forms.add(stripped[:-1])
+    return {f for f in forms if f}
+
+
+def _match_entity(export: str, candidates: dict[str, Any]) -> str | None:
+    """
+    Match an export/class name to EXACTLY ONE candidate key (table or API resource).
+    Deterministic only-match rule: no match, or >1 candidate → None (never guess).
+    """
+    export_forms = _entity_forms(export)
+    matched = [k for k in candidates if _entity_forms(k) & export_forms]
+    return matched[0] if len(matched) == 1 else None
+
+
+def _parse_schema_overview(overview: str) -> dict[str, dict[str, str]]:
+    """
+    Parse the architecture agent's schema-overview lines into {table: {column: type}}.
+    Handles e.g. 'users (id UUID PK, email VARCHAR UNIQUE, created_at TIMESTAMP)'.
+    """
+    tables: dict[str, dict[str, str]] = {}
+    for line in (overview or "").splitlines():
+        line = line.strip()
+        if not line or "(" not in line:
+            continue
+        name = line.split("(", 1)[0].strip()
+        if not name:
+            continue
+        inner = line.split("(", 1)[1].rsplit(")", 1)[0]
+        fields: dict[str, str] = {}
+        for part in inner.split(","):
+            tokens = part.strip().split()
+            if len(tokens) >= 2:
+                fields[tokens[0]] = " ".join(tokens[1:])
+        if fields:
+            tables[name] = fields
+    return tables
+
+
+def _is_request_schema(export: str) -> bool:
+    kw = _norm_keyword(export)
+    return any(kw.endswith(s) for s in _REQUEST_SUFFIXES)
+
+
+def _is_response_schema(export: str) -> bool:
+    kw = _norm_keyword(export)
+    return any(kw.endswith(s) for s in _RESPONSE_SUFFIXES)
+
+
+def _is_schema_file(fm: FileManifest) -> bool:
+    """Backend file defining request/response models (schemas/models module, or schema-style exports)."""
+    path = (fm.filepath or "").lower()
+    if "/schemas/" in path or "/models/" in path or path.endswith(("schemas.py", "models.py")):
+        return True
+    for export in fm.exports or []:
+        kw = _norm_keyword(export)
+        if any(kw.endswith(s) for s in _ENTITY_SUFFIXES):
+            return True
+    return False
+
+
+def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = None) -> None:
+    """
+    Deterministically attach a field contract to each DB-model and schema file:
+
+      - database-agent files → fields from `database_schema_overview` (table → columns),
+                               matched to model exports by normalized name
+                               (e.g. table 'todos' → export 'TodoItem').
+      - backend schema files → fields from the matching API contract's
+                               request/response bodies, matched by path resource
+                               (e.g. '/api/todos' → export 'TodoCreate').
+
+    No LLM involvement — a name that matches nothing (or several things) is skipped.
+    """
+    if arch is None:
+        return
+
+    tables = _parse_schema_overview(getattr(arch, "database_schema_overview", "") or "")
+
+    resources: dict[str, list[Any]] = {}
+    for c in (getattr(arch, "api_contracts", None) or []):
+        key = ""
+        for seg in str(getattr(c, "path", "") or "").strip("/").split("/"):
+            if seg and seg.lower() != "api":
+                key = seg
+                break
+        if key:
+            resources.setdefault(key, []).append(c)
+
+    for fm in manifest_files.values():
+        if fm.agent == "database" and tables:
+            for export in list(fm.exports or []):
+                table = _match_entity(export, tables)
+                if table is None:
+                    continue
+                fm.contract[export] = dict(tables[table])
+        elif fm.agent == "backend" and _is_schema_file(fm):
+            for export in list(fm.exports or []):
+                key = _match_entity(export, resources)
+                if key is None:
+                    continue
+                fields: dict[str, str] = {}
+                for c in resources[key]:
+                    req = dict(getattr(c, "request_body", None) or {})
+                    res = dict(getattr(c, "response_body", None) or {})
+                    if _is_request_schema(export):
+                        fields.update(req)
+                    elif _is_response_schema(export):
+                        fields.update(res)
+                    else:
+                        fields.update({**req, **res})
+                if fields:
+                    fm.contract[export] = fields
 
 
 def _detect_backend_root(manifest_files: dict[str, FileManifest]) -> str | None:
@@ -864,6 +1025,39 @@ if __name__ == "__main__":
     assert len(mf) == 2
     assert mf["output/backend/app/models/user.py"].exports == ["User"]
     print("[PASS] _build_manifest — 2 entries with correct exports")
+
+    # ── _populate_contracts (Phase 2) ──────────────────────────────────────────
+    from core.state import ArchData, APIContract
+    arch_c = ArchData(
+        database_schema_overview=(
+            "users (id UUID PK, email VARCHAR UNIQUE)\n"
+            "todos (id UUID PK, title VARCHAR, description TEXT, is_completed BOOLEAN, user_id UUID)\n"
+        ),
+        api_contracts=[
+            APIContract(method="POST", path="/api/todos",
+                        request_body={"title": "str", "description": "str"},
+                        response_body={"id": "UUID", "title": "str", "description": "str", "is_completed": "bool"}),
+        ],
+    )
+    ct_tasks = [
+        Task(id="db-001", agent="database", title="T1", description="", depends_on=[], priority=1),
+        Task(id="db-002", agent="database", title="T2", description="", depends_on=[], priority=1),
+        Task(id="be-001", agent="backend", title="T3", description="", depends_on=["db-001"], priority=2),
+    ]
+    ct_raw = [
+        {"id": "db-001", "file": "app/models/todo.py", "exports": ["TodoItem"], "imports_from": {}},
+        {"id": "db-002", "file": "app/models/user.py", "exports": ["User"], "imports_from": {}},
+        {"id": "be-001", "file": "app/schemas/todo.py", "exports": ["TodoCreate", "TodoResponse"], "imports_from": {}},
+    ]
+    mfc = _build_manifest(ct_tasks, ct_raw, arch_c)
+    assert mfc["output/app/models/todo.py"].contract["TodoItem"]["is_completed"] == "BOOLEAN"
+    assert mfc["output/app/models/todo.py"].contract["TodoItem"]["user_id"] == "UUID"
+    assert mfc["output/app/models/user.py"].contract == {
+        "User": {"id": "UUID PK", "email": "VARCHAR UNIQUE"}}
+    assert mfc["output/app/schemas/todo.py"].contract["TodoCreate"] == {"title": "str", "description": "str"}
+    assert mfc["output/app/schemas/todo.py"].contract["TodoResponse"]["is_completed"] == "bool"
+    assert _match_entity("Workspace", {"todos": {}, "users": {}}) is None
+    print("[PASS] _populate_contracts — DB model + schema field contracts populated deterministically")
 
     # ── _generate_tasks_from_skeleton (Pass 2) ────────────────────────────────
     skel = [

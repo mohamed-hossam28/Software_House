@@ -275,6 +275,11 @@ class FileManifest(BaseModel):
     #: Import graph derived by the Planner (Pass 1): {source module path -> names imported}.
     #: The coding agents MUST use exactly these imports — never guessed paths.
     imports_from: dict[str, list[str]] = Field(default_factory=dict)
+    #: Cross-agent field contract (Phase 2) — populated deterministically by the
+    #: Planner for DB-model and schema files: {export name -> {field: type}}.
+    #: Backend agents read this so schemas/CRUD match DB columns and API bodies
+    #: exactly even while the database agent runs in parallel.
+    contract: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     # ── Coding agent fills after writing ────────────────────────────────
     written:   bool = False

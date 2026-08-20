@@ -34,10 +34,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
 from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
@@ -177,6 +177,10 @@ def _build_file_prompt(
     # import statements this file may use. Never guessed.
     import_contract = build_import_contract(manifest, filepath)
 
+    # Phase 2 — planned fields of not-yet-written DB/schema dependencies
+    # (fixes field drift while the database agent runs in parallel).
+    pending_contracts = build_pending_contracts(manifest, filepath)
+
     # Phase C — architecture rules pinned by the planner:
     #   C1: request/response models live ONLY in a shared schemas/ module.
     #   C2: routers are thin; data access lives in the services/ layer.
@@ -224,6 +228,8 @@ def _build_file_prompt(
 {scaffold_note}
 
 {import_contract}
+
+{pending_contracts}
 
 ## Layer Architecture Rules (MUST follow)
 {layer_rules_str}
@@ -742,4 +748,24 @@ if __name__ == "__main__":
     shutil.rmtree(os.path.join(root_dir, "backend"), ignore_errors=True)
 
     print("[PASS] BackendAgent mock integration test succeeded.")
+
+    # ── Test 3: Pending Contracts section (Phase 2) ────────────────────────────
+    from agents.base import build_pending_contracts
+    pc_manifest = CodeManifest(files={
+        "output/backend/db/models.py": FileManifest(
+            agent="database", task_id="db-001", filepath="output/backend/db/models.py",
+            purpose="ORM models", exports=["TodoItem"],
+            contract={"TodoItem": {"id": "UUID", "title": "VARCHAR", "is_completed": "BOOLEAN"}},
+        ),
+        "output/backend/crud/todo.py": FileManifest(
+            agent="backend", task_id="be-002", filepath="output/backend/crud/todo.py",
+            purpose="crud", exports=["TodoService"],
+            imports_from={"output/backend/db/models.py": ["TodoItem"]},
+        ),
+    })
+    pc_prompt = _build_file_prompt("output/backend/crud/todo.py", pc_manifest, state.architecture)
+    assert "PENDING CONTRACTS" in pc_prompt, "Pending Contracts section missing from prompt"
+    assert "`TodoItem`:" in pc_prompt and "is_completed: BOOLEAN" in pc_prompt
+    assert build_pending_contracts(pc_manifest, "output/backend/db/models.py") == ""
+    print("[PASS] _build_file_prompt — Pending Contracts section injected (Phase 2)")
     print("=" * 60 + "\n")
