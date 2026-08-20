@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 from dotenv import load_dotenv
+load_dotenv()
 
 # Force workspace root on sys.path
 ROOT = os.path.dirname(os.path.abspath(__file__))

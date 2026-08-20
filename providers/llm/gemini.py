@@ -19,6 +19,7 @@ class GeminiProvider(BaseLLMProvider):
         key = (
             api_key 
             or (settings.api_key if settings.default_provider.lower().strip() == "gemini" else None)
+            or settings.gemini_api
             or os.environ.get("GEMINI_API_KEY") 
             or os.environ.get("gemini_api")
         )
