@@ -32,6 +32,14 @@ def as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def normalize_output_path(filepath: str) -> str:
+    """Anchor a manifest filepath under the output/ directory root."""
+    rel = filepath.lstrip("/").lstrip("\\")
+    if not rel.startswith("output/") and not rel.startswith("output\\") and rel != "output":
+        return f"output/{rel}"
+    return rel
+
+
 def _is_corrupt_scannable(filepath: str) -> bool:
     """True when a file should be scanned by the corruption detector."""
     basename = os.path.basename(filepath or "").lower()

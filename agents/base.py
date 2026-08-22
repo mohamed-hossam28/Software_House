@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from threading import Lock
 
+from agents.utils import _ESCAPED_CHAR_RE
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,9 +29,7 @@ DEFAULT_BACKOFF    = settings.default_backoff or 2.0
 
 # Prompt size caps — keep the request body under typical gateway payload limits.
 MAX_TREE_ENTRIES    = 80   # project file tree entries shown in coding prompts
-MAX_MANIFEST_ENTRIES = 25  # dependency/manifest entries + written summaries per prompt 
-
-_ESCAPED_CHAR_RE = re.compile(r"\\(?:[\"\\/bfnrt]|u[0-9a-fA-F]{4})")
+MAX_MANIFEST_ENTRIES = 25  # dependency/manifest entries + written summaries per prompt
 
 
 def deep_unescape(data: Any) -> Any:
