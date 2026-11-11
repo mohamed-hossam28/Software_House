@@ -17,7 +17,6 @@ from agents.planner import PlannerAgent
 from agents.data_base import DatabaseAgent
 from agents.backend import BackendAgent
 from agents.frontend import FrontendAgent
-from agents.integration import IntegrationAgent
 
 # Import core state and statuses
 from core.state import ProjectState, ProjectStatus
@@ -201,23 +200,6 @@ def frontend_node(state: dict) -> dict:
         retries=settings.default_retries,
         backoff=settings.default_backoff,
         temperature=0.2,
-    )
-    return agent.run(state)
-
-
-def integration_node(state: dict) -> dict:
-    """
-    Integration node: runs the IntegrationAgent to cross-verify files, API contracts, and resolve conflicts.
-    Receives full state dict, returns only changed fields as dict.
-    """
-    logger.info("[GraphNode] Running IntegrationAgent...")
-    agent = IntegrationAgent(
-        provider=settings.default_provider,
-        model=settings.model_name,
-        max_tokens=settings.integration_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.0,
     )
     return agent.run(state)
 

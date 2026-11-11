@@ -609,7 +609,7 @@ def _inject_router_task(
     The router task depends on every other backend task (runs last in its
     layer) and the backend entrypoint's depends_on is re-wired to include it,
     so main.py always registers this module and deviations are caught by the
-    FILE_SET / import checks in the integration agent.
+    import checks downstream.
     """
     if not arch or not getattr(arch, "api_contracts", None):
         return tasks, manifest_files
@@ -702,8 +702,7 @@ def _inject_project_files(
 ) -> tuple[list[Task], dict[str, FileManifest], list[str]]:
     """
     Commit to the deliverable's project-scaffolding file set (Phase C3).
-    These files are REQUIRED for a runnable deliverable and the integration
-    agent verifies they exist and are written (FILE_SET check):
+    These files are REQUIRED for a runnable deliverable:
       - output/requirements.txt          (Python dependency manifest)
       - output/README.md                 (run instructions)
       - <backend_root>.env.example       (environment template — no real secrets)
@@ -720,7 +719,6 @@ def _inject_project_files(
             n += 1
         return f"{prefix}-{n:03d}"
 
-    required_files: list[str] = []
     specs = [
         (
             "output/requirements.txt",
@@ -754,9 +752,8 @@ def _inject_project_files(
             agent="backend", task_id=tid, filepath=path,
             purpose=purpose, exports=exports,
         )
-        required_files.append(path)
 
-    return next_tasks, next_manifest, required_files
+    return next_tasks, next_manifest
 
 
 def _generate_tasks_from_skeleton(nodes: list[Any], warnings: list[str]) -> list[Task]:
@@ -932,16 +929,14 @@ class PlannerAgent(BaseAgent):
         # router shape was planned (main.py must register routers that exist).
         tasks, manifest_files = _inject_router_task(tasks, manifest_files, arch)
 
-        # Inject the committed project-scaffolding file set (Phase C3) and
-        # record it on state so the integration agent can enforce it (FILE_SET).
-        tasks, manifest_files, required_files = _inject_project_files(tasks, manifest_files)
+        # Inject the committed project-scaffolding file set (Phase C3).
+        tasks, manifest_files = _inject_project_files(tasks, manifest_files)
 
         manifest_task_ids = {fm.task_id for fm in manifest_files.values()}
         synced_tasks = [t for t in tasks if t.id in manifest_task_ids]
 
         ps.tasks = TaskList(tasks=synced_tasks)
         ps.code_manifest = CodeManifest(files=manifest_files)
-        ps.required_files = required_files
 
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)

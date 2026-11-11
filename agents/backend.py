@@ -34,10 +34,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts, build_rework_instructions, build_rework_prompt, build_rework_batch_prompt
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
 from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
@@ -88,7 +88,6 @@ def _build_file_prompt(
     manifest: CodeManifest,
     arch: Any,
     task: Task | None = None,
-    rework_instructions: str = "",
 ) -> str:
     """Builds a highly descriptive prompt for the LLM to implement a single backend file."""
     file_manifest = manifest.files.get(filepath)
@@ -212,8 +211,6 @@ def _build_file_prompt(
 - **Purpose**: {file_manifest.purpose}
 - **Required Exports**: {', '.join(file_manifest.exports) or '(none)'}
   *(CRITICAL: The generated code MUST define and export these exact names with the exact arguments expected by other modules.)*
-
-{rework_instructions.strip()}
 
 ## Architecture Context
 ### Tech Stack
@@ -360,82 +357,6 @@ class BackendAgent(BaseAgent):
                 state.completed_task_ids.add(task.id)
             logger.info("[BackendAgent] ✓ batch trivial: %s", fm.filepath)
 
-    def _process_rework_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
-        """Single LLM call for a batch of trivial rework files (lean targeted prompt)."""
-        with lock:
-            manifest = state.code_manifest
-            arch = state.architecture
-            backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
-            sys_prompt = _build_system_prompt(backend_tech)
-
-            entries = []
-            valid_tasks = []
-            for t in tasks:
-                fm = manifest.by_task(t.id)
-                if not fm:
-                    continue
-                code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
-                current_code = code_bucket.get(fm.filepath, "")
-                rework = build_rework_instructions(state.integration, fm.filepath)
-                if rework and current_code:
-                    entries.append((fm.filepath, current_code, rework))
-                    valid_tasks.append(t)
-            user_prompt = build_rework_batch_prompt(entries, output_key="code", manifest=manifest)
-
-        filepaths = [fp for fp, _, _ in entries]
-        logger.info("[BackendAgent] Batch rework call: %s", filepaths)
-
-        try:
-            raw = self._call_with_system(sys_prompt, user_prompt, agent_name="be-rework-batch", state=state, lock=lock)
-        except Exception as exc:
-            logger.error("[BackendAgent] Rework batch LLM call failed: %s", exc)
-            with lock:
-                state.log_error(self.name, f"Rework batch LLM call failed: {exc}")
-            return
-
-        try:
-            items = self._parse_batch_response(raw)
-        except Exception as exc:
-            logger.error("[BackendAgent] Rework batch JSON parse failed: %s — raw: %s", exc, raw[:300])
-            with lock:
-                state.log_error(self.name, f"Rework batch JSON parse failed: {exc}")
-            return
-
-        aligned = align_batch_items(items, valid_tasks, manifest)
-        if aligned is None:
-            logger.warning(
-                "[BackendAgent] Rework batch response count mismatch (%d items for %d tasks) — falling back to per-file rework",
-                len(items), len(valid_tasks),
-            )
-            for t in valid_tasks:
-                self._process_task(t, state, lock)
-            return
-
-        for item, task in aligned:
-            with lock:
-                fm = manifest.by_task(task.id)
-            if not fm:
-                continue
-            code = str(item.get("code", "")).strip()
-            if not code:
-                logger.warning("[BackendAgent] Rework batch: empty code for %s — skipping", fm.filepath)
-                continue
-            try:
-                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
-            except Exception as exc:
-                logger.error("[BackendAgent] Rework batch disk write failed for %s: %s", fm.filepath, exc)
-                written_code = None
-            if written_code is None:
-                logger.warning("[BackendAgent] Rework batch: corrupted content refused for %s", fm.filepath)
-                continue
-            code = written_code
-            with lock:
-                code_bucket = getattr(state.generated_code, self.code_bucket)
-                code_bucket[fm.filepath] = code
-                # Rework responses return only code — preserve existing manifest metadata.
-                state.completed_task_ids.add(task.id)
-            logger.info("[BackendAgent] ✓ rework batch: %s", fm.filepath)
-
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
         """Worker thread task to call the LLM, write file, and update manifest."""
         manifest = state.code_manifest
@@ -475,19 +396,8 @@ class BackendAgent(BaseAgent):
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
         with lock:
             arch = state.architecture
-            rework = build_rework_instructions(state.integration, filepath)
-            code_bucket = getattr(state.generated_code, self.code_bucket, {}) or {}
-            current_code = code_bucket.get(filepath, "")
 
-        if rework and current_code:
-            # Lean REWORK path: conflict notes + current file content, plus the
-            # deterministic Import Contract + file tree for import/wiring rounds.
-            user_prompt = build_rework_prompt(
-                filepath, current_code, rework, output_key="code",
-                manifest=manifest, task=task,
-            )
-        else:
-            user_prompt = _build_file_prompt(file_manifest.filepath, manifest, arch, task, rework_instructions=rework)
+        user_prompt = _build_file_prompt(file_manifest.filepath, manifest, arch, task)
 
         backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
         sys_prompt = _build_system_prompt(backend_tech)
@@ -515,11 +425,7 @@ class BackendAgent(BaseAgent):
                 state.log_error(self.name, f"LLM response for {filepath} missing 'code'")
             return
 
-        # Rework responses return only code — preserve existing manifest metadata.
-        if rework:
-            classes, functions = None, None
-        else:
-            classes, functions = parse_metadata(data, default_return_type="None")
+        classes, functions = parse_metadata(data, default_return_type="None")
 
         # Write code to disk (safe-write guard refuses corrupted content)
         try:
@@ -537,8 +443,7 @@ class BackendAgent(BaseAgent):
         # Update ProjectState thread-safely
         with lock:
             state.generated_code.backend[filepath] = code
-            if not rework:
-                state.code_manifest.mark_written(filepath, classes, functions)
+            state.code_manifest.mark_written(filepath, classes, functions)
             state.completed_task_ids.add(task.id)
 
         logger.info("[BackendAgent] Successfully wrote and summarized %s", filepath)
@@ -571,19 +476,13 @@ class BackendAgent(BaseAgent):
                     and not is_barrel_file(getattr(fm, "filepath", ""))
                 )
 
-            def _is_trivial_rework(t: Task) -> bool:
-                fm = ps.code_manifest.by_task(t.id)
-                return build_rework_instructions(ps.integration, getattr(fm, "filepath", ""))
-
-            trivial_batch = [t for t in stage if _is_batchable(t) and not _is_trivial_rework(t)]
-            rework_batch  = [t for t in stage if _is_batchable(t) and _is_trivial_rework(t)]
+            trivial_batch = [t for t in stage if _is_batchable(t)]
             non_trivial   = [t for t in stage if not _is_batchable(t)]
             batches    = [trivial_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial_batch), TRIVIAL_BATCH_SIZE)]
-            rework_bs  = [rework_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(rework_batch), TRIVIAL_BATCH_SIZE)]
 
             logger.info(
-                "[BackendAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d trivial-rework (→ %d batch call(s)) + %d non-trivial",
-                idx + 1, len(stages), len(trivial_batch), len(batches), len(rework_batch), len(rework_bs), len(non_trivial),
+                "[BackendAgent] Stage %d/%d — %d trivial (→ %d batch call(s)) + %d non-trivial",
+                idx + 1, len(stages), len(trivial_batch), len(batches), len(non_trivial),
             )
 
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
@@ -592,10 +491,6 @@ class BackendAgent(BaseAgent):
                     for t in batch:
                         t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
-                for rb in rework_bs:
-                    for t in rb:
-                        t.status = "in_progress"
-                    futures.append(pool.submit(self._process_rework_batch, rb, ps, state_lock))
                 for task in non_trivial:
                     task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
@@ -773,38 +668,4 @@ if __name__ == "__main__":
     assert build_pending_contracts(pc_manifest, "output/backend/db/models.py") == ""
     print("[PASS] _build_file_prompt — Pending Contracts section injected (Phase 2)")
 
-    # ── Test 4: Rework prompt ground truth (Phase 3) ──────────────────────────
-    from agents.base import build_rework_prompt, build_rework_batch_prompt
-    rtr_manifest = CodeManifest(files={
-        "output/backend/api/todo.py": FileManifest(
-            agent="backend", task_id="be-004", filepath="output/backend/api/todo.py",
-            purpose="router", exports=["router"],
-            imports_from={"output/backend/crud/todo.py": ["TodoService"]},
-            written=True,
-        ),
-        "output/backend/crud/todo.py": FileManifest(
-            agent="backend", task_id="be-003", filepath="output/backend/crud/todo.py",
-            purpose="crud", exports=["TodoService"], written=True,
-        ),
-    })
-    import_conflict = (
-        "[IMPORT_NAME] File: output/backend/api/todo.py | Import "
-        "'from backend.services.todo_service import TodoService' cannot be resolved"
-    )
-    rp = build_rework_prompt(
-        "output/backend/api/todo.py",
-        "from backend.services.todo_service import TodoService\n",
-        import_conflict, manifest=rtr_manifest,
-    )
-    assert "IMPORT CONTRACT" in rp and "from crud.todo import TodoService" in rp, rp
-    assert "PROJECT FILE TREE" in rp
-    syntax_conflict = "[SYNTAX] File: output/backend/api/todo.py | Syntax error line 3"
-    rp2 = build_rework_prompt("output/backend/api/todo.py", "x = 1\n", syntax_conflict, manifest=rtr_manifest)
-    assert "IMPORT CONTRACT" not in rp2, "pure-syntax rework must stay lean"
-    rbp = build_rework_batch_prompt(
-        [("output/backend/api/todo.py", "from backend.services.todo_service import TodoService\n", import_conflict)],
-        manifest=rtr_manifest,
-    )
-    assert "IMPORT CONTRACT" in rbp and "PROJECT FILE TREE" in rbp
-    print("[PASS] build_rework_prompt/batch — Import Contract + file tree appended for import/wiring rework only")
     print("=" * 60 + "\n")

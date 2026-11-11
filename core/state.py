@@ -16,8 +16,6 @@ from enum import Enum
 from typing import Any, Optional, Annotated
 from datetime import datetime
 
-from core.config import settings
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Reducer functions for parallel-safe state merging
@@ -64,11 +62,6 @@ def merge_errors(
 ) -> list[dict[str, str]]:
     """Append new errors from the update to the current list."""
     return current + update
-
-
-def merge_str_list(current: list[str], update: list[str]) -> list[str]:
-    """Append new strings from the update to the current list."""
-    return list(current) + list(update)
 
 
 def pick_latest_agent(current: str, update: str) -> str:
@@ -341,18 +334,6 @@ class CodeMap(BaseModel):
     devops: dict[str, str] = Field(default_factory=dict)
  
  
-class IntegrationStatus(BaseModel):
-    merged: bool = False
-    conflicts: list[str] = Field(default_factory=list)
-    unified_entry_point: str = ""
-    #: Truly-unresolved conflicts grouped by owning agent ("backend"/"frontend"/"database"/"devops").
-    #: The graph reads this to route a REWORK loop back to the relevant coding agents.
-    conflicts_by_agent: dict[str, list[str]] = Field(default_factory=dict)
-    #: Truly-unresolved conflicts grouped by file path — used to inject rework
-    #: instructions into the coding-agent prompts when a file is regenerated.
-    rework_targets: dict[str, list[str]] = Field(default_factory=dict)
- 
- 
 class TestResults(BaseModel):
     total: int = 0
     passed: int = 0
@@ -426,21 +407,6 @@ class ProjectState(BaseModel):
     max_clarfication_rounds: int = 3
     clarfication_rounds: int = 0
 
-    # ── Integration REWORK loop (mod 1) ───────────────────────────────
-    # integration -> {coding agent} -> integration, capped at max rounds.
-    # Cap sourced from config (REWORK_TRIAL env) so it's tunable without code changes.
-    integration_rework_rounds: int = 0
-    max_integration_rounds: int = settings.rework_trial or 2
-    # Per-file failed-round counter; files past rework_file_max stop routing back.
-    rework_failures: dict[str, int] = Field(default_factory=dict)
-    rework_file_max: int = settings.rework_file_max or 2
-
-    # ── Project scaffolding file-set (planner-declared, integration-enforced) ──
-    # Planner commits to a fixed set of files the deliverable MUST contain
-    # (requirements.txt, README.md, .env.example, migrations, …). The
-    # integration agent verifies each one exists and is written (FILE_SET check).
-    required_files: list[str] = Field(default_factory=list)
-
     # agents outputs
 
     requirements:    SRSData       = Field(default_factory=SRSData)
@@ -448,19 +414,15 @@ class ProjectState(BaseModel):
     tasks:           Annotated[TaskList, merge_tasks] = Field(default_factory=TaskList)
     code_manifest:   Annotated[CodeManifest, merge_code_manifest] = Field(default_factory=CodeManifest)   # ← file-level contracts
     generated_code:  Annotated[CodeMap, merge_code_map] = Field(default_factory=CodeMap)
-    integration:     IntegrationStatus = Field(default_factory=IntegrationStatus)
     tests:           TestResults   = Field(default_factory=TestResults)
     security:        SecurityScan  = Field(default_factory=SecurityScan)
     review:          ReviewFeedback = Field(default_factory=ReviewFeedback)
 
-    ## human in the loop  
+    ## human in the loop
     hitl: Optional[HITLRequest]=None
-    
+
     # ── Supporting layers (parallel-safe via reducers) ──────────────────────
     artifacts: dict[str, str] = Field(default_factory=dict)        # label -> filepath
-    #: FILE_CORRUPTION conflict strings recorded by coding agents when a write
-    #: was refused by the safe-write guard (consumed by the integration agent).
-    corrupt_writes: Annotated[list[str], merge_str_list] = Field(default_factory=list)
 
     metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
     memory_refs: MemoryPointers = Field(default_factory=MemoryPointers)

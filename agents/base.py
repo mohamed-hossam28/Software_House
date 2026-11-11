@@ -71,13 +71,7 @@ def deep_unescape(data: Any) -> Any:
 
 
 def record_corrupt_write(state: Any, filepath: str, conflict: dict) -> None:
-    """Register a refused safe-write as a FILE_CORRUPTION conflict for the rework loop."""
-    c_str = (
-        f"[FILE_CORRUPTION] File: {filepath} | Expected: {conflict.get('expected')} "
-        f"| Actual: {conflict.get('actual')} | Reason: {conflict.get('reason')}"
-    )
-    if hasattr(state, "corrupt_writes"):
-        state.corrupt_writes.append(c_str)
+    """Log a refused safe-write so the corruption is visible in the run logs."""
     logger.warning("[safe-write] REFUSED corrupted content for %s: %s", filepath, conflict.get("reason"))
 
 
@@ -228,7 +222,7 @@ def is_barrel_file(filepath: str | None) -> bool:
 
 
 def _layer_root_for(filepath: str) -> str | None:
-    """Layer root dir of a workspace file, e.g. 'output/backend/' (mirrors integration.layer_root_for)."""
+    """Layer root dir of a workspace file, e.g. 'output/backend/'."""
     parts = (filepath or "").split("/")
     if len(parts) >= 2 and parts[0] == "output":
         return f"{parts[0]}/{parts[1]}/"
@@ -457,175 +451,6 @@ def align_batch_items(items: list[dict], tasks: list[Any], manifest: Any) -> lis
         return aligned
 
     return list(zip(items, tasks))
-
-
-def build_rework_instructions(integration: Any, filepath: str) -> str:
-    """
-    Build a prompt section for *filepath* describing integration conflicts that
-    a coding agent must resolve when it regenerates the file (REWORK loop).
-
-    Returns an empty string when no rework is required for this file.
-    """
-    targets = {}
-    if integration is not None:
-        targets = getattr(integration, "rework_targets", {}) or {}
-        if isinstance(targets, dict) is False and hasattr(targets, "model_dump"):
-            targets = targets.model_dump()
-
-    notes = targets.get(filepath) if isinstance(targets, dict) else None
-    if not notes:
-        return ""
-
-    lines = "\n".join(f"- {n}" for n in notes)
-    return (
-        "\n## INTEGRATION REWORK REQUIRED\n"
-        "The previous version of this file failed integration checks. "
-        "Fix the following issue(s) in this rewrite:\n\n"
-        f"{lines}\n"
-    )
-
-
-#: Conflict-message markers that indicate a rework round involves IMPORTS or
-#: WIRING — exactly the rounds where a model re-guesses the same wrong path.
-#: Only these get the GROUND TRUTH block (Import Contract + file tree).
-_REWORK_IMPORT_KEYWORDS = (
-    r"\bimport\b", r"cannot be resolved", r"\bexported name\b", r"\breferences\b",
-    r"\bunresolved\b", r"\bwiring\b", r"duplicate prefix", r"\bprefix\b",
-    r"\brouter\b", r"include_router", r"\bfoundation\b", r"\bengine\b",
-    r"\bsessionlocal\b", r"\bmodule\b", r"\bschemas\b", r"\bcrud\b",
-)
-
-
-def _rework_needs_ground_truth(rework_instructions: str) -> bool:
-    """True when a rework round's conflicts involve imports/wiring, so the model
-    must see the real import lines + real sibling files instead of re-guessing."""
-    return any(re.search(k, (rework_instructions or ""), re.IGNORECASE)
-               for k in _REWORK_IMPORT_KEYWORDS)
-
-
-def _rework_ground_truth_section(
-    rework_instructions: str,
-    manifest: Any,
-    filepath: str,
-    task: Any = None,
-) -> str:
-    """
-    Phase 3 — GROUND TRUTH block for a REWORK round whose conflicts involve
-    imports/wiring. The lean rework prompt previously showed ONLY the conflict
-    notes + the file's own code, so the model re-guessed the same wrong import
-    path every round. This block shows the deterministic Import Contract (the
-    real, allowed import lines) + the capped project file tree (the real
-    sibling files and their exports). Returns "" when not applicable.
-    """
-    if not manifest or not hasattr(manifest, "files"):
-        return ""
-    if not _rework_needs_ground_truth(rework_instructions):
-        return ""
-    fm = manifest.files.get(filepath)
-    if fm is None:
-        return ""
-    parts: list[str] = []
-    contract = build_import_contract(manifest, filepath)
-    if contract:
-        parts.append(contract)
-    tree = build_project_file_tree(
-        manifest,
-        highlight_path=filepath,
-        task=task,
-        agent=getattr(fm, "agent", None),
-    )
-    if tree and not tree.startswith("(no "):
-        parts.append(
-            "## PROJECT FILE TREE (capped) — real files, real exports\n"
-            "Use ONLY the import lines above; never invent modules or paths.\n\n"
-            + tree
-        )
-    if not parts:
-        return ""
-    return "\n\n".join(parts)
-
-
-def build_rework_prompt(
-    filepath: str,
-    current_code: str,
-    rework_instructions: str,
-    output_key: str = "code",
-    manifest: Any = None,
-    task: Any = None,
-) -> str:
-    """
-    Build a lean, targeted prompt for a REWORK round.
-
-    Unlike the full generation prompt, this sends ONLY the conflict notes and the
-    current file content, and asks the LLM to return the full corrected file. It is
-    cheaper and minimizes the risk of the LLM regressing unrelated parts of the file.
-
-    Phase 3 — when the rework involves import/wiring conflicts, the deterministic
-    Import Contract + capped project file tree are appended (via *manifest*/*task*)
-    so the model sees the real target modules instead of re-guessing the same wrong
-    path each round.
-    """
-    ground_truth = _rework_ground_truth_section(rework_instructions, manifest, filepath, task)
-    prompt = (
-        f"{rework_instructions.strip()}\n\n"
-        f"Here is the CURRENT content of `{filepath}`:\n\n"
-        f"```\n{current_code}\n```\n\n"
-    )
-    if ground_truth:
-        prompt += f"{ground_truth}\n\n"
-    return prompt + (
-        "Rewrite ONLY what is necessary to fix the issue(s) above. Keep everything "
-        "else identical. Return a single valid JSON object with the full corrected "
-        f"file content under the \"{output_key}\" key. No prose outside the JSON.\n\n"
-        "CRITICAL — the \"code\" value MUST contain the COMPLETE corrected file as "
-        "plain source text, exactly one copy. Never quote or JSON-escape it (no \\n "
-        "sequences, no wrapped quotes). Do NOT paste the CURRENT content shown above "
-        "into the value as a prefix and append changes — the value REPLACES the entire "
-        "file. If no change is actually needed, return the current content as-is, "
-        "exactly one copy."
-    )
-
-
-def build_rework_batch_prompt(
-    entries: list[tuple[str, str, str]],
-    output_key: str = "code",
-    manifest: Any = None,
-) -> str:
-    """
-    Build a lean, targeted prompt for a REWORK batch of multiple files.
-
-    *entries* is a list of (filepath, current_code, rework_instructions) tuples.
-    Returns a prompt asking for a JSON ARRAY of corrected files (one per entry,
-    same order). Used to batch small/trivial rework files into one LLM call.
-
-    Phase 3 — entries whose rework involves import/wiring conflicts get the
-    deterministic Import Contract + capped file tree appended (via *manifest*).
-    """
-    blocks = []
-    for i, (fp, current_code, instr) in enumerate(entries, start=1):
-        ground_truth = _rework_ground_truth_section(instr, manifest, fp)
-        block = (
-            f"### File {i}: {fp}\n"
-            f"{instr.strip()}\n\n"
-            f"CURRENT content of `{fp}`:\n"
-            f"```\n{current_code}\n```"
-        )
-        if ground_truth:
-            block += f"\n\n{ground_truth}"
-        blocks.append(block)
-    joined = "\n\n".join(blocks)
-    return (
-        f"{joined}\n\n"
-        "For EACH file above, fix ONLY the issue(s) listed and return the full "
-        "corrected file content. Do not add new files or reorder. "
-        f"Respond with a single JSON ARRAY (one object per file, in the same order):\n"
-        f'[{{"filepath":"<path>","{output_key}":"<full corrected source>"}}, ...]\n\n'
-        "CRITICAL — each \"code\" value MUST contain the COMPLETE corrected file as "
-        "plain source text, exactly one copy. Never quote or JSON-escape it (no \\n "
-        "sequences, no wrapped quotes). Do NOT paste the CURRENT content shown above "
-        "into a value as a prefix and append changes — each value REPLACES the entire "
-        "file. If no change is needed for a file, return its content as-is, exactly once."
-    )
 
 
 def is_trivial_filepath(filepath: str, exports: list | None = None) -> bool:

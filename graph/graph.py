@@ -18,10 +18,9 @@ from graph.nodes import (
     database_node,
     backend_node,
     frontend_node,
-    integration_node,
     finalize_node,
 )
-from graph.edges import route_after_requirements, route_after_integration
+from graph.edges import route_after_requirements
 
 # Define the StateGraph with ProjectState
 workflow = StateGraph(ProjectState)
@@ -34,7 +33,6 @@ workflow.add_node("planner", planner_node)
 workflow.add_node("database", database_node)
 workflow.add_node("backend", backend_node)
 workflow.add_node("frontend", frontend_node)
-workflow.add_node("integration", integration_node)
 workflow.add_node("finalize", finalize_node)
 
 # Add Edges
@@ -61,23 +59,12 @@ workflow.add_edge("planner", "backend")
 workflow.add_edge("planner", "frontend")
 workflow.add_edge("planner", "database")
 
-# Engineering agents merge into integration
-workflow.add_edge("backend", "integration")
-workflow.add_edge("frontend", "integration")
-workflow.add_edge("database", "integration")
+# Engineering agents converge into the finalize node (persists the run
+# summary next to output/).
+workflow.add_edge("backend", "finalize")
+workflow.add_edge("frontend", "finalize")
+workflow.add_edge("database", "finalize")
 
-# Mod 1 — integration REWORK loop back to the coding agents when conflicts remain,
-# else END via the finalize node (persists the run summary next to output/).
-workflow.add_conditional_edges(
-    "integration",
-    route_after_integration,
-    {
-        "backend": "backend",
-        "frontend": "frontend",
-        "database": "database",
-        "__end__": "finalize",
-    },
-)
 workflow.add_edge("finalize", END)
 
 

@@ -98,11 +98,6 @@ def run_pipeline(prompt: str, project_name: str = "MySoftwareProject", max_round
                     file_names = [os.path.basename(f) for f in written_files]
                     print(f"  +- Written files ({node_name}): {len(written_files)} files ({', '.join(file_names)})")
 
-                elif node_name == "integration":
-                    print(f"  |- Merged status:     {current_state.integration.merged}")
-                    if current_state.integration.conflicts:
-                        print(f"  +- Conflicts:         {len(current_state.integration.conflicts)} items remaining")
-
     except Exception as e:
         logger.error(f"Pipeline execution encountered an error: {e}", exc_info=True)
         # Attempt to retrieve current state from checkpointer

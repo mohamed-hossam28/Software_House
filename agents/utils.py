@@ -335,20 +335,12 @@ def write_run_summary(state: Any) -> str:
             }
             files[fp] = entry
 
-        integration = getattr(state, "integration", None)
         summary = {
             "project_id": getattr(state, "project_id", ""),
             "project_name": getattr(state, "project_name", ""),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "status": getattr(state, "status", ""),
             "files": files,
-            "integration": {
-                "merged": bool(integration.merged if integration else False),
-                "conflicts": list(integration.conflicts if integration else []),
-                "rework_rounds": getattr(state, "integration_rework_rounds", 0),
-                "max_rounds": getattr(state, "max_integration_rounds", 0),
-                "rework_failures": dict(getattr(state, "rework_failures", {}) or {}),
-            },
             "errors": [
                 {"agent": e.get("agent", ""), "message": e.get("message", ""), "ts": str(e.get("ts", ""))}
                 for e in (getattr(state, "errors", None) or [])
