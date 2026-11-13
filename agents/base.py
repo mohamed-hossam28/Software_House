@@ -16,6 +16,12 @@ from pathlib import Path
 from threading import Lock
 
 from agents.utils import _ESCAPED_CHAR_RE
+from core.workspace_paths import (  # noqa: F401  (re-export: shared with the checker layer)
+    _layer_root_for,
+    _module_path_for,
+    _normalized_src,
+    _rel_import_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,50 +225,6 @@ def is_barrel_file(filepath: str | None) -> bool:
     """
     base = os.path.basename(filepath or "").lower()
     return base in _BARREL_NAMES
-
-
-def _layer_root_for(filepath: str) -> str | None:
-    """Layer root dir of a workspace file, e.g. 'output/backend/'."""
-    parts = (filepath or "").split("/")
-    if len(parts) >= 2 and parts[0] == "output":
-        return f"{parts[0]}/{parts[1]}/"
-    return None
-
-
-def _module_path_for(src: str) -> str:
-    """
-    Layer-root-relative dotted Python module for a manifest path.
-    'output/backend/api/todo.py' → 'api.todo'; 'output/backend/db/__init__.py' → 'db'.
-    """
-    root = _layer_root_for(src)
-    rel = src[len(root):] if root and src.startswith(root) else src.lstrip("/").lstrip("\\")
-    if rel.endswith(".py"):
-        rel = rel[:-3]
-    if rel.endswith("/__init__"):
-        rel = rel[: -len("/__init__")].rstrip("/")
-    return rel.replace("/", ".").replace("\\", ".")
-
-
-def _rel_import_path(from_file: str, to_file: str) -> str:
-    """JS/TS relative import path from *from_file* to *to_file* (extension stripped)."""
-    to_no_ext = to_file.replace("\\", "/")
-    for ext in (".tsx", ".ts", ".jsx", ".js"):
-        if to_no_ext.endswith(ext):
-            to_no_ext = to_no_ext[: -len(ext)]
-            break
-    from_dir = os.path.dirname(from_file.replace("\\", "/"))
-    rel = os.path.relpath(to_no_ext, from_dir).replace("\\", "/")
-    if not rel.startswith("."):
-        rel = "./" + rel
-    return rel
-
-
-def _normalized_src(src: str) -> str:
-    """Normalize a planned import source to the manifest's workspace-relative form."""
-    src = str(src).strip().lstrip("/").lstrip("\\").replace("\\", "/")
-    if not src.startswith("output/"):
-        src = f"output/{src}"
-    return src
 
 
 def build_import_contract(manifest: Any, filepath: str) -> str:
