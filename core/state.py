@@ -361,6 +361,36 @@ class ReviewFeedback(BaseModel):
     failed_checks: list[str] = Field(default_factory=list)
     notes: str = ""
     rework_instructions: list[str] = Field(default_factory=list)
+
+
+class FindingSeverity(str, Enum):
+    """Severity of a static-check finding. Only errors trigger repair; warns log only."""
+    ERROR = "error"
+    WARN  = "warn"
+
+
+class StaticFinding(BaseModel):
+    """One result from the Integration Agent's static checks."""
+    file:     str = ""                                              # workspace path e.g. output/backend/api/todo.py
+    check:    str = ""                                              # check id e.g. python_syntax, python_imports, third_party, manifest_written
+    severity: FindingSeverity = FindingSeverity.ERROR
+    line:     int = 0                                               # 1-based source line; 0 = not applicable
+    message:  str = ""
+
+
+class StaticVerdict(str, Enum):
+    """Outcome of the integration node's check/repair cycle."""
+    PASS     = "pass"
+    REPAIRED = "repaired"
+    FAILED   = "failed"
+
+
+class StaticChecks(BaseModel):
+    """Accumulated result of the Integration Agent's static-check + repair cycle."""
+    verdict:        StaticVerdict = StaticVerdict.PASS
+    findings:       list[StaticFinding] = Field(default_factory=list)
+    rounds:         int = 0                                          # repair rounds performed
+    repaired_files: list[str] = Field(default_factory=list)
  
  
 class PerformanceMetrics(BaseModel):
@@ -417,6 +447,7 @@ class ProjectState(BaseModel):
     tests:           TestResults   = Field(default_factory=TestResults)
     security:        SecurityScan  = Field(default_factory=SecurityScan)
     review:          ReviewFeedback = Field(default_factory=ReviewFeedback)
+    static_checks:   StaticChecks  = Field(default_factory=StaticChecks)
 
     ## human in the loop
     hitl: Optional[HITLRequest]=None
