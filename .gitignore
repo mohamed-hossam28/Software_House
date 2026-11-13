@@ -214,3 +214,6 @@ project_req.md
 .agents
 skills-lock.json
 code-review-report.md
+.wayfinder
+docs
+agents.md
