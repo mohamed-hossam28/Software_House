@@ -335,11 +335,34 @@ def write_run_summary(state: Any) -> str:
             }
             files[fp] = entry
 
+        findings = list(getattr(getattr(state, "static_checks", None), "findings", None) or [])
+
+        def _enum_str(value: Any) -> str:
+            return getattr(value, "value", str(value or "")) or ""
+
+        error_count = sum(1 for f in findings if _enum_str(getattr(f, "severity", "")) == "error")
+        warn_count = sum(1 for f in findings if _enum_str(getattr(f, "severity", "")) == "warn")
+
         summary = {
             "project_id": getattr(state, "project_id", ""),
             "project_name": getattr(state, "project_name", ""),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "status": getattr(state, "status", ""),
+            "static_checks": {
+                "verdict": _enum_str(getattr(getattr(state, "static_checks", None), "verdict", "")),
+                "errors": error_count,
+                "warnings": warn_count,
+                "findings": [
+                    {
+                        "file": getattr(f, "file", ""),
+                        "check": getattr(f, "check", ""),
+                        "severity": _enum_str(getattr(f, "severity", "")),
+                        "line": getattr(f, "line", 0),
+                        "message": getattr(f, "message", ""),
+                    }
+                    for f in findings
+                ],
+            },
             "files": files,
             "errors": [
                 {"agent": e.get("agent", ""), "message": e.get("message", ""), "ts": str(e.get("ts", ""))}

@@ -17,9 +17,10 @@ from agents.planner import PlannerAgent
 from agents.data_base import DatabaseAgent
 from agents.backend import BackendAgent
 from agents.frontend import FrontendAgent
+from agents.integration import IntegrationAgent
 
 # Import core state and statuses
-from core.state import ProjectState, ProjectStatus
+from core.state import FindingSeverity, ProjectState, ProjectStatus
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -204,15 +205,40 @@ def frontend_node(state: dict) -> dict:
     return agent.run(state)
 
 
+def integration_node(state: dict) -> dict:
+    """
+    Integration node: runs the IntegrationAgent's static checks over everything
+    the coding agents generated and records a pass/failed verdict in
+    state.static_checks. Error-level findings flow into the state error list.
+    Returns only changed fields as dict. No repair yet.
+    """
+    logger.info("[GraphNode] Running IntegrationAgent (static checks)...")
+    agent = IntegrationAgent(
+        provider=settings.default_provider,
+        model=settings.model_name,
+        retries=settings.default_retries,
+        backoff=settings.default_backoff,
+    )
+    return agent.run(state)
+
+
 def finalize_node(state: dict) -> dict:
     """
     Finalize node: persists the run summary (manifest + conflicts + fingerprints)
     next to the generated project as `output/run_summary.json`. Never fails the run.
+    Prints the integration verdict and finding counts in the summary.
     """
     from agents.utils import write_run_summary
 
     logger.info("[GraphNode] Finalizing — writing run summary...")
     ps = _state_from_dict(state)
+
+    findings = ps.static_checks.findings
+    error_count = sum(1 for f in findings if f.severity == FindingSeverity.ERROR)
+    warn_count = sum(1 for f in findings if f.severity == FindingSeverity.WARN)
+    print(f"Integration verdict: {ps.static_checks.verdict.value} "
+          f"(errors: {error_count}, warnings: {warn_count})")
+
     path = write_run_summary(ps)
     logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
     return {}

@@ -18,6 +18,7 @@ from graph.nodes import (
     database_node,
     backend_node,
     frontend_node,
+    integration_node,
     finalize_node,
 )
 from graph.edges import route_after_requirements
@@ -33,6 +34,7 @@ workflow.add_node("planner", planner_node)
 workflow.add_node("database", database_node)
 workflow.add_node("backend", backend_node)
 workflow.add_node("frontend", frontend_node)
+workflow.add_node("integration", integration_node)
 workflow.add_node("finalize", finalize_node)
 
 # Add Edges
@@ -59,11 +61,13 @@ workflow.add_edge("planner", "backend")
 workflow.add_edge("planner", "frontend")
 workflow.add_edge("planner", "database")
 
-# Engineering agents converge into the finalize node (persists the run
-# summary next to output/).
-workflow.add_edge("backend", "finalize")
-workflow.add_edge("frontend", "finalize")
-workflow.add_edge("database", "finalize")
+# Engineering agents converge into the integration node (static checks),
+# which then hands off to finalize (persists the run summary next to output/).
+workflow.add_edge("backend", "integration")
+workflow.add_edge("frontend", "integration")
+workflow.add_edge("database", "integration")
+
+workflow.add_edge("integration", "finalize")
 
 workflow.add_edge("finalize", END)
 
