@@ -1,53 +1,51 @@
 from providers.llm.base import BaseLLMProvider
- 
- 
-# Registry maps provider name → class
-# Add a new provider here when you add a new file
-_REGISTRY: dict[str, str] = {
+
+from providers.llm.openai_compatible import PROVIDER_SPECS, build_provider
+
+# Dotted paths for providers with their own protocol (dynamic import keeps
+# their SDKs unloaded unless used). OpenAI-compatible names are served by
+# the single OpenAICompatibleProvider class — see providers/llm/openai_compatible.py.
+_SDK_PROVIDERS: dict[str, str] = {
     "anthropic": "providers.llm.anthropic.AnthropicProvider",
-    "open_router": "providers.llm.open_router.OpenAIProvider",
-    "orca_router": "providers.llm.orca_router.OrcaRouterProvider",
-    "token_router": "providers.llm.token_router.TokenRouterProvider",
     "gemini":    "providers.llm.gemini.GeminiProvider",
-    "glm":       "providers.llm.glm.GLMProvider",
-    "nara":      "providers.llm.nara_router.NaraRouterProvider",
 }
- 
- 
+
+
 class LLMFactory:
- 
+
     @staticmethod
     def get(provider_name: str, api_key: str | None = None) -> BaseLLMProvider:
         """
         Returns an instantiated LLM provider.
- 
+
         Args:
-            provider_name:  one of "anthropic", "open_router", "orca_router", "token_router", "gemini", "glm", "nara"
-            api_key:        optional — if None, each provider reads from env
- 
+            provider_name:  one of "anthropic", "gemini", or any OpenAI-compatible
+                            name in providers.llm.openai_compatible.PROVIDER_SPECS
+            api_key:        optional — if None, the provider reads from settings/env
+
         Raises:
-            ValueError:  if the provider name is not in the registry
+            ValueError:  if the provider name is not registered
         """
         name = provider_name.lower().strip()
- 
-        if name not in _REGISTRY:
-            available = ", ".join(_REGISTRY.keys())
+
+        if name in PROVIDER_SPECS:
+            return build_provider(name, api_key=api_key)
+
+        if name not in _SDK_PROVIDERS:
+            available = ", ".join(_SDK_PROVIDERS.keys() | PROVIDER_SPECS.keys())
             raise ValueError(
                 f"Unknown LLM provider: '{provider_name}'. "
                 f"Available providers: {available}"
             )
- 
-        # Import the class dynamically so unused providers are never imported
-        # e.g. if you only use Anthropic, openai and gemini packages are never touched
-        module_path, class_name = _REGISTRY[name].rsplit(".", 1)
- 
+
         import importlib
-        module   = importlib.import_module(module_path)
-        cls      = getattr(module, class_name)
- 
+        module_path, class_name = _SDK_PROVIDERS[name].rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        cls = getattr(module, class_name)
+
         return cls(api_key=api_key)
- 
+
     @staticmethod
     def available() -> list[str]:
         """Returns the list of registered provider names."""
-        return list(_REGISTRY.keys())
+        return list(_SDK_PROVIDERS.keys() | PROVIDER_SPECS.keys())

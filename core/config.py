@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     anthropic_api: Optional[str] = Field(None, validation_alias=AliasChoices("anthropic_api_key", "ANTHROPIC_API_KEY"))
     nvidia_api: Optional[str] = Field(None, validation_alias=AliasChoices("nvidia_api_key", "NVIDIA_API_KEY", "nvidia_api", "NVIDIA_API"))
     nara_api: Optional[str] = Field(None, validation_alias=AliasChoices("nara_api", "nara_api_key", "NARA_API_KEY"))
+    apinex_api: Optional[str] = Field(None, validation_alias=AliasChoices("apinex_api", "apinex_api_key", "APINEX_API_KEY"))
 
     # Provider and model settings
     # Support both DEFAULY_PROVIDER (as requested) and standard DEFAULT_PROVIDER
@@ -81,8 +82,6 @@ class Settings(BaseSettings):
             return "gemini-2.0-flash"
         elif provider == "anthropic":
             return "claude-sonnet-4-6"
-        elif provider == "glm":
-            return "z-ai/glm-5.2"
         elif provider in ("open_router", "openrouter"):
             return "openai/gpt-oss-120b:free"
         elif provider == "orca_router":
@@ -90,7 +89,9 @@ class Settings(BaseSettings):
         elif provider == "token_router":
             return "deepseek/deepseek-v4-pro-0813-free"
         elif provider == "nara":
-            return "mistral-large"
+            return "deepseek-3.2"
+        elif provider == "apinex":
+            return "free/glm-5.3-flash"
         else:
             return "openai/gpt-oss-120b:free"
 
@@ -117,10 +118,10 @@ class Settings(BaseSettings):
             return self.token_router_api
         elif provider in ("groq", "qrok"):
             return self.groq_api
-        elif provider == "glm":
-            return self.nvidia_api
         elif provider == "nara":
             return self.nara_api
+        elif provider == "apinex":
+            return self.apinex_api
         return None
     
 
