@@ -9,19 +9,22 @@ URL matching — fetch(...) and axios(...) calls are extracted, their URL
 expression resolved to normalized path candidates (base-URL/env prefixes and
 full URLs stripped to the path, query strings and trailing slashes removed,
 `${id}` / `:id` / `{id}` parameters unified), and then matched by method and
-path shape against the Architecture Agent's API contracts. A call is clean
-when any candidate matches a contract; a call whose every candidate matches no
-contract — or that hits a contract path only with a different method — is an
-error finding. Candidates exist because a template literal's leading
-interpolation is ambiguous: `${BASE}/todos` (base-URL prefix) and `/${id}/todos`
-(leading path parameter) are structurally identical, so both readings are
-tried and any-match wins — no false positives at the cost of missing an error
-only when one reading matches.
+path shape against the Architecture Agent's API contracts together with the
+backend's implemented FastAPI routes (extracted by
+core.static_checks.route_checker — the two-way HTTP contract story). A call is
+clean when any candidate matches a contract or an implemented route; a call
+whose every candidate matches neither — or that hits a known path only with a
+different method — is an error finding. Candidates exist because a template
+literal's leading interpolation is ambiguous: `${BASE}/todos` (base-URL
+prefix) and `/${id}/todos` (leading path parameter) are structurally
+identical, so both readings are tried and any-match wins — no false positives
+at the cost of missing an error only when one reading matches.
 
 Calls whose URL cannot be statically resolved (a bare variable, a function
-call) are skipped rather than guessed. When the architecture defines no API
-contracts at all the URL check is skipped entirely: there is nothing to match
-against and flagging every frontend call would be noise.
+call) are skipped rather than guessed. The URL check runs when there is
+anything to match against — API contracts or implemented backend routes
+(see core.static_checks.route_checker); when both are empty it is skipped,
+because flagging every frontend call would be noise.
 
 The manifest and dialect parameters are part of the uniform checker signature
 and are unused by the JavaScript checks.
@@ -32,16 +35,19 @@ from typing import Any
 import esprima
 
 from core.state import FindingSeverity, StaticFinding
+from core.static_checks.http_paths import (
+    HTTPIndex,
+    PATH_SLOT,
+    PathShape,
+    contract_index,
+    normalize_path,
+    path_shape,
+    shapes_match,
+)
+from core.static_checks.route_checker import extract_backend_routes
 
 HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 _AXIOS_VERBS = {"get", "post", "put", "patch", "delete", "head", "options", "request"}
-_PATH_SLOT = "{}"                       # parameter slot in a normalized path shape
-_ABSOLUTE_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://[^/]*")
-
-#: PathShape — path reduced to comparable segments, parameters as _PATH_SLOT.
-PathShape = tuple[str, ...]
-#: ContractIndex — path shape → the HTTP methods contracts define on it.
-ContractIndex = dict[PathShape, frozenset[str]]
 
 
 def check_javascript(
@@ -62,7 +68,9 @@ def check_javascript(
         if filepath.endswith((".js", ".mjs")) and code
     }
 
-    contracts = _contract_index(architecture)
+    contracts = contract_index(architecture)
+    routes = extract_backend_routes(files)
+    targets = _merge_indexes(contracts, routes)
 
     for filepath, code in js_files.items():
         tree, error = _parse(code)
@@ -75,9 +83,18 @@ def check_javascript(
                 message=f"SyntaxError: {error.get('message', 'could not be parsed')}",
             ))
             continue
-        if contracts:
-            findings.extend(_check_urls(filepath, tree, contracts))
+        if targets:
+            findings.extend(_check_urls(filepath, tree, targets))
     return findings
+
+
+def _merge_indexes(contracts: HTTPIndex, routes: HTTPIndex) -> HTTPIndex:
+    """Contracts and implemented backend routes as one path shape → methods map."""
+    merged: HTTPIndex = {}
+    for index in (contracts, routes):
+        for shape, methods in index.items():
+            merged[shape] = merged.get(shape, frozenset()) | methods
+    return merged
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -147,31 +164,10 @@ def _node_line(node: Any) -> int:
 # ── Contract matching ────────────────────────────────────────────────────────
 
 
-def _contract_index(architecture: Any) -> ContractIndex:
-    """path-shape → set of HTTP methods; empty when there is nothing to match against."""
-    contracts = getattr(architecture, "api_contracts", None) or []
-    index: ContractIndex = {}
-    for contract in contracts:
-        method = str(getattr(contract, "method", "") or "").upper()
-        path = str(getattr(contract, "path", "") or "")
-        if not method or not path:
-            continue
-        shape = _path_shape(_normalize_path(path))
-        index[shape] = index.get(shape, frozenset()) | {method}
-    return index
-
-
-def _shapes_match(call: PathShape, contract: PathShape) -> bool:
-    """True when the two path shapes align, with parameter slots matching any value."""
-    return len(call) == len(contract) and all(
-        a == b or _PATH_SLOT in (a, b) for a, b in zip(call, contract)
-    )
-
-
 def _check_urls(
     filepath: str,
     tree: Any,
-    contracts: ContractIndex,
+    targets: HTTPIndex,
 ) -> list[StaticFinding]:
     findings: list[StaticFinding] = []
     for node in _walk(tree):
@@ -181,18 +177,20 @@ def _check_urls(
         candidates = _path_candidates(url_expr)
         if not candidates or not method:
             continue
-        if _any_candidate_matches(candidates, method, contracts):
+        if _any_candidate_matches(candidates, method, targets):
             continue
-        methods_on_path = _methods_on_any_candidate(candidates, contracts)
+        methods_on_path = _methods_on_any_candidate(candidates, targets)
         line = _node_line(node)
         if methods_on_path:
             message = (
                 f"Frontend call to {method} {candidates[0]} hits a contract path but no "
-                f"contract defines {method} there (defined: {', '.join(methods_on_path)})"
+                f"contract or implemented route defines {method} there "
+                f"(defined: {', '.join(methods_on_path)})"
             )
         else:
             message = (
-                f"Frontend call to {method} {candidates[0]} does not match any API contract"
+                f"Frontend call to {method} {candidates[0]} matches no API contract "
+                f"or implemented backend route"
             )
         findings.append(StaticFinding(
             file=filepath,
@@ -207,29 +205,29 @@ def _check_urls(
 def _any_candidate_matches(
     candidates: list[str],
     method: str,
-    contracts: ContractIndex,
+    targets: HTTPIndex,
 ) -> bool:
-    """True when any path candidate matches a contract by method and path shape."""
+    """True when any path candidate matches a contract or implemented route."""
     for path in candidates:
-        shape = _path_shape(path)
-        if method in contracts.get(shape, frozenset()):
+        shape = path_shape(path)
+        if method in targets.get(shape, frozenset()):
             return True
-        for known, methods in contracts.items():
-            if method in methods and _shapes_match(shape, known):
+        for known, methods in targets.items():
+            if method in methods and shapes_match(shape, known):
                 return True
     return False
 
 
 def _methods_on_any_candidate(
     candidates: list[str],
-    contracts: ContractIndex,
+    targets: HTTPIndex,
 ) -> list[str]:
-    """Methods contracts define on any path shape a candidate could be."""
+    """Methods contracts or routes define on any path shape a candidate could be."""
     methods: set[str] = set()
     for path in candidates:
-        shape = _path_shape(path)
-        for known, known_methods in contracts.items():
-            if _shapes_match(shape, known):
+        shape = path_shape(path)
+        for known, known_methods in targets.items():
+            if shapes_match(shape, known):
                 methods.update(known_methods)
     return sorted(methods)
 
@@ -300,17 +298,17 @@ def _path_candidates(expr: Any) -> list[str]:
     if expr is None:
         return []
     if expr.type == "Literal" and isinstance(expr.value, str):
-        return _dedupe_paths([_normalize_path(expr.value)])
+        return _dedupe_paths([normalize_path(expr.value)])
     if expr.type == "TemplateLiteral":
         readings = [
             _template_raw(expr, leading_is_parameter=leading)
             for leading in (False, True)
         ]
-        return _dedupe_paths(_normalize_path(raw) for raw in readings)
+        return _dedupe_paths(normalize_path(raw) for raw in readings)
     if expr.type == "BinaryExpression" and getattr(expr.operator, "operator", expr.operator) == "+":
         lefts = _path_candidates(expr.left) or [""]
         rights = _path_candidates(expr.right) or [""]
-        return _dedupe_paths(_normalize_path(left + right) for left in lefts for right in rights)
+        return _dedupe_paths(normalize_path(left + right) for left in lefts for right in rights)
     return []
 
 
@@ -338,38 +336,8 @@ def _template_raw(template: Any, leading_is_parameter: bool) -> str:
         pieces.append(quasi.value.raw or "")
         if index < len(expressions):
             if "".join(pieces):                    # path text precedes → mid-path parameter
-                pieces.append(_PATH_SLOT)
+                pieces.append(PATH_SLOT)
             elif leading_is_parameter:             # leading interpolation read as a parameter
-                pieces.append(_PATH_SLOT)
+                pieces.append(PATH_SLOT)
             # else: leading interpolation read as a base-URL prefix → dropped
     return "".join(pieces)
-
-
-def _normalize_path(raw: str) -> str | None:
-    """Path portion of *raw*: scheme/host stripped, query and trailing slash removed."""
-    path = _ABSOLUTE_URL_RE.sub("", raw or "")
-    path = path.split("?", 1)[0]
-    if not path.startswith("/"):
-        start = path.find("/")
-        if start < 0:
-            return None
-        path = path[start:]
-    path = path.rstrip("/") or "/"
-    return path
-
-
-def _path_shape(path: str) -> PathShape:
-    """Path reduced to comparable segments; parameters become a shared placeholder."""
-    segments: list[str] = []
-    for segment in path.split("/"):
-        if not segment:
-            continue
-        if (
-            (segment.startswith("{") and segment.endswith("}"))
-            or segment.startswith(":")
-            or segment == "{P}"
-        ):
-            segments.append(_PATH_SLOT)
-        else:
-            segments.append(segment.lower())
-    return tuple(segments)
