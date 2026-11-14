@@ -14,8 +14,9 @@ from core.state import StaticFinding
 from core.static_checks.python_checker import check_python
 from core.static_checks.js_checker import check_javascript
 from core.static_checks.route_checker import check_backend_routes
+from core.static_checks.sql_checker import check_sql
 
-ALL_CHECKS = [check_python, check_javascript, check_backend_routes]
+ALL_CHECKS = [check_python, check_javascript, check_backend_routes, check_sql]
 
 
 def run_all_checks(

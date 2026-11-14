@@ -39,3 +39,4 @@ python-dotenv==1.2.2
 
 json-repair==0.61.2
 esprima==4.0.1                   # pure-Python JS parser for frontend static checks
+sqlglot==30.31.0                 # pure-Python SQL parser for dialect-aware SQL static checks
