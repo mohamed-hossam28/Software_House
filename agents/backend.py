@@ -50,6 +50,9 @@ from core.state import (
     Argument,
     ClassName,
     FunctionName,
+    PersistenceContract,
+    backend_persistence_rules,
+    render_persistence_contract,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,8 +61,11 @@ logger = logging.getLogger(__name__)
 MAX_PARALLEL_CALLS = 3
 
 # ── System Prompt Builder ──────────────────────────────────────────────────────
-def _build_system_prompt(backend_tech: str) -> str:
-    """Builds a system prompt tailored to the specific backend technology from the tech stack."""
+def _build_system_prompt(backend_tech: str, contract: PersistenceContract | None = None) -> str:
+    """Builds a system prompt tailored to the backend tech, carrying the persistence contract + mandate."""
+    persistence = "\n\n".join(
+        b for b in (render_persistence_contract(contract), backend_persistence_rules(contract)) if b
+    )
     return f"""\
 You are an expert backend engineer specializing in {backend_tech}.
 Your job is to generate the complete source code for a backend file and its manifest details.
@@ -74,7 +80,16 @@ Your job is to generate the complete source code for a backend file and its mani
 7. Write clean, idiomatic code utilizing features of {backend_tech}.
 8. Include robust error handling and return appropriate error responses / HTTP status codes for {backend_tech}.
 Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"docstring":"<desc>"}}],"functions":[{{"name":"<func name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"return_type":"<type>","docstring":"<desc>"}}]}}
+
+{persistence}
 """
+
+
+def _system_prompt_for(arch: Any) -> str:
+    """System prompt for this project: backend tech + persistence contract and mandate."""
+    default_tech = "FastAPI (Python 3.12)"
+    backend_tech = arch.tech_stack.get("backend", default_tech) if arch and arch.tech_stack else default_tech
+    return _build_system_prompt(backend_tech, arch.persistence_contract if arch else None)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -299,8 +314,7 @@ class BackendAgent(BaseAgent):
         with lock:
             manifest = state.code_manifest
             arch = state.architecture
-            backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
-            sys_prompt = _build_system_prompt(backend_tech)
+            sys_prompt = _system_prompt_for(arch)
             user_prompt = self._build_batch_prompt(tasks, manifest, arch)
 
         filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
@@ -390,8 +404,7 @@ class BackendAgent(BaseAgent):
 
         user_prompt = _build_file_prompt(file_manifest.filepath, manifest, arch, task)
 
-        backend_tech = arch.tech_stack.get("backend", "FastAPI (Python 3.12)") if arch and arch.tech_stack else "FastAPI (Python 3.12)"
-        sys_prompt = _build_system_prompt(backend_tech)
+        sys_prompt = _system_prompt_for(arch)
 
         try:
             raw = self._call_with_system(sys_prompt, user_prompt, agent_name=f"be-{task.id[:6]}", state=state, lock=lock)

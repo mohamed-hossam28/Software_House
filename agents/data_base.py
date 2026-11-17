@@ -64,6 +64,7 @@ from core.state import (
     PersistenceContract,
     CONNECTION_MODULE_EXPORTS,
     build_connection_module,
+    render_persistence_contract,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,12 +99,20 @@ def _orm_constraint_block(arch: Any) -> str:
     )
 
 
-def _build_system_prompt(db_tech: str, orm_block: str = "") -> str:
+def _system_prompt_for(arch: Any) -> str:
+    """System prompt for this project: DB tooling, ORM constraint and persistence contract."""
+    contract = arch.persistence_contract if arch else None
+    return _build_system_prompt(_resolve_db_tech(arch), _orm_constraint_block(arch), contract)
+
+
+def _build_system_prompt(db_tech: str, orm_block: str = "", contract: PersistenceContract | None = None) -> str:
     return f"""\
 You are an expert database engineer specialising in {db_tech}.
 Generate a complete, runnable database migration file AND a structured manifest block.
 
 {orm_block}
+
+{render_persistence_contract(contract)}
 
 ## Strict Rules
 1.  Table and column names MUST match the Architecture database_schema_overview EXACTLY
@@ -320,7 +329,7 @@ class DatabaseAgent(BaseAgent):
             arch = state.architecture
             db_tech = _resolve_db_tech(arch)
             orm_block = _orm_constraint_block(arch)
-            sys_prompt  = _build_system_prompt(db_tech, orm_block)
+            sys_prompt  = _system_prompt_for(arch)
             user_prompt = self._build_batch_prompt(tasks, manifest, arch, db_tech)
 
         filepaths = [manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]
@@ -413,7 +422,7 @@ class DatabaseAgent(BaseAgent):
             arch = state.architecture
             db_tech = _resolve_db_tech(arch)
             orm_block = _orm_constraint_block(arch)
-            sys_prompt = _build_system_prompt(db_tech, orm_block)
+            sys_prompt = _system_prompt_for(arch)
             user_prompt = _build_file_prompt(
                 filepath, task, state.code_manifest, arch, db_tech, orm_block
             )

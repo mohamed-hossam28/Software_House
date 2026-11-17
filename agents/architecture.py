@@ -24,7 +24,7 @@ from typing import Any
 
 from .base import BaseAgent
 from agents.utils import _as_list
-from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError
+from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError, persistence_mandate
 
 logger = logging.getLogger(__name__)
 
@@ -340,8 +340,11 @@ Return JSON:
 """
 
 
-def _complexity_block(tier: str) -> str:
-    """Calibrate output size/complexity to user intent (Problem 4)."""
+def _complexity_block(tier: str, has_database: bool = False) -> str:
+    """Calibrate output size/complexity to user intent (Problem 4).
+
+    With a database, the tier also carries the persistence mandate.
+    """
     constraints = {
         "MINIMAL": (
             "Maximum 10 files total.\n"
@@ -366,6 +369,7 @@ def _complexity_block(tier: str) -> str:
         f"## Complexity: {tier}\n"
         "Calibrate the architecture to this tier. Do not over-engineer beyond the tier.\n"
         + constraints.get(tier, constraints["STANDARD"])
+        + ("\n" + persistence_mandate(tier) if has_database else "")
     )
 
 
@@ -460,7 +464,7 @@ class ArchitectureAgent(BaseAgent):
 
         # ── Complexity calibration (Problem 4) ─────────────────────────────────
         tier = classify_complexity(getattr(ps.requirements, "raw_prompt", ""))
-        complexity_block = _complexity_block(tier)
+        complexity_block = _complexity_block(tier, has_database=bool(authoritative_stack.get("database")))
         results["complexity_tier"] = tier
         logger.info("[ArchitectureAgent] complexity tier: %s", tier)
 

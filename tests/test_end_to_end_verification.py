@@ -299,3 +299,72 @@ def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(monkeypatc
     assert on_disk == manifest[env_path].planned_content
     assert "DATABASE_URL=postgresql://" in on_disk
     assert manifest[env_path].written
+
+
+class MandateObeyingProvider(TodoModelProvider):
+    """Records every prompt; the backend side writes session-backed code with no in-memory state."""
+
+    BACKEND_CODE = (
+        "from db.session import get_db\n"
+        "\n"
+        "\n"
+        "def list_items(db):\n"
+        "    return db.execute(__import__('sqlalchemy').text('SELECT 1')).all()\n"
+    )
+
+    def __init__(self):
+        self.prompts: list[tuple[str, str]] = []
+
+    def complete(self, system_prompt, user_message, *args, **kwargs) -> LLMResponse:
+        self.prompts.append((system_prompt, user_message))
+        response = super().complete(system_prompt, user_message, *args, **kwargs)
+        data = json.loads(response.text)
+        for item in data if isinstance(data, list) else [data]:
+            item["code"] = self.BACKEND_CODE
+        return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
+
+
+def test_mandate_obeying_backend_persists_through_the_synthesized_module(monkeypatch, tmp_path):
+    """Every DB/backend prompt carries the contract; obeying code imports the real module."""
+    import ast
+
+    from agents.backend import BackendAgent
+    from agents.data_base import DatabaseAgent
+    from agents.planner import PlannerAgent
+    from core.state import (ArchData, backend_persistence_rules, build_persistence_contract,
+                            render_persistence_contract)
+    from tests.planner import MockSkeletonLLM
+
+    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
+    contract = build_persistence_contract("SQLite 3")
+    state = ProjectState(project_id="mandate", project_name="TodoMandate")
+    state.requirements.raw_prompt = "Build a todo app."
+    state.architecture = ArchData(
+        tech_stack={"backend": "FastAPI (Python 3.12)", "database": "SQLite 3"},
+        persistence_contract=contract,
+    )
+    db_llm, be_llm = MandateObeyingProvider(), MandateObeyingProvider()
+
+    PlannerAgent(provider=MockSkeletonLLM()).run(state)
+    DatabaseAgent(provider=db_llm, retries=1).run(state)
+    BackendAgent(provider=be_llm, retries=1).run(state)
+
+    rendered = render_persistence_contract(contract)
+    assert db_llm.prompts and be_llm.prompts
+    for system_prompt, user_message in db_llm.prompts + be_llm.prompts:
+        assert rendered in system_prompt + user_message
+    for system_prompt, _ in be_llm.prompts:
+        assert backend_persistence_rules(contract) in system_prompt
+
+    backend_root = tmp_path / "output" / "app"
+    for path in ("services/todo.py", "api/routes/todo.py"):
+        tree = ast.parse((backend_root / path).read_text(encoding="utf-8"))
+        assert not [n for n in tree.body if isinstance(n, ast.Assign)
+                    and isinstance(n.value, (ast.List, ast.Dict))], path
+
+    env = {**os.environ, "DATABASE_URL": f"sqlite:///{(tmp_path / 'app.db').as_posix()}"}
+    probe = "import services.todo, db.session as s; print(services.todo.list_items(next(s.get_db())))"
+    result = subprocess.run([sys.executable, "-c", probe], cwd=backend_root, env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[(1,)]"

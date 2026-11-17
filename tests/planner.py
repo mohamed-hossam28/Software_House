@@ -132,6 +132,7 @@ class MockSkeletonLLM(BaseLLMProvider):
     def complete(self, system_prompt, user_message, model, max_tokens=8192,
                  temperature=0.2, **kwargs):
         self.calls += 1
+        self.last_user_message = user_message
         # The planner must use the skeleton system prompt (Pass 1).
         assert "imports_from" in system_prompt, "Pass-1 skeleton system prompt not used"
         return LLMResponse(
@@ -393,6 +394,17 @@ def test_env_example_without_database_has_no_url_variable():
 
     assert env.planned_content is not None
     assert "DATABASE_URL" not in env.planned_content
+
+
+def test_skeleton_prompt_carries_the_persistence_contract():
+    from core.state import render_persistence_contract
+
+    state = _make_state()
+    state.architecture.persistence_contract = build_persistence_contract("SQLite 3")
+    mock = MockSkeletonLLM()
+    PlannerAgent(provider=mock).run(state)
+
+    assert render_persistence_contract(state.architecture.persistence_contract) in mock.last_user_message
 
 
 # ── End-to-end two-pass run ───────────────────────────────────────────────────

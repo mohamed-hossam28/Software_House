@@ -21,7 +21,8 @@ from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES,
 from providers.llm.base import BaseLLMProvider
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
-    CONNECTION_MODULE_EXPORTS, build_env_example,
+    CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
+    render_persistence_contract,
 )
 import re
 
@@ -71,6 +72,8 @@ SKELETON_USER_TEMPLATE = """\
 ### Database Schema Overview
 {database_schema_overview}
 
+{persistence_contract}
+
 {complexity_constraint}
 ---
 Generate the complete project skeleton. JSON object only:
@@ -92,8 +95,11 @@ def _fmt_tech_stack(stack: dict[str, str]) -> str:
     return "\n".join(f"- {k}: {v}" for k, v in stack.items())
 
 
-def _complexity_constraint(tier: str) -> str:
-    """Prompt-level constraint calibrating file count to user intent (Problem 4)."""
+def _complexity_constraint(tier: str, has_database: bool = False) -> str:
+    """Prompt-level constraint calibrating file count to user intent (Problem 4).
+
+    With a database, the tier also carries the persistence mandate.
+    """
     tier = (tier or "STANDARD").upper()
     limits = {"MINIMAL": "8-12", "STANDARD": "15-30", "ENTERPRISE": "30-60+"}
     return (
@@ -108,6 +114,7 @@ def _complexity_constraint(tier: str) -> str:
             "ENTERPRISE": "- Full auth/RBAC/monitoring as warranted.\n"
                           "- Every file must map to a stated requirement.",
         }.get(tier, "- Only create files that map to stated requirements.")
+        + ("\n" + persistence_mandate(tier) if has_database else "")
     )
 
 
@@ -962,7 +969,11 @@ class PlannerAgent(BaseAgent):
             tech_stack          = _fmt_tech_stack(arch.tech_stack),
             api_contracts       = _fmt_api_contracts(arch.api_contracts),
             database_schema_overview = arch.database_schema_overview or "(none provided)",
-            complexity_constraint    = _complexity_constraint(getattr(arch, "complexity_tier", "STANDARD")),
+            persistence_contract     = render_persistence_contract(arch.persistence_contract),
+            complexity_constraint    = _complexity_constraint(
+                getattr(arch, "complexity_tier", "STANDARD"),
+                has_database=arch.persistence_contract is not None,
+            ),
         )
 
         # ── PASS 1: single skeleton LLM call ────────────────────────────────

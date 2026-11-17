@@ -343,6 +343,58 @@ def get_db():
 {create_schema}'''
 
 
+def connection_import_line(contract: PersistenceContract) -> str:
+    """The one import statement code uses to reach the connection module."""
+    module = contract.connection_module.removesuffix(".py").replace("/", ".")
+    return f"from {module} import {', '.join(CONNECTION_MODULE_EXPORTS)}"
+
+
+def render_persistence_contract(contract: Optional[PersistenceContract]) -> str:
+    """Prompt block giving every downstream agent identical persistence values."""
+    if contract is None:
+        return "## Persistence Contract\n(no database in this stack — nothing to persist to)"
+    migrations = contract.migrations_tool or "none (the ORM creates the schema)"
+    return (
+        "## Persistence Contract (fixed — every agent uses exactly these values)\n"
+        f"- ORM: {contract.orm}\n"
+        f"- Migrations tool: {migrations}\n"
+        f"- DB URL env var: {contract.db_url_env_var} (read from the environment only — never hardcode)\n"
+        f"- Connection module: {contract.connection_module} (relative to the backend root; "
+        f"synthesized, do not write it) — import with `{connection_import_line(contract)}`\n"
+        f"- Init command (run once before serving): {contract.init_command}"
+    )
+
+
+def backend_persistence_rules(contract: Optional[PersistenceContract]) -> str:
+    """Backend system-prompt rules forcing real persistence (empty with no database)."""
+    if contract is None:
+        return ""
+    return (
+        "## Persistence Mandate (MUST follow)\n"
+        f"- Routers and services obtain database sessions ONLY from the connection module: "
+        f"`{connection_import_line(contract)}` (`get_db` yields a session and closes it). "
+        "Never create engines, sessions or connections anywhere else.\n"
+        f"- All data persists to the database through {contract.orm}. NEVER use module-level "
+        "lists, dicts or other mutable globals as data storage — no in-memory stores, even for "
+        "simple apps."
+    )
+
+
+#: Persistence mandate appended to every complexity-tier calibration block —
+#: a smaller tier means a smaller database, never no database.
+_MINIMAL_PERSISTENCE_MANDATE = (
+    "- Persistence: store all data in a small real database through the ORM — never in-memory."
+)
+_PERSISTENCE_MANDATE = (
+    "- Persistence: all data persists to the configured database through the ORM — no in-memory storage."
+)
+
+
+def persistence_mandate(tier: str) -> str:
+    """The persistence rule for a complexity tier (MINIMAL still means a real database)."""
+    return _MINIMAL_PERSISTENCE_MANDATE if (tier or "").upper() == "MINIMAL" else _PERSISTENCE_MANDATE
+
+
 #: Complexity tiers for calibrating output size to user intent (Problem 4).
 COMPLEXITY_TIERS: tuple[str, ...] = ("MINIMAL", "STANDARD", "ENTERPRISE")
 

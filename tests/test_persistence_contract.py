@@ -198,3 +198,64 @@ def test_mongodb_connection_module_uses_motor_not_sqlalchemy():
     assert not any(m.startswith("sqlalchemy") for m in imported if m)
     assert {"engine", "SessionLocal", "get_db"} <= defined
     assert 'os.environ["DATABASE_URL"]' in source
+
+
+# ── Contract rendering + persistence mandate (ticket #16) ─────────────────────
+
+def test_rendered_contract_carries_every_value_downstream_agents_must_agree_on():
+    from core.state import render_persistence_contract
+
+    rendered = render_persistence_contract(build_persistence_contract("PostgreSQL 16"))
+
+    for value in ("SQLAlchemy", "Alembic", "DATABASE_URL", "db/session.py",
+                  "from db.session import engine, SessionLocal, get_db", "alembic upgrade head"):
+        assert value in rendered
+
+
+def test_rendered_contract_without_database_names_no_url_variable():
+    from core.state import render_persistence_contract
+
+    assert "DATABASE_URL" not in render_persistence_contract(None)
+
+
+def _planner_prompt(tier: str, database_tech: str | None) -> str:
+    from agents.planner import PlannerAgent
+    from core.state import ArchData, ProjectState
+    from tests.planner import MockSkeletonLLM
+
+    state = ProjectState(project_id="tier", project_name="Tier")
+    state.architecture = ArchData(
+        tech_stack={"backend": "FastAPI (Python 3.12)", **({"database": database_tech} if database_tech else {})},
+        persistence_contract=build_persistence_contract(database_tech) if database_tech else None,
+        complexity_tier=tier,
+    )
+    mock = MockSkeletonLLM()
+    PlannerAgent(provider=mock).run(state)
+    return mock.last_user_message
+
+
+@pytest.mark.parametrize("tier", ["MINIMAL", "STANDARD", "ENTERPRISE"])
+def test_every_complexity_tier_carries_the_persistence_mandate_when_there_is_a_database(tier):
+    from agents.architecture import _complexity_block
+    from core.state import persistence_mandate
+
+    mandate = persistence_mandate(tier)
+
+    assert mandate in _planner_prompt(tier, "SQLite 3")
+    assert mandate in _complexity_block(tier, has_database=True)
+
+
+def test_stack_without_database_gets_no_persistence_mandate():
+    from agents.architecture import _complexity_block
+    from core.state import persistence_mandate
+
+    mandate = persistence_mandate("STANDARD")
+
+    assert mandate not in _planner_prompt("STANDARD", None)
+    assert mandate not in _complexity_block("STANDARD", has_database=False)
+
+
+def test_minimal_tier_still_requires_a_real_database():
+    from core.state import persistence_mandate
+
+    assert "small real database" in persistence_mandate("MINIMAL")
