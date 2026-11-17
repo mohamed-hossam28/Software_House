@@ -50,6 +50,7 @@ except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items
 from agents.utils import safe_write, parse_metadata, resolve_stages
+from core.workspace_paths import _module_path_for
 
 from core.state import (
     ProjectState,
@@ -60,6 +61,9 @@ from core.state import (
     Argument,
     ClassName,
     FunctionName,
+    PersistenceContract,
+    CONNECTION_MODULE_EXPORTS,
+    build_connection_module,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,34 @@ No prose outside the JSON object.
 
 
 # ── Priority-based stage resolver ──────────────────────────────────────────────
+
+def is_connection_module(fm: FileManifest | None, contract: PersistenceContract | None) -> bool:
+    """True for the planner-pinned DB connection module (matched by the contract path)."""
+    return (
+        fm is not None and contract is not None and fm.agent == "database"
+        and fm.filepath.endswith("/" + contract.connection_module)
+    )
+
+
+def _deterministic_kind(fm: FileManifest | None, contract: PersistenceContract | None) -> str | None:
+    """'connection module' / 'barrel' for files written without the LLM, else None."""
+    if fm is None:
+        return None
+    if is_connection_module(fm, contract):
+        return "connection module"
+    if is_barrel_file(fm.filepath):
+        return "barrel"
+    return None
+
+
+def _model_modules(manifest: CodeManifest) -> list[str]:
+    """Dotted modules of the database agent's ORM model files (under a models/ package) for create-all."""
+    return sorted(
+        _module_path_for(path) for path, fm in manifest.files.items()
+        if fm.agent == "database" and "/models/" in path
+        and path.endswith(".py") and not is_barrel_file(path)
+    )
+
 
 def resolve_db_stages(tasks: list[Task]) -> list[list[Task]]:
     """Groups DB tasks into execution stages based on priority then depends_on."""
@@ -362,25 +394,18 @@ class DatabaseAgent(BaseAgent):
         filepath = fm.filepath
         logger.info("[DBAgent] Generating migration for %s (task %s) …", filepath, task.id)
 
-        # Barrel files (`__init__.py`) are pure re-exports — synthesize
-        # deterministically from the manifest. No LLM call, no guessing.
-        if is_barrel_file(filepath):
-            content = build_barrel_content(filepath, state.code_manifest)
-            try:
-                written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
-            except Exception as exc:
-                logger.error("[DBAgent] Barrel write failed for %s: %s", filepath, exc)
-                with lock:
-                    state.log_error(self.name, f"Barrel write failed for {filepath}: {exc}")
-                return
-            if written_code is None:
-                logger.warning("[DBAgent] Corrupted barrel content refused for %s", filepath)
-                return
-            with lock:
-                state.generated_code.database[filepath] = written_code
-                state.code_manifest.mark_written(filepath, [], [])
-                state.completed_task_ids.add(task.id)
-            logger.info("[DBAgent] ✓ barrel (deterministic): %s", filepath)
+        # The connection module is synthesized from the persistence contract and
+        # barrel files (`__init__.py`) are pure re-exports — both are written
+        # deterministically. No LLM call, no guessing.
+        with lock:
+            contract = state.architecture.persistence_contract
+            kind = _deterministic_kind(fm, contract)
+            if kind == "connection module":
+                content = build_connection_module(contract, _model_modules(state.code_manifest))
+            elif kind == "barrel":
+                content = build_barrel_content(filepath, state.code_manifest)
+        if kind is not None:
+            self._write_deterministic(task.id, filepath, content, kind, state, lock)
             return
 
         # Build prompts while holding the lock (read-only snapshot of shared state)
@@ -466,9 +491,18 @@ class DatabaseAgent(BaseAgent):
 
         state_lock = Lock()
 
+        # Deterministic files (barrels, connection module) are never batched.
+        contract = ps.architecture.persistence_contract
+
+        def _is_batchable(t: Task) -> bool:
+            return (
+                is_trivial_file(t, ps.code_manifest)
+                and _deterministic_kind(ps.code_manifest.by_task(t.id), contract) is None
+            )
+
         for idx, stage in enumerate(stages):
-            trivial_batch = [t for t in stage if is_trivial_file(t, ps.code_manifest) and not is_barrel_file(getattr(ps.code_manifest.by_task(t.id), "filepath", ""))]
-            non_trivial   = [t for t in stage if not is_trivial_file(t, ps.code_manifest)]
+            trivial_batch = [t for t in stage if _is_batchable(t)]
+            non_trivial   = [t for t in stage if not _is_batchable(t)]
             batches    = [trivial_batch[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(trivial_batch), TRIVIAL_BATCH_SIZE)]
 
             logger.info(
@@ -617,6 +651,24 @@ if __name__ == "__main__":
     assert len(written_fm.classes[0].arguments) == 4, "Columns count mismatch"
     assert not state.errors, f"Unexpected errors: {state.errors}"
     print("[PASS] DatabaseAgent mock run — migration written, manifest in state classes, no errors")
+
+    # ── Connection module detection + model module discovery ──────────────────
+    from core.state import build_persistence_contract
+    sqlite_contract = build_persistence_contract("SQLite 3")
+    session_fm = FileManifest(agent="database", task_id="db-900", filepath="output/app/db/session.py",
+                              purpose="conn", exports=list(CONNECTION_MODULE_EXPORTS))
+    model_fm = FileManifest(agent="database", task_id="db-001", filepath="output/app/models/todo.py",
+                            purpose="model", exports=["TodoItem"])
+    assert is_connection_module(session_fm, sqlite_contract)
+    assert not is_connection_module(model_fm, sqlite_contract)
+    assert not is_connection_module(session_fm, None)
+    reordered_fm = session_fm.model_copy(update={"exports": ["get_db", "engine"]})
+    assert is_connection_module(reordered_fm, sqlite_contract), "matched by contract path, not exports"
+    helper_fm = FileManifest(agent="database", task_id="db-002", filepath="output/app/db/seed.py",
+                             purpose="seed helper", exports=["seed"])
+    cm_conn = CodeManifest(files={p.filepath: p for p in (session_fm, model_fm, helper_fm)})
+    assert _model_modules(cm_conn) == ["models.todo"], "only models/ files feed create-all"
+    print("[PASS] is_connection_module / _model_modules — pinned module detected, models discovered")
 
     # Cleanup
     import shutil

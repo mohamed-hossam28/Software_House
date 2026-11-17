@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from threading import Lock
 
-from agents.utils import _ESCAPED_CHAR_RE
+from agents.utils import _ESCAPED_CHAR_RE, safe_write
 from core.workspace_paths import (  # noqa: F401  (re-export: shared with the checker layer)
     _layer_root_for,
     _module_path_for,
@@ -607,6 +607,27 @@ class BaseAgent(ABC):
         if name in ("data_base", "db"):
             name = "database"
         return name
+
+    def _write_deterministic(
+        self, task_id: str, filepath: str, content: str, kind: str, state: ProjectState, lock: Lock,
+    ) -> None:
+        """Write non-LLM content (barrel, planned content, connection module) through
+        safe-write and mark the manifest entry written."""
+        try:
+            written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
+        except Exception as exc:
+            logger.error("[%s] %s write failed for %s: %s", self.name, kind, filepath, exc)
+            with lock:
+                state.log_error(self.name, f"{kind} write failed for {filepath}: {exc}")
+            return
+        if written_code is None:
+            logger.warning("[%s] Corrupted %s content refused for %s", self.name, kind, filepath)
+            return
+        with lock:
+            getattr(state.generated_code, self.code_bucket)[filepath] = written_code
+            state.code_manifest.mark_written(filepath, [], [])
+            state.completed_task_ids.add(task_id)
+        logger.info("[%s] ✓ %s (deterministic): %s", self.name, kind, filepath)
 
     @property
     @abstractmethod

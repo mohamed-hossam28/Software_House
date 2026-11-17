@@ -1,5 +1,9 @@
 """Seam 1 — the persistence contract is a pure function of the database tech string."""
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from core.state import UnknownDatabaseError, build_persistence_contract
@@ -91,3 +95,106 @@ def test_env_example_without_a_known_database_has_no_url_variable(database_tech)
     from core.state import build_env_example
 
     assert "DATABASE_URL" not in build_env_example(database_tech)
+
+
+# ── Connection module synthesizer (ticket #14) ────────────────────────────────
+
+def _exec_module(source: str, monkeypatch, database_url: str) -> dict:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    namespace: dict = {"__name__": "db.session"}
+    exec(compile(source, "db/session.py", "exec"), namespace)
+    return namespace
+
+
+def test_connection_module_session_dependency_yields_a_working_session(monkeypatch):
+    from sqlalchemy import text
+
+    from core.state import build_connection_module
+
+    source = build_connection_module(build_persistence_contract("SQLite 3"), model_modules=[])
+    module = _exec_module(source, monkeypatch, "sqlite://")
+
+    sessions = module["get_db"]()
+    db = next(sessions)
+    assert db.execute(text("SELECT 1")).scalar() == 1
+    sessions.close()  # dependency teardown runs the finally block
+    assert {"engine", "SessionLocal", "get_db"} <= module.keys()
+
+
+@pytest.mark.parametrize("database_tech", ["PostgreSQL 16", "MySQL 8", "SQLite 3"])
+def test_connection_module_hardcodes_no_host_database_or_credentials(database_tech):
+    from core.state import build_connection_module
+
+    source = build_connection_module(build_persistence_contract(database_tech), model_modules=["models.todo"])
+
+    assert 'os.environ["DATABASE_URL"]' in source
+    for leaked in ("://", "localhost", "127.0.0.1", "@", "password", "change-me"):
+        assert leaked not in source
+
+
+#: Minimal SQLAlchemy model module, shared with the end-to-end suite.
+TODO_MODEL_SOURCE = '''
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+
+class TodoItem(Base):
+    __tablename__ = "todo_items"
+    id = Column(Integer, primary_key=True)
+    title = Column(String)
+'''
+
+
+def _run_init_command(tmp_path, database_tech: str) -> list[str]:
+    """Lay out a backend root, run `python -m db.session`, return the created tables."""
+    from sqlalchemy import create_engine, inspect
+
+    from core.state import build_connection_module
+
+    (tmp_path / "db").mkdir()
+    (tmp_path / "db" / "__init__.py").write_text("")
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "__init__.py").write_text("")
+    (tmp_path / "models" / "todo.py").write_text(TODO_MODEL_SOURCE)
+    (tmp_path / "db" / "session.py").write_text(
+        build_connection_module(build_persistence_contract(database_tech), model_modules=["models.todo"]),
+        encoding="utf-8",
+    )
+    url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
+    env = {**os.environ, "DATABASE_URL": url}
+
+    subprocess.run([sys.executable, "-m", "db.session"], cwd=tmp_path, env=env, check=True)
+
+    return inspect(create_engine(url)).get_table_names()
+
+
+def test_create_all_stack_init_command_creates_the_model_tables(tmp_path):
+    contract = build_persistence_contract("SQLite 3")
+    assert contract.init_command == "python -m db.session"
+
+    assert _run_init_command(tmp_path, "SQLite 3") == ["todo_items"]
+
+
+def test_migrations_stack_leaves_schema_creation_to_the_migrations_tool(tmp_path):
+    # Same SQLAlchemy module shape; only the schema-creation path differs.
+    assert _run_init_command(tmp_path, "PostgreSQL 16") == []
+
+
+def test_mongodb_connection_module_uses_motor_not_sqlalchemy():
+    import ast
+
+    from core.state import build_connection_module
+
+    source = build_connection_module(build_persistence_contract("MongoDB 7"), model_modules=[])
+    tree = ast.parse(source)
+
+    imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    defined = {t.id for node in tree.body if isinstance(node, ast.Assign) for t in node.targets
+               if isinstance(t, ast.Name)}
+    defined |= {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "motor.motor_asyncio" in imported
+    assert not any(m.startswith("sqlalchemy") for m in imported if m)
+    assert {"engine", "SessionLocal", "get_db"} <= defined
+    assert 'os.environ["DATABASE_URL"]' in source

@@ -358,26 +358,6 @@ class BackendAgent(BaseAgent):
                 state.completed_task_ids.add(task.id)
             logger.info("[BackendAgent] ✓ batch trivial: %s", fm.filepath)
 
-    def _write_deterministic(
-        self, task: Task, filepath: str, content: str, kind: str, state: ProjectState, lock: Lock,
-    ) -> None:
-        """Write non-LLM content through safe-write and mark the manifest entry written."""
-        try:
-            written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
-        except Exception as exc:
-            logger.error("[BackendAgent] %s write failed for %s: %s", kind, filepath, exc)
-            with lock:
-                state.log_error(self.name, f"{kind} write failed for {filepath}: {exc}")
-            return
-        if written_code is None:
-            logger.warning("[BackendAgent] Corrupted %s content refused for %s", kind, filepath)
-            return
-        with lock:
-            state.generated_code.backend[filepath] = written_code
-            state.code_manifest.mark_written(filepath, [], [])
-            state.completed_task_ids.add(task.id)
-        logger.info("[BackendAgent] ✓ %s (deterministic): %s", kind, filepath)
-
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
         """Worker thread task to call the LLM, write file, and update manifest."""
         manifest = state.code_manifest
@@ -397,11 +377,11 @@ class BackendAgent(BaseAgent):
         # contract) and barrel files (`__init__.py`, `index.ts`, pure re-exports)
         # are written deterministically. No LLM call, no guessing.
         if file_manifest.planned_content is not None:
-            self._write_deterministic(task, filepath, file_manifest.planned_content, "planned content", state, lock)
+            self._write_deterministic(task.id, filepath, file_manifest.planned_content, "planned content", state, lock)
             return
         if is_barrel_file(filepath):
             content = build_barrel_content(filepath, manifest)
-            self._write_deterministic(task, filepath, content, "barrel", state, lock)
+            self._write_deterministic(task.id, filepath, content, "barrel", state, lock)
             return
 
         # Build prompt using current thread-safe snapshot of manifest and architecture stack

@@ -255,6 +255,94 @@ def build_env_example(database_tech: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_motor_connection_module(contract: PersistenceContract) -> str:
+    """Connection module for document stores (Beanie/MongoDB) — Motor client + database dependency."""
+    env_var = contract.db_url_env_var
+    return f'''"""
+DB connection module - synthesized from the persistence contract ({contract.orm}).
+Generated deterministically; do not hand-edit. Reads the URL from ${env_var}.
+"""
+import os
+
+from motor.motor_asyncio import AsyncIOMotorClient
+
+DATABASE_URL = os.environ["{env_var}"]
+
+engine = AsyncIOMotorClient(DATABASE_URL)
+
+
+def SessionLocal():
+    """Return the database named in the URL."""
+    return engine.get_default_database()
+
+
+async def get_db():
+    """Database dependency: yield the database handle."""
+    yield SessionLocal()
+'''
+
+
+def build_connection_module(contract: PersistenceContract, model_modules: list[str]) -> str:
+    """Deterministic source of the DB connection module (contract.connection_module).
+
+    Defines CONNECTION_MODULE_EXPORTS — engine, session factory, session
+    dependency — and reads the DB URL from the contract's env var only, so no
+    host, database name or credentials are ever hardcoded.
+    """
+    env_var = contract.db_url_env_var
+    if contract.orm != "SQLAlchemy":
+        return _build_motor_connection_module(contract)
+    create_schema = ""
+    if contract.migrations_tool is None:
+        # No migrations tool: the init command (`python -m <module>`) creates
+        # every table declared by the model modules.
+        create_schema = f'''
+
+def create_schema():
+    """Create every table declared by the model modules (no migrations tool)."""
+    import importlib
+
+    from sqlalchemy import MetaData
+
+    for module_name in {model_modules!r}:
+        module = importlib.import_module(module_name)
+        for value in vars(module).values():
+            metadata = getattr(value, "metadata", None)
+            if isinstance(metadata, MetaData):
+                metadata.create_all(bind=engine)
+
+
+if __name__ == "__main__":
+    create_schema()
+'''
+    return f'''"""
+DB connection module - synthesized from the persistence contract ({contract.orm}).
+Generated deterministically; do not hand-edit. Reads the URL from ${env_var}.
+"""
+import os
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.environ["{env_var}"]
+
+# SQLite connections are shared across FastAPI's threadpool.
+_connect_args = {{"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {{}}
+
+engine = create_engine(DATABASE_URL, connect_args=_connect_args)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def get_db():
+    """Session dependency: yield a session, always close it."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+{create_schema}'''
+
+
 #: Complexity tiers for calibrating output size to user intent (Problem 4).
 COMPLEXITY_TIERS: tuple[str, ...] = ("MINIMAL", "STANDARD", "ENTERPRISE")
 

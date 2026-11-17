@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agents.integration import IntegrationAgent
@@ -18,6 +20,7 @@ from core.state import (
 )
 from graph.nodes import finalize_node
 from providers.llm.base import BaseLLMProvider, LLMResponse
+from tests.test_persistence_contract import TODO_MODEL_SOURCE
 
 
 class BrokenSeedRepairProvider(BaseLLMProvider):
@@ -210,9 +213,22 @@ class AnyCodingFileProvider(BaseLLMProvider):
         return LLMResponse(text=text, input_tokens=10, output_tokens=10)
 
 
-def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(monkeypatch, tmp_path):
-    """Planner → database + backend agents: the connection module is planned and
-    written, main.py imports it, and .env.example is written verbatim."""
+class TodoModelProvider(AnyCodingFileProvider):
+    """Database-agent LLM stub that writes a real SQLAlchemy model."""
+
+    MODEL = TODO_MODEL_SOURCE
+
+    def complete(self, *args, **kwargs) -> LLMResponse:
+        response = super().complete(*args, **kwargs)
+        data = json.loads(response.text)
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            item["migration_code"] = self.MODEL
+        return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
+
+
+def _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech: str) -> ProjectState:
+    """Planner → database + backend agents with mocked LLMs, writing under tmp_path."""
     from agents.backend import BackendAgent
     from agents.data_base import DatabaseAgent
     from agents.planner import PlannerAgent
@@ -224,13 +240,52 @@ def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(monkeypatc
     state.requirements.raw_prompt = "Build a todo app."
     state.architecture = ArchData(
         tech_stack={"backend": "FastAPI (Python 3.12)", "frontend": "HTML + Vanilla JS",
-                    "database": "PostgreSQL 16"},
-        persistence_contract=build_persistence_contract("PostgreSQL 16"),
+                    "database": database_tech},
+        persistence_contract=build_persistence_contract(database_tech),
     )
 
     PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=AnyCodingFileProvider(), retries=1).run(state)
+    DatabaseAgent(provider=TodoModelProvider(), retries=1).run(state)
     BackendAgent(provider=AnyCodingFileProvider(), retries=1).run(state)
+    return state
+
+
+@pytest.mark.parametrize("database_tech", ["PostgreSQL 16", "SQLite 3"])
+def test_database_agent_synthesizes_the_connection_module_without_the_llm(
+    monkeypatch, tmp_path, database_tech
+):
+    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech)
+
+    session_path = "output/app/db/session.py"
+    on_disk = (tmp_path / session_path).read_text(encoding="utf-8")
+    assert "LLM_WROTE_THIS" not in on_disk
+    assert 'os.environ["DATABASE_URL"]' in on_disk
+    assert "def get_db" in on_disk
+    assert state.code_manifest.files[session_path].written
+    assert state.generated_code.database[session_path] == on_disk
+
+
+def test_sqlite_stack_init_command_runs_against_the_generated_project(monkeypatch, tmp_path):
+    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, "SQLite 3")
+    contract = state.architecture.persistence_contract
+    backend_root = tmp_path / "output" / "app"
+    url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
+    env = {**os.environ, contract.db_url_env_var: url}
+
+    result = subprocess.run(
+        [sys.executable, *contract.init_command.split()[1:]],
+        cwd=backend_root, env=env, capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    from sqlalchemy import create_engine, inspect
+    assert inspect(create_engine(url)).get_table_names() == ["todo_items"]
+
+
+def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(monkeypatch, tmp_path):
+    """Planner → database + backend agents: the connection module is planned and
+    written, main.py imports it, and .env.example is written verbatim."""
+    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, "PostgreSQL 16")
 
     manifest = state.code_manifest.files
     session = manifest["output/app/db/session.py"]
