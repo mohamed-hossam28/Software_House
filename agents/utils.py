@@ -399,7 +399,7 @@ def write_run_summary(state: Any, static_report_path: str = "") -> str:
         code_map = getattr(state, "generated_code", None)
         buckets = {}
         if code_map is not None:
-            for layer in ("backend", "frontend", "database", "devops"):
+            for layer in ("backend", "frontend", "database"):
                 buckets.update(getattr(code_map, layer, {}) or {})
 
         manifest = getattr(state, "code_manifest", None)

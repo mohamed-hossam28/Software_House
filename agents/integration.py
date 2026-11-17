@@ -88,7 +88,7 @@ class IntegrationAgent(BaseAgent):
         t0 = time.perf_counter()
 
         files: dict[str, str] = {}
-        for layer in ("backend", "frontend", "database", "devops"):
+        for layer in ("backend", "frontend", "database"):
             files.update(getattr(ps.generated_code, layer, {}) or {})
 
         dialect = str((ps.architecture.tech_stack or {}).get("database", "") or "")
@@ -311,7 +311,7 @@ class IntegrationAgent(BaseAgent):
     def _replace_bucket_entry(self, ps: ProjectState, filepath: str, content: str) -> None:
         """Write the repaired content into the generated_code bucket that owns the file."""
         layer = self._bucket_layer(ps, filepath)
-        for candidate in ("backend", "frontend", "database", "devops"):
+        for candidate in ("backend", "frontend", "database"):
             bucket = dict(getattr(ps.generated_code, candidate) or {})
             bucket.pop(filepath, None)
             if candidate == layer:
@@ -331,17 +331,16 @@ class IntegrationAgent(BaseAgent):
             "database": "database",
             "data_base": "database",
             "db": "database",
-            "devops": "devops",
         }
         if owner in owner_layers:
             return owner_layers[owner]
 
         code_map = ps.generated_code
-        for layer in ("backend", "frontend", "database", "devops"):
+        for layer in ("backend", "frontend", "database"):
             if filepath in (getattr(code_map, layer, None) or {}):
                 return layer
         norm = f"/{filepath.replace(os.sep, '/')}"
-        for layer in ("backend", "frontend", "database", "devops"):
+        for layer in ("backend", "frontend", "database"):
             if f"/{layer}/" in norm:
                 return layer
         raise ValueError(f"Cannot determine generated-code owner for '{filepath}'")

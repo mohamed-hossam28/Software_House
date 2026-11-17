@@ -4,16 +4,11 @@ agents/architecture.py
 Architecture Agent — parallel 3-round execution via ThreadPoolExecutor.
 
 ROUND 1 (fully independent — run in parallel)
-  ├── Call A: tech_stack
-  ├── Call B: system_components
-  └── Call C: db_schema_overview
+  ├── Call A: core architecture  (tech_stack + system_components + security)
+  └── Call B: db_schema_overview
 
-ROUND 2 (depends on Round 1 — run in parallel)
-  ├── Call D: api_contracts       (needs tech_stack + system_components)
-  └── Call E: security_requirements (needs tech_stack)
-
-ROUND 3 (depends on Round 2 — single call)
-  └── Call F: data_flow           (needs api_contracts + system_components)
+ROUND 2 (depends on Round 1 — single call)
+  └── Call C: api_contracts      (needs tech_stack + system_components)
 """
 
 import logging

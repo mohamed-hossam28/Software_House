@@ -129,14 +129,7 @@ class ProjectStatus(str, Enum):
     AWAITING_HUMAN = "awaiting_human"
     COMPLETED    = "completed"
     FAILED       = "failed"
-    REWORK       = "rework"
- 
- 
-class ReviewVerdict(str, Enum):
-    PASS   = "pass"
-    REWORK = "rework"
-    FAIL   = "fail"
- 
+  
 
 ###################### data models##############################################################
 
@@ -331,38 +324,8 @@ class CodeMap(BaseModel):
     backend: dict[str, str] = Field(default_factory=dict)          # filepath -> code
     frontend: dict[str, str] = Field(default_factory=dict)
     database: dict[str, str] = Field(default_factory=dict)
-    devops: dict[str, str] = Field(default_factory=dict)
- 
- 
-class TestResults(BaseModel):
-    total: int = 0
-    passed: int = 0
-    failed: int = 0
-    skipped: int = 0
-    coverage_pct: float = 0.0
-    failures: list[dict[str, str]] = Field(default_factory=list)   # [{test, reason}]
-    report_path: str = ""
- 
- 
-class SecurityScan(BaseModel):
-    scanned_at: Optional[datetime] = None
-    critical: int = 0
-    high: int = 0
-    medium: int = 0
-    low: int = 0
-    findings: list[dict[str, Any]] = Field(default_factory=list)
-    passed: bool = False
- 
- 
-class ReviewFeedback(BaseModel):
-    verdict: ReviewVerdict = ReviewVerdict.REWORK
-    score: float = 0.0                                              # 0-100
-    passed_checks: list[str] = Field(default_factory=list)
-    failed_checks: list[str] = Field(default_factory=list)
-    notes: str = ""
-    rework_instructions: list[str] = Field(default_factory=list)
-
-
+  
+  
 class FindingSeverity(str, Enum):
     """Severity of a static-check finding. Only errors trigger repair; warns log only."""
     ERROR = "error"
@@ -398,15 +361,8 @@ class PerformanceMetrics(BaseModel):
     total_llm_calls: int = 0
     agent_durations: dict[str, float] = Field(default_factory=dict)  # agent -> seconds
 
- 
- 
-class MemoryPointers(BaseModel):
-    session_checkpoint_id: str = ""
-    long_term_refs: list[str] = Field(default_factory=list)
-    rag_context_ids: list[str] = Field(default_factory=list)
-
-
-
+  
+  
 class HITLRequest(BaseModel):
     """
     Created by an agent when it needs human input before the pipeline can continue.
@@ -444,19 +400,13 @@ class ProjectState(BaseModel):
     tasks:           Annotated[TaskList, merge_tasks] = Field(default_factory=TaskList)
     code_manifest:   Annotated[CodeManifest, merge_code_manifest] = Field(default_factory=CodeManifest)   # ← file-level contracts
     generated_code:  Annotated[CodeMap, merge_code_map] = Field(default_factory=CodeMap)
-    tests:           TestResults   = Field(default_factory=TestResults)
-    security:        SecurityScan  = Field(default_factory=SecurityScan)
-    review:          ReviewFeedback = Field(default_factory=ReviewFeedback)
     static_checks:   StaticChecks  = Field(default_factory=StaticChecks)
 
     ## human in the loop
     hitl: Optional[HITLRequest]=None
 
     # ── Supporting layers (parallel-safe via reducers) ──────────────────────
-    artifacts: dict[str, str] = Field(default_factory=dict)        # label -> filepath
-
     metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
-    memory_refs: MemoryPointers = Field(default_factory=MemoryPointers)
 
     # ── Error tracking & completed tasks (parallel-safe via reducers) ───────
     completed_task_ids: Annotated[set[str], merge_completed_task_ids] = Field(default_factory=set)

@@ -23,7 +23,7 @@ Rules enforced (see system prompt):
   5.  No invented tables or columns — flag suggestions in manifest summary.
   6.  All nullable/non-nullable constraints must be explicit.
   7.  No DROP TABLE or destructive DDL unless task explicitly requests rollback.
-  8.  Index on every FK column + columns flagged as frequently queried in data_flow.
+  8.  Index on every FK column.
   9.  No hardcoded environment values (DB name, host, credentials).
   10. Each migration is self-contained given its declared depends_on.
   11. Manifest export lists exact table name, column names, and types.
@@ -117,8 +117,7 @@ Generate a complete, runnable database migration file AND a structured manifest 
     Never leave a column's nullability ambiguous.
 7.  Never write DROP TABLE or any destructive operation unless the task explicitly requests
     a rollback/down migration.
-8.  Include an index on every foreign key column and on any column mentioned in
-    Architecture's data_flow as frequently queried.
+8.  Include an index on every foreign key column.
 9.  Never hardcode environment-specific values (database name, host, credentials).
     Migrations must be portable across environments.
 10. Each migration file must be self-contained and runnable in isolation given its
@@ -593,7 +592,6 @@ if __name__ == "__main__":
     state.architecture = ArchData(
         tech_stack={"database": "PostgreSQL with SQLAlchemy (Alembic)"},
         database_schema_overview="users(id UUID PK, email VARCHAR, created_at, updated_at)",
-        data_flow="Users table is queried by email on every login.",
     )
     state.tasks = TaskList(tasks=[
         Task(id="db-001", agent="database", title="Users table", description="Create users table", depends_on=[], priority=1),

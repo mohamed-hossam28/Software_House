@@ -26,9 +26,9 @@ import re
 
 logger = logging.getLogger(__name__)
 
-VALID_AGENTS: frozenset[str] = frozenset({"database", "backend", "frontend", "devops"})
-AGENT_PRIORITY: dict[str, int] = {"database": 1, "backend": 2, "frontend": 2, "devops": 3}
-AGENT_PREFIX: dict[str, str] = {"database": "db", "backend": "be", "frontend": "fe", "devops": "do"}
+VALID_AGENTS: frozenset[str] = frozenset({"database", "backend", "frontend"})
+AGENT_PRIORITY: dict[str, int] = {"database": 1, "backend": 2, "frontend": 2}
+AGENT_PREFIX: dict[str, str] = {"database": "db", "backend": "be", "frontend": "fe"}
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  Pass-1 system + user prompts                                                ║
@@ -41,14 +41,14 @@ file — including each file that any other file imports from.
 
 Respond with a SINGLE JSON object — no prose outside it:
 {"skeleton": [
-  {"id":"<ID>","agent":"<database|backend|frontend|devops>","title":"<short>",
+  {"id":"<ID>","agent":"<database|backend|frontend>","title":"<short>",
    "description":"<what this file does>","file":"<repo-relative path>",
    "exports":["<name>", ...],
    "imports_from":{"<source file path>":["<name>", ...], ...}}
 ]}
 
 Rules:
-- ID prefix by owner agent: db-*, be-*, fe-*, do-* (e.g. be-001).
+- ID prefix by owner agent: db-*, be-*, fe-* (e.g. be-001).
 - exports: ONLY cross-module names — what OTHER files import from THIS file.
 - imports_from: the exact source file path(s) this file imports from, and which names it imports.
   This is how the system computes build order — be precise and exhaustive.
@@ -778,7 +778,7 @@ def _generate_tasks_from_skeleton(nodes: list[Any], warnings: list[str]) -> list
             continue
         agent = str(nd.get("agent", "")).strip().lower()
         if not agent:
-            for prefix, a in (("db-", "database"), ("be-", "backend"), ("fe-", "frontend"), ("do-", "devops")):
+            for prefix, a in (("db-", "database"), ("be-", "backend"), ("fe-", "frontend")):
                 if tid.startswith(prefix):
                     agent = a
                     break
@@ -942,9 +942,9 @@ class PlannerAgent(BaseAgent):
         ps.metrics.agent_durations[self.name] = round(duration, 3)
         counts = {a: len(ps.tasks.by_agent(a)) for a in VALID_AGENTS}
         logger.info(
-            "[PlannerAgent] %d tasks in %.2fs — db:%d be:%d fe:%d do:%d | manifest:%d",
+            "[PlannerAgent] %d tasks in %.2fs — db:%d be:%d fe:%d | manifest:%d",
             len(tasks), duration,
-            counts["database"], counts["backend"], counts["frontend"], counts["devops"],
+            counts["database"], counts["backend"], counts["frontend"],
             len(manifest_files),
         )
         return self._compute_diff(before, ps)
