@@ -51,7 +51,21 @@ Ensure your response includes all required keys:
 
 Respond strictly with valid JSON only.
 """
- 
+
+#: Appended to the final requirements call when clarification rounds are
+#: exhausted and the pipeline bypasses the human: every guess the LLM makes
+#: must be recorded in `assumptions` so the architecture agent can see
+#: exactly what was inferred instead of it staying silent.
+ROUNDS_EXHAUSTED_INSTRUCTION = """\
+
+## Clarification Rounds Exhausted
+Clarification rounds exhausted — you are proceeding without further human input.
+Every unstated premise you relied on MUST be listed in the `assumptions` list.
+Do not leave any guess implicit: if a detail was not stated by the user and you
+had to assume it, record it under `assumptions` so downstream agents can see
+exactly what was inferred.
+"""
+
 
 class RequirementsAgent(BaseAgent):
     def __init__(
@@ -82,10 +96,26 @@ class RequirementsAgent(BaseAgent):
         raw_prompt=state.requirements.raw_prompt
         rag_context = self._get_rag_context(state)
 
-        return USER_PROMPT_TEMPLATE.format(
+        prompt = USER_PROMPT_TEMPLATE.format(
             raw_prompt=raw_prompt,
             rag_context=rag_context or "No prior context available."
         )
+
+        if self._rounds_exhausted(state):
+            prompt += ROUNDS_EXHAUSTED_INSTRUCTION
+
+        return prompt
+
+    @staticmethod
+    def _rounds_exhausted(state: ProjectState) -> bool:
+        """True when the human node has used up every clarification round.
+
+        The graph only re-enters the requirements node after the last human
+        round when `clarfication_rounds >= max_clarfication_rounds`, so this
+        marks the final call before the router bypasses the human and routes
+        straight to architecture (see graph/edges.py route_after_requirements).
+        """
+        return state.clarfication_rounds >= state.max_clarfication_rounds
 
     
     
