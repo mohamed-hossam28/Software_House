@@ -1,7 +1,7 @@
 """
 agents/architecture.py
 ──────────────────────
-Architecture Agent — parallel 3-round execution via ThreadPoolExecutor.
+Architecture Agent — 2 rounds, 3 LLM calls (Round 1 parallel via ThreadPoolExecutor).
 
 ROUND 1 (fully independent — run in parallel)
   ├── Call A: core architecture  (tech_stack + system_components + security)
@@ -9,6 +9,11 @@ ROUND 1 (fully independent — run in parallel)
 
 ROUND 2 (depends on Round 1 — single call)
   └── Call C: api_contracts      (needs tech_stack + system_components)
+
+The tech stack is resolved deterministically before Round 1
+(TechStackResolver: defaults ← store ← SRS-detected). Call A's proposed
+tech_stack can only fill layers the resolver left unspecified; it never
+overrides a resolved layer (merge_tech_stack).
 """
 
 import logging
@@ -191,6 +196,22 @@ class TechStackResolver:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────
+def merge_tech_stack(resolved: dict[str, str], llm_proposed: dict[str, str]) -> dict[str, str]:
+    """Merge the LLM's proposed stack under the resolver's: the resolver always wins.
+
+    LLM layer names are compared case- and whitespace-insensitively, so e.g.
+    "Database" cannot sit next to a resolved "database". LLM layers with blank
+    values are dropped.
+    """
+    resolved_layers = {layer.strip().lower() for layer in resolved}
+    merged: dict[str, str] = {}
+    for layer, tech in llm_proposed.items():
+        key = layer.strip().lower()
+        if key and key not in resolved_layers and tech.strip():
+            merged[key] = tech.strip()
+    return {**merged, **resolved}
+
+
 def _bullet_list(items: list[str]) -> str:
     if not items:
         return "  (none)"
@@ -262,7 +283,7 @@ def _db_srs_block(srs: SRSData) -> str:
 
 
 def _srs_summary_block(srs: SRSData, stack: dict[str, str]) -> str:
-    """Format a condensed SRS summary (functional requirements + tech stack) for Round 2 & 3 calls to minimize token usage."""
+    """Format a condensed SRS summary (functional requirements + tech stack) for the Round 2 call (API contracts) to minimize token usage."""
     return (
         "## Requirements & Tech Stack Summary\n\n"
         "### Functional Requirements\n"
@@ -286,7 +307,7 @@ _BASE_SYSTEM = (
 
 CORE_ARCH_SYSTEM = _BASE_SYSTEM + """
 Your tasks for the given software requirement specification (SRS):
-1. Decide the backend, frontend, database, cache, and infrastructure technologies. Strictly honor any explicit framework, library, language, or stack requested by the user in the SRS (e.g. HTML/CSS, Vanilla JS, Svelte, Vue, Angular, Django, Flask, Go, Rust, SQLite, etc.). Use the baseline defaults ONLY for unspecified layers.
+1. The "Resolved Tech Stack" table is FINAL — do not change, repeat, or override any layer it lists. In "tech_stack", include ONLY additional layers the table does not specify that this system genuinely needs (e.g. message queue, search engine, object storage). If no extra layer is needed, return an empty object.
 2. List every high-level service/component the system needs (e.g. AuthService, BoardService, NotificationService, APIGateway, etc.). Be exhaustive.
 3. Define security requirements (auth strategy, RBAC roles, data encryption, rate limiting, CORS policy, secrets management).
 
@@ -370,7 +391,7 @@ class ArchitectureAgent(BaseAgent):
 
     def _call_core_architecture(self, srs_text: str, stack_table: str, complexity_block: str,
                                  results: dict, lock: Lock, state: ProjectState) -> None:
-        prompt = f"## Resolved Tech Stack (use as baseline)\n{stack_table}\n\n{complexity_block}\n\n{srs_text}\n```json\n"
+        prompt = f"## Resolved Tech Stack (final — do not override)\n{stack_table}\n\n{complexity_block}\n\n{srs_text}\n```json\n"
         try:
             from agents.schemas.architecture import CoreArchitectureSchema
             raw = self._call_with_system(CORE_ARCH_SYSTEM, prompt, "arch-core", state=state, lock=lock)
@@ -455,8 +476,8 @@ class ArchitectureAgent(BaseAgent):
             for f in futures:
                 f.result()
 
-        # LLM dynamically chosen stack takes priority over pre-calculated static baseline
-        merged_stack = {**authoritative_stack, **results.get("tech_stack", {})}
+        # Resolver output is authoritative; the LLM only fills unspecified layers
+        merged_stack = merge_tech_stack(authoritative_stack, results.get("tech_stack", {}))
         results["tech_stack"] = merged_stack
 
         srs_summary_text = _srs_summary_block(ps.requirements, merged_stack)
