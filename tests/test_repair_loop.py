@@ -517,3 +517,49 @@ class TestRepairPromptAndTargets:
         assert "errors" not in diff
         # regenerated content landed in the owning bucket
         assert ps.generated_code.database[path] == "class TodoItem:\n    name: str"
+
+
+class TestPersistenceRepair:
+    """In-memory/bypass findings flow through the same repair loop (ticket #15)."""
+
+    PATH = "output/backend/services/todo.py"
+    IN_MEMORY = "todos = []\n\n\ndef add(item):\n    todos.append(item)\n"
+    PERSISTED = (
+        "from db.session import SessionLocal\n\n\n"
+        "def add(item):\n    db = SessionLocal()\n    db.add(item)\n    db.commit()\n"
+    )
+
+    def _state(self) -> ProjectState:
+        from core.state import build_persistence_contract
+
+        ps = make_state(files={self.PATH: self.IN_MEMORY})
+        ps.code_manifest = CodeManifest(files={self.PATH: FileManifest(
+            agent="backend", task_id="be-1", filepath=self.PATH, purpose="todo service",
+            exports=["add"], written=True)})
+        ps.architecture = ArchData(persistence_contract=build_persistence_contract("SQLite 3"))
+        return ps
+
+    def test_in_memory_file_is_repaired_with_the_persistence_contract_in_the_prompt(self):
+        from core.state import render_persistence_contract
+
+        ps = self._state()
+        provider = FakeRepairProvider([repair_reply(self.PATH, self.PERSISTED)])
+        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+
+        _, prompt = provider.prompts[0]
+        assert "[in_memory_state] line 1" in prompt
+        assert render_persistence_contract(ps.architecture.persistence_contract) in prompt
+        assert diff["static_checks"]["verdict"] == StaticVerdict.REPAIRED.value
+        assert diff["static_checks"]["repaired_files"] == [self.PATH]
+
+    def test_unrepaired_in_memory_state_survives_as_error_after_two_rounds(self):
+        ps = self._state()
+        provider = FakeRepairProvider([repair_reply(self.PATH, self.IN_MEMORY)] * 2)
+        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+
+        checks = diff["static_checks"]
+        assert provider.calls == 2
+        assert checks["verdict"] == StaticVerdict.FAILED.value
+        assert [(f["file"], f["check"], f["severity"]) for f in checks["findings"]] == [
+            (self.PATH, "in_memory_state", "error")
+        ]

@@ -343,10 +343,14 @@ def get_db():
 {create_schema}'''
 
 
+def connection_module_dotted(contract: PersistenceContract) -> str:
+    """Dotted import path of the connection module, e.g. 'db.session'."""
+    return contract.connection_module.removesuffix(".py").replace("/", ".")
+
+
 def connection_import_line(contract: PersistenceContract) -> str:
     """The one import statement code uses to reach the connection module."""
-    module = contract.connection_module.removesuffix(".py").replace("/", ".")
-    return f"from {module} import {', '.join(CONNECTION_MODULE_EXPORTS)}"
+    return f"from {connection_module_dotted(contract)} import {', '.join(CONNECTION_MODULE_EXPORTS)}"
 
 
 def render_persistence_contract(contract: Optional[PersistenceContract]) -> str:

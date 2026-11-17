@@ -295,3 +295,105 @@ class TestRunAllChecks:
         # …and run_all_checks routes the broken JS file to the JS checker
         findings = run_all_checks(files, manifest)
         assert all(f.check == "js_syntax" for f in findings)
+
+
+# ── Persistence checks (ticket #15) ───────────────────────────────────────────
+
+class TestPersistenceChecks:
+    """In-memory storage and connection-module bypass in backend files."""
+
+    SERVICE = "output/backend/services/todo.py"
+
+    def _check(self, code: str = "", path: str = SERVICE, database: str | None = "SQLite 3",
+               files: dict[str, tuple[str, str]] | None = None):
+        """Run the checker over one backend file, or over {path: (owner agent, code)}."""
+        from core.state import ArchData, build_persistence_contract
+        from core.static_checks.persistence_checker import check_persistence
+
+        files = files or {path: ("backend", code)}
+        manifest = CodeManifest(files={
+            p: FileManifest(agent=owner, task_id=f"t-{p}", filepath=p, purpose="", exports=[])
+            for p, (owner, _) in files.items()
+        })
+        arch = ArchData(persistence_contract=build_persistence_contract(database) if database else None)
+        return check_persistence({p: c for p, (_, c) in files.items()}, manifest, arch, "sqlite")
+
+    def test_module_level_list_store_is_error_with_line(self):
+        findings = self._check("from db.session import get_db\n\ntodos = []\n")
+
+        assert [(f.check, f.severity, f.line) for f in findings] == [
+            ("in_memory_state", FindingSeverity.ERROR, 3)
+        ]
+        assert findings[0].file == self.SERVICE
+
+    @pytest.mark.parametrize("statement", [
+        "todos: dict[int, dict] = {}",
+        "store = dict()",
+        "by_owner = defaultdict(list)",
+        "seen = set()",
+    ])
+    def test_annotated_and_factory_containers_are_in_memory_state(self, statement):
+        findings = self._check(f"from collections import defaultdict\n{statement}\n")
+
+        assert [f.check for f in findings] == ["in_memory_state"]
+
+    @pytest.mark.parametrize("code", [
+        "FAKE_DB = {}\n",                                                   # empty, whatever the casing
+        "ITEMS: list = []\n",
+        'todos = [{"id": 1}]\n\n\ndef add(t):\n    todos.append(t)\n',      # seeded, then mutated
+        'USERS = {"a": 1}\n\n\ndef put(k, v):\n    USERS[k] = v\n',
+        'cache = {"a": 1}\n\n\ndef drop(k):\n    del cache[k]\n',
+    ])
+    def test_empty_or_mutated_module_containers_are_in_memory_state(self, code):
+        assert [f.check for f in self._check(code)] == ["in_memory_state"]
+
+    @pytest.mark.parametrize("statement", [
+        '__all__ = ["router"]',
+        'origins = ["http://localhost:3000"]',                 # FastAPI CORS docs
+        'tags_metadata = [{"name": "todos"}]',
+        'responses = {404: {"description": "Not found"}}',
+        "router = APIRouter()",
+        "def handler():\n    items = []\n    return items",
+    ])
+    def test_unmutated_config_locals_and_non_containers_are_not_flagged(self, statement):
+        assert self._check(f"{statement}\n") == []
+
+    def test_stack_without_database_is_not_checked(self):
+        assert self._check("todos = []\n", database=None) == []
+
+    @pytest.mark.parametrize("session_path", ["output/backend/db/session.py", "db/session.py"])
+    def test_non_backend_and_connection_module_files_are_not_checked(self, session_path):
+        files = {
+            session_path: ("backend", 'from sqlalchemy import create_engine\n_cache = {}\nengine = create_engine("x")\n'),
+            "output/frontend/state.py": ("frontend", "todos = []\n"),
+        }
+        assert self._check(files=files) == []
+
+    @pytest.mark.parametrize("code, line", [
+        ('from sqlalchemy import create_engine\n\nengine = create_engine("sqlite:///todo.db")\n', 3),
+        ('import sqlite3\n\n\ndef rows():\n    return sqlite3.connect("todo.db").execute("SELECT 1")\n', 5),
+        ('from sqlalchemy.orm import Session\n\n\ndef add(item):\n    s = Session()\n    s.add(item)\n    s.commit()\n', 7),
+    ])
+    def test_data_access_bypassing_the_connection_module_is_error(self, code, line):
+        findings = self._check(code)
+
+        assert [(f.check, f.severity, f.line) for f in findings] == [
+            ("db_without_connection_module", FindingSeverity.ERROR, line)
+        ]
+        from core.state import build_persistence_contract, connection_import_line
+        assert connection_import_line(build_persistence_contract("SQLite 3")) in findings[0].message
+
+    @pytest.mark.parametrize("code", [
+        # session injected by the caller (router passes Depends(get_db))
+        "def list_todos(db):\n    return db.query(object).all()\n",
+        "async def save(session, item):\n    session.add(item)\n    await session.commit()\n",
+        # session opened from an injected factory
+        "async def save(factory, item):\n    async with factory() as session:\n        await session.commit()\n",
+        # session obtained from the connection module
+        "from db.session import SessionLocal\n\n\ndef count():\n    s = SessionLocal()\n    return s.execute('SELECT 1')\n",
+        "from ..db.session import get_db\n\n\ndef first(db=None):\n    return db.query(object).first()\n",
+        # no data access at all
+        "def hello():\n    return {'ok': True}\n",
+    ])
+    def test_injected_or_connection_module_sessions_are_clean(self, code):
+        assert self._check(code) == []

@@ -368,3 +368,36 @@ def test_mandate_obeying_backend_persists_through_the_synthesized_module(monkeyp
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[(1,)]"
+
+
+class InMemoryBackendProvider(MandateObeyingProvider):
+    """Backend LLM stub that ignores the mandate and keeps data in a module-level list."""
+
+    BACKEND_CODE = "todos = []\n\n\ndef list_items():\n    return todos\n"
+
+
+def test_in_memory_backend_is_caught_by_the_integration_checks(monkeypatch, tmp_path):
+    from agents.backend import BackendAgent
+    from agents.data_base import DatabaseAgent
+    from agents.planner import PlannerAgent
+    from core.state import ArchData, build_persistence_contract
+    from core.static_checks import run_all_checks
+    from tests.planner import MockSkeletonLLM
+
+    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
+    state = ProjectState(project_id="inmem", project_name="TodoInMemory")
+    state.requirements.raw_prompt = "Build a todo app."
+    state.architecture = ArchData(
+        tech_stack={"backend": "FastAPI (Python 3.12)", "database": "SQLite 3"},
+        persistence_contract=build_persistence_contract("SQLite 3"),
+    )
+    PlannerAgent(provider=MockSkeletonLLM()).run(state)
+    DatabaseAgent(provider=MandateObeyingProvider(), retries=1).run(state)
+    BackendAgent(provider=InMemoryBackendProvider(), retries=1).run(state)
+
+    files = {**state.generated_code.backend, **state.generated_code.database}
+    findings = run_all_checks(files, state.code_manifest, state.architecture, "sqlite")
+
+    flagged = {f.file for f in findings if f.check == "in_memory_state"}
+    assert "output/app/services/todo.py" in flagged
+    assert "output/app/db/session.py" not in flagged

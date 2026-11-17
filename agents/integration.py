@@ -50,8 +50,11 @@ from core.state import (
     StaticChecks,
     StaticFinding,
     StaticVerdict,
+    backend_persistence_rules,
+    render_persistence_contract,
 )
 from core.static_checks import run_all_checks
+from core.static_checks.persistence_checker import PERSISTENCE_CHECKS
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +393,13 @@ class IntegrationAgent(BaseAgent):
             lines += ["", "## SCHEMA FIELD CONTRACT — valid entities and fields"]
             field_contracts = self._schema_contract_lines(manifest, file_errors)
             lines.extend(field_contracts or ["(no manifest field contracts available)"])
+
+        if any(f.check in PERSISTENCE_CHECKS for f in file_errors):
+            contract = getattr(architecture, "persistence_contract", None)
+            lines += ["", render_persistence_contract(contract)]
+            rules = backend_persistence_rules(contract)
+            if rules:
+                lines += ["", rules]
 
         fm = getattr(manifest, "files", {}).get(filepath) if manifest is not None else None
         if fm is not None:
