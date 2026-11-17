@@ -306,7 +306,87 @@ def sha256_of(code: str) -> str:
     return hashlib.sha256((code or "").encode("utf-8")).hexdigest()
 
 
-def write_run_summary(state: Any) -> str:
+def static_checks_snapshot(state: Any) -> dict[str, Any]:
+    """Canonical serializable snapshot used by reports and human summaries."""
+    static_checks = getattr(state, "static_checks", None)
+    findings = list(getattr(static_checks, "findings", None) or [])
+
+    def enum_str(value: Any) -> str:
+        return getattr(value, "value", str(value or "")) or ""
+
+    serialized = [
+        {
+            "file": getattr(finding, "file", ""),
+            "check": getattr(finding, "check", ""),
+            "severity": enum_str(getattr(finding, "severity", "")),
+            "line": getattr(finding, "line", 0),
+            "message": getattr(finding, "message", ""),
+        }
+        for finding in findings
+    ]
+    error_count = sum(1 for finding in serialized if finding["severity"] == "error")
+    warn_count = sum(1 for finding in serialized if finding["severity"] == "warn")
+    repaired_files = list(getattr(static_checks, "repaired_files", None) or [])
+    return {
+        "verdict": enum_str(getattr(static_checks, "verdict", "")),
+        "findings_count": len(serialized),
+        "errors": error_count,
+        "warnings": warn_count,
+        "repair_rounds": int(getattr(static_checks, "rounds", 0) or 0),
+        "repaired_count": len(repaired_files),
+        "repaired_files": repaired_files,
+        "findings": serialized,
+    }
+
+
+def format_static_checks_summary(state: Any) -> str:
+    """One-line final verdict with finding and repair counts."""
+    checks = static_checks_snapshot(state)
+    return (
+        f"Integration verdict: {checks['verdict']} "
+        f"(findings: {checks['findings_count']}, errors: {checks['errors']}, "
+        f"warnings: {checks['warnings']}, repair rounds: {checks['repair_rounds']}, "
+        f"repaired files: {checks['repaired_count']})"
+    )
+
+
+def write_static_checks_report(state: Any) -> str:
+    """Write every final static finding to `output/static_checks_report.json`."""
+    try:
+        import json
+        from datetime import datetime, timezone
+
+        checks = static_checks_snapshot(state)
+
+        report = {
+            "project_id": getattr(state, "project_id", ""),
+            "project_name": getattr(state, "project_name", ""),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "verdict": checks["verdict"],
+            "counts": {
+                "findings": checks["findings_count"],
+                "errors": checks["errors"],
+                "warnings": checks["warnings"],
+                "repair_rounds": checks["repair_rounds"],
+                "repaired_files": checks["repaired_count"],
+            },
+            "repaired_files": checks["repaired_files"],
+            "findings": checks["findings"],
+        }
+
+        rel = os.path.join(OUTPUT_DIR, "static_checks_report.json")
+        abs_path = os.path.join(_root_dir, rel)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        return rel
+    except Exception as exc:  # pragma: no cover — reporting must never break a run
+        import logging
+        logging.getLogger(__name__).warning("write_static_checks_report failed: %s", exc)
+        return ""
+
+
+def write_run_summary(state: Any, static_report_path: str = "") -> str:
     """
     Persist a run summary next to the generated project (`output/run_summary.json`)
     so the deliverable on disk can be diffed against the plan. Never raises.
@@ -335,34 +415,14 @@ def write_run_summary(state: Any) -> str:
             }
             files[fp] = entry
 
-        findings = list(getattr(getattr(state, "static_checks", None), "findings", None) or [])
-
-        def _enum_str(value: Any) -> str:
-            return getattr(value, "value", str(value or "")) or ""
-
-        error_count = sum(1 for f in findings if _enum_str(getattr(f, "severity", "")) == "error")
-        warn_count = sum(1 for f in findings if _enum_str(getattr(f, "severity", "")) == "warn")
+        checks = static_checks_snapshot(state)
 
         summary = {
             "project_id": getattr(state, "project_id", ""),
             "project_name": getattr(state, "project_name", ""),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "status": getattr(state, "status", ""),
-            "static_checks": {
-                "verdict": _enum_str(getattr(getattr(state, "static_checks", None), "verdict", "")),
-                "errors": error_count,
-                "warnings": warn_count,
-                "findings": [
-                    {
-                        "file": getattr(f, "file", ""),
-                        "check": getattr(f, "check", ""),
-                        "severity": _enum_str(getattr(f, "severity", "")),
-                        "line": getattr(f, "line", 0),
-                        "message": getattr(f, "message", ""),
-                    }
-                    for f in findings
-                ],
-            },
+            "static_checks": {**checks, "report_path": static_report_path},
             "files": files,
             "errors": [
                 {"agent": e.get("agent", ""), "message": e.get("message", ""), "ts": str(e.get("ts", ""))}

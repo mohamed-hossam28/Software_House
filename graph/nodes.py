@@ -20,7 +20,7 @@ from agents.frontend import FrontendAgent
 from agents.integration import IntegrationAgent
 
 # Import core state and statuses
-from core.state import FindingSeverity, ProjectState, ProjectStatus
+from core.state import ProjectState, ProjectStatus
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -224,22 +224,16 @@ def integration_node(state: dict) -> dict:
 
 def finalize_node(state: dict) -> dict:
     """
-    Finalize node: persists the run summary (manifest + conflicts + fingerprints)
-    next to the generated project as `output/run_summary.json`. Never fails the run.
-    Prints the integration verdict and finding counts in the summary.
+    Finalize node: persists the run summary and complete static-check findings
+    report next to the generated project. Never fails the run.
     """
-    from agents.utils import write_run_summary
+    from agents.utils import write_run_summary, write_static_checks_report
 
     logger.info("[GraphNode] Finalizing — writing run summary...")
     ps = _state_from_dict(state)
 
-    findings = ps.static_checks.findings
-    error_count = sum(1 for f in findings if f.severity == FindingSeverity.ERROR)
-    warn_count = sum(1 for f in findings if f.severity == FindingSeverity.WARN)
-    print(f"Integration verdict: {ps.static_checks.verdict.value} "
-          f"(errors: {error_count}, warnings: {warn_count})")
-
-    path = write_run_summary(ps)
+    report_path = write_static_checks_report(ps)
+    path = write_run_summary(ps, static_report_path=report_path)
+    logger.info("[GraphNode] Static findings report written: %s", report_path or "(skipped)")
     logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
     return {}
-

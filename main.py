@@ -1,6 +1,8 @@
 import os
 import sys
 import logging
+from threading import Lock
+from typing import TextIO
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -9,25 +11,70 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# Load configuration and environment variables
-from core.config import Settings
-settings = Settings()
-
-from core.state import ProjectState, ProjectStatus
-from graph.graph import graph
-
-# Configure logging to suppress noisy logger outputs in mainstream view
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-# Make agents and nodes loggers a bit quieter so stream logs stand out cleanly
-logging.getLogger("agents").setLevel(logging.WARNING)
-logging.getLogger("graph").setLevel(logging.WARNING)
 logger = logging.getLogger("MainOrchestrator")
+_logging_configured = False
+_configured_log_path = ""
+_tee_lock = Lock()
+
+
+class _TeeStream:
+    """Mirror terminal output into the pipeline log file."""
+
+    def __init__(self, terminal: TextIO, log_file: TextIO):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        with _tee_lock:
+            self.terminal.write(text)
+            self.log_file.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        with _tee_lock:
+            self.terminal.flush()
+            if not self.log_file.closed:
+                self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.terminal.isatty()
+
+
+def configure_run_logging(log_path: str | None = None) -> str:
+    """Tee pipeline output to the terminal and `output/logs.txt` once per process."""
+    global _logging_configured, _configured_log_path
+    if _logging_configured:
+        return _configured_log_path
+
+    path = log_path or os.path.join(ROOT, "output", "logs.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    log_file = open(path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = _TeeStream(sys.stdout, log_file)
+    sys.stderr = _TeeStream(sys.stderr, log_file)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    # Keep generation noise down while retaining repair-round evidence.
+    logging.getLogger("agents").setLevel(logging.WARNING)
+    logging.getLogger("agents.integration").setLevel(logging.INFO)
+    logging.getLogger("graph").setLevel(logging.WARNING)
+    _logging_configured = True
+    _configured_log_path = path
+    return path
 
 
 def run_pipeline(prompt: str, project_name: str = "MySoftwareProject", max_rounds: int = 3):
+    configure_run_logging()
+    # Import project modules only after the tee is active so dependency/provider
+    # warnings emitted during import are preserved in output/logs.txt.
+    from agents.utils import format_static_checks_summary
+    from core.config import Settings
+    from core.state import ProjectState
+    from graph.graph import graph
+
+    settings = Settings()
     print("\n" + "=" * 60)
     print("STARTING MULTI-AGENT SOFTWARE BUILD PIPELINE (STREAMING)")
     print("=" * 60)
@@ -121,6 +168,7 @@ def run_pipeline(prompt: str, project_name: str = "MySoftwareProject", max_round
     print(f"Total LLM Calls     : {current_state.metrics.total_llm_calls}")
     print(f"Total Tokens Used   : {current_state.metrics.total_tokens_used}")
     print(f"Errors Logged       : {len(current_state.errors)}")
+    print(format_static_checks_summary(current_state))
     print("=" * 60 + "\n")
 
 
