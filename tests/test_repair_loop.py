@@ -289,13 +289,19 @@ class TestRepairLoop:
             for f in diff["static_checks"]["findings"]
         )
 
-    def test_warning_only_findings_never_trigger_repair(self):
-        ps = make_state(
-            files={
-                "output/backend/api/todo.py": "import requests\n\nr = requests\n",
-                "output/requirements.txt": "fastapi==0.110.0\n",
-            }
-        )
+    def test_warning_only_findings_never_trigger_repair(self, monkeypatch):
+        """Findings below error severity must not consume repair rounds."""
+        def checker(*args, **kwargs):
+            return [StaticFinding(
+                file="output/backend/api/todo.py",
+                check="sql_columns",
+                severity="warn",
+                line=1,
+                message="synthetic warning",
+            )]
+
+        monkeypatch.setattr("agents.integration.run_all_checks", checker)
+        ps = make_state(files={"output/backend/api/todo.py": "x = 1\n"})
         provider = FakeRepairProvider([])
         diff = IntegrationAgent(provider=provider, retries=1).run(ps)
 
@@ -303,6 +309,76 @@ class TestRepairLoop:
         assert diff["static_checks"]["rounds"] == 0
         assert diff["static_checks"]["repaired_files"] == []
         assert provider.calls == 0, "warn-only findings must not call the LLM"
+
+    def test_undeclared_dependency_triggers_repair(self):
+        # third_party is now an error: the importing file is repaired
+        ps = make_state(files={
+            "output/backend/api/todo.py": "import requests\n\nr = requests\n",
+            "output/requirements.txt": "fastapi==0.110.0\n",
+        })
+        provider = FakeRepairProvider([
+            repair_reply("output/backend/api/todo.py", "x = 1\n")
+        ])
+        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.REPAIRED.value
+        assert checks["repaired_files"] == ["output/backend/api/todo.py"]
+        assert provider.calls == 1
+        assert not any(f["check"] == "third_party" for f in checks["findings"])
+
+    def test_missing_contract_routes_are_repaired_into_target_file(self):
+        # route errors attribute to the manifest-planned entry file and the
+        # repair round writes the missing route into it
+        ps = make_state(files={
+            "output/backend/main.py": (
+                "from fastapi import FastAPI\n\napp = FastAPI()\n\n"
+                '@app.get("/health")\ndef health(): ...\n'
+            ),
+        })
+        add_manifest(ps, "output/backend/main.py", exports=["app"], written=True)
+        ps.architecture = ArchData(api_contracts=[
+            APIContract(method="GET", path="/health", description="health"),
+            APIContract(method="POST", path="/api/v1/todos", description="create todo"),
+        ])
+        fixed = (
+            "from fastapi import FastAPI\n\napp = FastAPI()\n\n"
+            '@app.get("/health")\ndef health(): ...\n\n'
+            '@app.post("/api/v1/todos")\ndef create_todo(): ...\n'
+        )
+        provider = FakeRepairProvider([repair_reply("output/backend/main.py", fixed)])
+        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.REPAIRED.value
+        assert checks["repaired_files"] == ["output/backend/main.py"]
+        assert provider.calls == 1
+        assert not any(f["check"] == "backend_routes" for f in checks["findings"])
+
+    def test_route_error_without_planned_route_file_fails_without_repair(self):
+        # no backend .py in the manifest → the gap cannot be attributed to any
+        # file, so it fails honestly instead of guessing a repair target
+        ps = make_state(files={
+            "output/backend/main.py": (
+                "from fastapi import FastAPI\n\napp = FastAPI()\n\n"
+                '@app.get("/health")\ndef health(): ...\n'
+            ),
+        })
+        ps.architecture = ArchData(api_contracts=[
+            APIContract(method="POST", path="/api/v1/todos", description="create todo"),
+        ])
+        provider = FakeRepairProvider([])
+        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.FAILED.value
+        assert checks["rounds"] == 0
+        assert provider.calls == 0, "file-less findings cannot be repaired"
+        assert any(
+            f["check"] == "backend_routes" and f["file"] == ""
+            for f in checks["findings"]
+        )
+        assert "errors" in diff
 
     def test_repair_llm_usage_counts_in_shared_metrics(self):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})

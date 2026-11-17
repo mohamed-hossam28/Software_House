@@ -11,9 +11,13 @@ be judged statically — and files that do not parse are skipped, since the
 Python checker already reports their syntax errors.
 
 Two-way check — a contract the backend never implements (no extracted route
-matches its method and path shape) is a WARN finding. A route the backend
-implements without a contract is not flagged: the backend is the source of
-truth for what exists, and the contracts guide the frontend.
+matches its method and path shape) is an ERROR finding. Each finding is
+attributed to the manifest-planned backend file that should own routes so the
+repair loop can regenerate or extend that file; when no backend route file is
+planned, the finding stays file-less and fails the run honestly (file-less
+errors cannot be repaired). A route the backend implements without a contract
+is not flagged: the backend is the source of truth for what exists, and the
+contracts guide the frontend.
 
 Known limitations (dynamic registration cannot be judged statically):
 `app.include_router(router, prefix=...)` adds no prefix, and routers mounted
@@ -21,8 +25,8 @@ inside routers collect none of their parents' prefixes — routes registered
 through either are indexed under their bare decorator path, which can only
 produce a false-positive warn (never a missed error or missed frontend match).
 
-The manifest and dialect parameters are part of the uniform checker signature
-and are unused by these checks.
+The dialect parameter is part of the uniform checker signature and is unused
+by these checks.
 """
 import ast
 from typing import Any
@@ -47,23 +51,24 @@ def check_backend_routes(
     architecture: Any = None,
     dialect: str = "",
 ) -> list[StaticFinding]:
-    """Warn for every API contract no extracted backend route implements.
+    """Error for every API contract no extracted backend route implements.
 
-    manifest and dialect are part of the uniform checker signature; they are
-    unused by these checks.
+    Findings carry the manifest-planned route file as their repair target;
+    `file=""` only when the manifest plans no backend route file at all.
     """
     contracts = contract_entries(architecture)
     if not contracts:
         return []
     routes = extract_backend_routes(files)
+    target = _route_file_target(manifest)
     findings: list[StaticFinding] = []
     for method, path, shape in contracts:
         if _implemented(method, shape, routes):
             continue
         findings.append(StaticFinding(
-            file="",                                # the contract is not source anywhere
+            file=target,
             check="backend_routes",
-            severity=FindingSeverity.WARN,
+            severity=FindingSeverity.ERROR,
             line=0,
             message=(
                 f"Backend never implements contract {method} {path} "
@@ -71,6 +76,35 @@ def check_backend_routes(
             ),
         ))
     return findings
+
+
+def _route_file_target(manifest: Any) -> str:
+    """Manifest path of the backend file planned to own FastAPI routes; "" when none.
+
+    Priority: a backend .py whose planner purpose mentions a route/endpoint
+    role, then one whose path contains a route/api segment, then a main/app
+    entry file. First sorted match wins, so the target is deterministic.
+    """
+    if manifest is None:
+        return ""
+    entries = getattr(manifest, "files", {}) or {}
+    purpose_hit = path_hit = entry_hit = ""
+    for filepath in sorted(entries):
+        if not filepath.endswith(".py"):
+            continue
+        fm = entries[filepath]
+        if str(getattr(fm, "agent", "") or "").lower() != "backend":
+            continue
+        purpose = str(getattr(fm, "purpose", "") or "").lower()
+        norm = filepath.replace("\\", "/").lower()
+        name = norm.rsplit("/", 1)[-1]
+        if not purpose_hit and any(w in purpose for w in ("route", "endpoint")):
+            purpose_hit = filepath
+        if not path_hit and any(seg in norm for seg in ("/route", "/api")):
+            path_hit = filepath
+        if not entry_hit and name in ("main.py", "app.py"):
+            entry_hit = filepath
+    return purpose_hit or path_hit or entry_hit or ""
 
 
 def _implemented(method: str, shape: PathShape, routes: HTTPIndex) -> bool:

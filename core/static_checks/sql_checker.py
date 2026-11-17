@@ -31,8 +31,9 @@ approximate entities, so they tolerate singular/plural variants.
 
 Findings — a statement that fails to parse is an ERROR (sql_parse); a query
 referencing a table absent from the schema is an ERROR (sql_tables); a query
-referencing a column absent from the table it is matched to is a WARN
-(sql_columns). With no schema knowledge at all the table/column cross-check
+referencing a column absent from the table it is matched to is an ERROR
+(sql_columns, repairable on the query file against the schema contract).
+With no schema knowledge at all the table/column cross-check
 is skipped (parsing still runs), because flagging every query would be noise.
 CTE aliases are treated as known tables within their statement. An
 un-prefixed column in a multi-table statement is matched against the union
@@ -538,7 +539,7 @@ def _missing_column(filepath: str, line: int, name: str, table: str) -> StaticFi
     return StaticFinding(
         file=filepath,
         check=_COLUMNS,
-        severity=FindingSeverity.WARN,
+        severity=FindingSeverity.ERROR,
         line=line,
         message=f"SQL references column '{name}' which no migration defines on '{table}'",
     )

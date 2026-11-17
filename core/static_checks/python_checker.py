@@ -3,8 +3,10 @@ Python static checks: syntax, internal import resolution, third-party imports,
 and manifest written-files conformance.
 
 Internal = a dotted module path that either exists in the written files
-(module index) or is planned by the manifest. Everything else is third-party
-or stdlib and is judged against the project's requirements.txt (warn only).
+(module index) or is planned by the manifest, or whose root is a workspace
+layer directory (e.g. 'backend' in 'output/backend/...'). Everything else is
+third-party or stdlib; third-party roots are judged against the project's
+requirements.txt and an undeclared one is an error.
 """
 import ast
 import os
@@ -125,8 +127,24 @@ def _build_module_index(files: dict[str, str], manifest: Any) -> ModuleIndex:
     index.roots = {
         *(m.split(".")[0] for m in index.resolved),
         *(m.split(".")[0] for m in index.planned),
+        *_workspace_layer_names(files, manifest),
     }
     return index
+
+
+def _workspace_layer_names(files: dict[str, str], manifest: Any) -> set[str]:
+    """Second path components of workspace files (backend, api, db, frontend, …).
+
+    Generated code may import through a layer prefix (e.g.
+    'from backend.config import …'). Those roots are internal: an unresolved
+    layer import is a python_imports error, not a third-party finding.
+    """
+    layers: set[str] = set()
+    for filepath in (*files, *_manifest_files(manifest)):
+        parts = filepath.replace("\\", "/").split("/")
+        if len(parts) >= 3 and parts[0] == "output":
+            layers.add(parts[1])
+    return layers
 
 
 def _package_parts(filepath: str, module_path: str) -> list[str]:
@@ -255,7 +273,7 @@ def _check_third_party(
     index: ModuleIndex,
     declared: set[str] | None,
 ) -> list[StaticFinding]:
-    """Warn about third-party top-level imports missing from requirements.txt. None = skip."""
+    """Error on third-party top-level imports missing from requirements.txt. None = skip."""
     if declared is None:
         return []
     findings: list[StaticFinding] = []
@@ -281,7 +299,7 @@ def _check_third_party(
             findings.append(StaticFinding(
                 file=filepath,
                 check="third_party",
-                severity=FindingSeverity.WARN,
+                severity=FindingSeverity.ERROR,
                 line=node.lineno,
                 message=f"Third-party import '{root}' is not listed in requirements.txt",
             ))
