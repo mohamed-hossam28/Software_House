@@ -36,7 +36,6 @@ data = {
         },
     ],
     "database_schema_overview": "users -> posts",
-    "data_flow": "Client -> API -> DB",
     "deployment_strategy": "Docker Compose",
     "security_requirements": ["JWT"],
 }
@@ -52,7 +51,6 @@ minimal = {
 }
 obj2 = ArchitectureSchema.model_validate(minimal)
 assert obj2.database_schema_overview == ""
-assert obj2.data_flow == ""
 assert obj2.deployment_strategy == ""
 print("[PASS] ArchitectureSchema — missing optional fields default to empty string")
 

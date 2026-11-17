@@ -374,7 +374,7 @@ def write_static_checks_report(state: Any) -> str:
             "findings": checks["findings"],
         }
 
-        rel = os.path.join(OUTPUT_DIR, "static_checks_report.json")
+        rel = f"{OUTPUT_DIR}/static_checks_report.json"   # workspace-relative, forward slashes on every OS
         abs_path = os.path.join(_root_dir, rel)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         with open(abs_path, "w", encoding="utf-8") as fh:
@@ -434,7 +434,7 @@ def write_run_summary(state: Any, static_report_path: str = "") -> str:
             },
         }
 
-        rel = os.path.join(OUTPUT_DIR, "run_summary.json")
+        rel = f"{OUTPUT_DIR}/run_summary.json"   # workspace-relative, forward slashes on every OS
         abs_path = os.path.join(_root_dir, rel)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         with open(abs_path, "w", encoding="utf-8") as fh:
