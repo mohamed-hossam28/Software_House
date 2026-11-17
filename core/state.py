@@ -149,13 +149,19 @@ _DEFAULT_ORM: dict[str, str] = {
 }
 
 
+def _match_db_name(database_tech: str) -> Optional[str]:
+    """Return the DB_ORM_MAP key whose name appears in the tech string, or None."""
+    db_key = (database_tech or "").lower()
+    for name in DB_ORM_MAP:
+        if name.lower() in db_key:
+            return name
+    return None
+
+
 def _match_db_mapping(database_tech: str) -> Optional[dict[str, str]]:
     """Return the DB_ORM_MAP entry whose name appears in the tech string, or None."""
-    db_key = (database_tech or "").lower()
-    for name, mapping in DB_ORM_MAP.items():
-        if name.lower() in db_key:
-            return mapping
-    return None
+    name = _match_db_name(database_tech)
+    return DB_ORM_MAP[name] if name else None
 
 
 def resolve_db_tooling(database_tech: str) -> dict[str, str]:
@@ -177,6 +183,11 @@ DB_URL_ENV_VAR = "DATABASE_URL"
 
 #: Backend DB connection module, relative to the backend root.
 CONNECTION_MODULE = "db/session.py"
+
+#: Fixed exports of the connection module (engine, session factory, session
+#: dependency) — pinned in the manifest so backend imports never depend on
+#: which parallel coding agent writes first.
+CONNECTION_MODULE_EXPORTS: tuple[str, ...] = ("engine", "SessionLocal", "get_db")
 
 #: Real migration tools → the command that applies migrations before serving.
 #: A DB_ORM_MAP "migrations" value not listed here (e.g. create_all()) means no tool.
@@ -217,6 +228,31 @@ def build_persistence_contract(database_tech: str) -> PersistenceContract:
         connection_module=CONNECTION_MODULE,
         init_command=init_command,
     )
+
+
+#: Example DB URL per DB_ORM_MAP key, written into `.env.example` (placeholder
+#: credentials only — never real secrets).
+_EXAMPLE_DB_URLS: dict[str, str] = {
+    "PostgreSQL": "postgresql://app:change-me@localhost:5432/app",
+    "SQLite":     "sqlite:///./app.db",
+    "MongoDB":    "mongodb://localhost:27017/app",
+    "MySQL":      "mysql+pymysql://app:change-me@localhost:3306/app",
+}
+
+
+def build_env_example(database_tech: str) -> str:
+    """Deterministic `.env.example` content built from the persistence contract.
+
+    For a known database, declares the contract's canonical DB URL variable
+    with an example value. With no database (or an unknown one, which has no
+    contract), declares no DB URL variable.
+    """
+    lines = ["# Copy to .env and fill in real values. Never commit real secrets."]
+    name = _match_db_name(database_tech)
+    if name is not None:
+        contract = build_persistence_contract(database_tech)
+        lines.append(f"{contract.db_url_env_var}={_EXAMPLE_DB_URLS[name]}")
+    return "\n".join(lines) + "\n"
 
 
 #: Complexity tiers for calibrating output size to user intent (Problem 4).
@@ -328,6 +364,10 @@ class FileManifest(BaseModel):
     #: Backend agents read this so schemas/CRUD match DB columns and API bodies
     #: exactly even while the database agent runs in parallel.
     contract: dict[str, dict[str, str]] = Field(default_factory=dict)
+    #: Deterministic file content synthesized by the Planner (e.g. `.env.example`
+    #: from the persistence contract). When set, the owning coding agent writes
+    #: it verbatim — no LLM call.
+    planned_content: Optional[str] = None
 
     # ── Coding agent fills after writing ────────────────────────────────
     written:   bool = False

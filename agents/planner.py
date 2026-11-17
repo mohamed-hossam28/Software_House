@@ -20,7 +20,8 @@ from typing import Any
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 from providers.llm.base import BaseLLMProvider
 from core.state import (
-    ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract,
+    ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
+    CONNECTION_MODULE_EXPORTS, build_env_example,
 )
 import re
 
@@ -520,6 +521,21 @@ def _detect_frontend_root(manifest_files: dict[str, FileManifest]) -> str | None
     return root
 
 
+#: Backend root used when no planned backend file reveals one. Shared by every
+#: injection pass so main.py, the router and the connection module agree.
+_DEFAULT_BACKEND_ROOT = "output/app/"
+
+
+def _next_task_id(prefix: str, existing_ids: set[str]) -> str:
+    """Reserve and return the first free injected-task id ('<prefix>-900' upward)."""
+    n = 900
+    while f"{prefix}-{n:03d}" in existing_ids:
+        n += 1
+    tid = f"{prefix}-{n:03d}"
+    existing_ids.add(tid)
+    return tid
+
+
 def _inject_scaffold_tasks(
     tasks: list[Task],
     manifest_files: dict[str, FileManifest],
@@ -538,14 +554,8 @@ def _inject_scaffold_tasks(
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
 
-    def _next_id(prefix: str) -> str:
-        n = 900
-        while f"{prefix}-{n:03d}" in existing_ids:
-            n += 1
-        return f"{prefix}-{n:03d}"
-
     # Infer root directories from the skeleton's actual file paths
-    backend_root = _detect_backend_root(manifest_files) or "output/app/"
+    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
     frontend_root = _detect_frontend_root(manifest_files) or "output/"
 
     be_main = f"{backend_root}main.py"
@@ -553,8 +563,7 @@ def _inject_scaffold_tasks(
 
     backend_task_ids = [t.id for t in tasks if t.agent == "backend"]
     if backend_task_ids and be_main not in existing_paths:
-        tid = _next_id("be")
-        existing_ids.add(tid)
+        tid = _next_task_id("be", existing_ids)
         next_tasks.append(Task(
             id=tid, agent="backend",
             title="Backend entrypoint (main.py)",
@@ -573,8 +582,7 @@ def _inject_scaffold_tasks(
 
     frontend_task_ids = [t.id for t in tasks if t.agent == "frontend"]
     if frontend_task_ids and fe_index not in existing_paths:
-        tid = _next_id("fe")
-        existing_ids.add(tid)
+        tid = _next_task_id("fe", existing_ids)
         next_tasks.append(Task(
             id=tid, agent="frontend",
             title="Frontend entrypoint (index.html)",
@@ -617,7 +625,7 @@ def _inject_router_task(
     if not backend_task_ids:
         return tasks, manifest_files
 
-    backend_root = _detect_backend_root(manifest_files) or "output/backend/"
+    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
     be_prefix = backend_root.rstrip("/") + "/"
 
     def _router_shaped(path: str) -> bool:
@@ -636,12 +644,6 @@ def _inject_router_task(
     existing_ids = {t.id for t in tasks}
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
-
-    def _next_id(prefix: str) -> str:
-        n = 900
-        while f"{prefix}-{n:03d}" in existing_ids:
-            n += 1
-        return f"{prefix}-{n:03d}"
 
     # Module name from the first contract path segment (e.g. /api/todos → todos).
     module_name = ""
@@ -662,8 +664,7 @@ def _inject_router_task(
         f"request={c.request_body or None}  response={c.response_body or None}"
         for c in arch.api_contracts
     )
-    tid = _next_id("be")
-    existing_ids.add(tid)
+    tid = _next_task_id("be", existing_ids)
     next_tasks.append(Task(
         id=tid, agent="backend",
         title=f"FastAPI router ({module_name})",
@@ -699,59 +700,138 @@ def _inject_router_task(
 def _inject_project_files(
     tasks: list[Task],
     manifest_files: dict[str, FileManifest],
-) -> tuple[list[Task], dict[str, FileManifest], list[str]]:
+    arch: ArchData,
+) -> tuple[list[Task], dict[str, FileManifest]]:
     """
     Commit to the deliverable's project-scaffolding file set (Phase C3).
     These files are REQUIRED for a runnable deliverable:
       - output/requirements.txt          (Python dependency manifest)
       - output/README.md                 (run instructions)
       - <backend_root>.env.example       (environment template — no real secrets)
+
+    `.env.example` carries deterministic content built from the persistence
+    contract (canonical DB URL variable), so no LLM writes it.
     """
+    database_tech = arch.tech_stack.get("database", "") if arch.persistence_contract else ""
+
     existing_ids = {t.id for t in tasks}
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
 
-    backend_root = _detect_backend_root(manifest_files) or "output/backend/"
+    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
 
-    def _next_id(prefix: str) -> str:
-        n = 900
-        while f"{prefix}-{n:03d}" in existing_ids:
-            n += 1
-        return f"{prefix}-{n:03d}"
-
+    # (path, title, purpose, exports, planned_content — None → LLM writes it)
     specs = [
         (
             "output/requirements.txt",
             "Python dependencies (requirements.txt)",
             "Locked Python dependency manifest covering every third-party import used by the backend.",
             ["requirements"],
+            None,
         ),
         (
             "output/README.md",
             "Project README (README.md)",
             "Run instructions: install dependencies, start the backend, and open the frontend.",
             ["readme"],
+            None,
         ),
         (
             f"{backend_root}.env.example",
             "Environment template (.env.example)",
-            "Example environment variables (DB URL, ports, secrets) — never real secrets.",
+            "Example environment variables (canonical DB URL) — never real secrets.",
             ["env_example"],
+            build_env_example(database_tech),
         ),
     ]
-    for path, title, purpose, exports in specs:
+    for path, title, purpose, exports, planned_content in specs:
         if path in next_manifest:
+            if planned_content is not None:
+                next_manifest[path].planned_content = planned_content
             continue
-        tid = _next_id("be")
-        existing_ids.add(tid)
+        tid = _next_task_id("be", existing_ids)
         next_tasks.append(Task(
             id=tid, agent="backend", title=title, description=purpose,
             depends_on=[], priority=AGENT_PRIORITY["backend"], status="pending",
         ))
         next_manifest[path] = FileManifest(
             agent="backend", task_id=tid, filepath=path,
-            purpose=purpose, exports=exports,
+            purpose=purpose, exports=exports, planned_content=planned_content,
         )
+
+    return next_tasks, next_manifest
+
+
+def _inject_persistence_seam(
+    tasks: list[Task],
+    manifest_files: dict[str, FileManifest],
+    arch: ArchData,
+) -> tuple[list[Task], dict[str, FileManifest]]:
+    """
+    Guarantee the DB connection module whenever the stack has a database
+    (i.e. the architecture produced a persistence contract).
+
+    The entry lives at <backend_root> + contract.connection_module, is owned by
+    the database agent, and carries the fixed CONNECTION_MODULE_EXPORTS.
+
+    If the skeleton already planned that path, its task is taken over (same
+    task id, so existing dependency edges stay valid): reassigned to the
+    database agent with the connection-module title/description, and its own
+    imports/deps dropped (the module is self-contained). Every file that
+    imported the planned module is rewired to the fixed exports.
+
+    The backend entrypoint imports the fixed exports and depends on the
+    connection-module task, so backend code can import it race-free while the
+    database agent runs in parallel.
+    """
+    contract = arch.persistence_contract
+    if contract is None:
+        return tasks, manifest_files
+
+    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
+    session_path = f"{backend_root}{contract.connection_module}"
+    exports = list(CONNECTION_MODULE_EXPORTS)
+    title = "DB connection module"
+    purpose = (
+        f"DB connection module ({contract.orm}) — engine, session factory and "
+        f"session dependency, reading the URL from {contract.db_url_env_var}."
+    )
+
+    next_tasks = list(tasks)
+    next_manifest = dict(manifest_files)
+
+    skeleton_entry = next_manifest.get(session_path)
+    if skeleton_entry is not None:
+        tid = skeleton_entry.task_id
+        for t in next_tasks:
+            if t.id == tid:
+                t.agent = "database"
+                t.priority = AGENT_PRIORITY["database"]
+                t.title = title
+                t.description = purpose
+                t.depends_on = []
+    else:
+        tid = _next_task_id("db", {t.id for t in tasks})
+        next_tasks.append(Task(
+            id=tid, agent="database", title=title, description=purpose,
+            depends_on=[], priority=AGENT_PRIORITY["database"], status="pending",
+        ))
+
+    next_manifest[session_path] = FileManifest(
+        agent="database", task_id=tid, filepath=session_path,
+        purpose=purpose, exports=exports,
+    )
+
+    for fm in next_manifest.values():
+        if session_path in fm.imports_from:
+            fm.imports_from[session_path] = list(exports)
+
+    main_fm = next_manifest.get(f"{backend_root}main.py")
+    if main_fm is not None:
+        main_fm.imports_from[session_path] = list(exports)
+        for t in next_tasks:
+            if t.id == main_fm.task_id and tid not in t.depends_on:
+                t.depends_on = t.depends_on + [tid]
 
     return next_tasks, next_manifest
 
@@ -929,8 +1009,12 @@ class PlannerAgent(BaseAgent):
         # router shape was planned (main.py must register routers that exist).
         tasks, manifest_files = _inject_router_task(tasks, manifest_files, arch)
 
+        # Guarantee the DB connection module (fixed exports) and wire it into
+        # the backend entrypoint whenever the stack has a database.
+        tasks, manifest_files = _inject_persistence_seam(tasks, manifest_files, arch)
+
         # Inject the committed project-scaffolding file set (Phase C3).
-        tasks, manifest_files = _inject_project_files(tasks, manifest_files)
+        tasks, manifest_files = _inject_project_files(tasks, manifest_files, arch)
 
         manifest_task_ids = {fm.task_id for fm in manifest_files.values()}
         synced_tasks = [t for t in tasks if t.id in manifest_task_ids]
@@ -1143,6 +1227,30 @@ if __name__ == "__main__":
     t4, m4 = _inject_router_task(tasks_m, mf_m, ArchData(api_contracts=[]))
     assert set(m4) == set(mf_m), "no injection without API contracts"
     print("[PASS] _inject_router_task — skipped when router exists or contracts absent")
+
+    # ── _inject_persistence_seam + deterministic .env.example ─────────────────
+    from core.state import build_persistence_contract
+    arch_db = ArchData(
+        tech_stack={"database": "SQLite 3"},
+        persistence_contract=build_persistence_contract("SQLite 3"),
+    )
+    t5, m5 = _inject_scaffold_tasks(tasks_m, mf_m)
+    t5, m5 = _inject_persistence_seam(t5, m5, arch_db)
+    t5, m5 = _inject_project_files(t5, m5, arch_db)
+    session_fm = m5["output/backend/db/session.py"]
+    assert session_fm.agent == "database"
+    assert session_fm.exports == list(CONNECTION_MODULE_EXPORTS)
+    main_fm = m5["output/backend/main.py"]
+    assert main_fm.imports_from["output/backend/db/session.py"] == list(CONNECTION_MODULE_EXPORTS)
+    assert session_fm.task_id in next(t for t in t5 if t.id == main_fm.task_id).depends_on
+    assert "DATABASE_URL=sqlite" in m5["output/backend/.env.example"].planned_content
+    print("[PASS] _inject_persistence_seam — connection module pinned, main.py wired, .env.example deterministic")
+
+    t6, m6 = _inject_persistence_seam(tasks_m, mf_m, ArchData())
+    assert set(m6) == set(mf_m), "no connection module without a database"
+    _, m6 = _inject_project_files(t6, m6, ArchData())
+    assert "DATABASE_URL" not in m6["output/backend/.env.example"].planned_content
+    print("[PASS] _inject_persistence_seam — nothing injected without a database")
 
     print("\n" + "=" * 60)
     print("All PlannerAgent smoke-tests PASSED")
