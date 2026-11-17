@@ -380,7 +380,7 @@ class FrontendAgent(BaseAgent):
 
         # Parse JSON
         try:
-            data = self.extract_json(raw)
+            data = self.extract_json_and_validate(raw, FrontendSchema, state=state, lock=lock)
         except Exception:
             snippet = raw[:500] if raw else "(empty)"
             logger.error("[FrontendAgent] JSON parse/validation failed for %s | raw: %s", filepath, snippet)

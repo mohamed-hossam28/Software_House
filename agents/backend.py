@@ -38,6 +38,7 @@ try:
 except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
+from agents.schemas.backend import BackendSchema
 from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
@@ -411,7 +412,7 @@ class BackendAgent(BaseAgent):
             return
 
         try:
-            data = self.extract_json(raw)
+            data = self.extract_json_and_validate(raw, BackendSchema, state=state, lock=lock)
         except Exception:
             logger.error("[BackendAgent] JSON parse/validation failed for %s", filepath)
             with lock:
