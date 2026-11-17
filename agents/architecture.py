@@ -1,7 +1,7 @@
 """
 agents/architecture.py
 ──────────────────────
-Architecture Agent — 2 rounds, 3 LLM calls (Round 1 parallel via ThreadPoolExecutor).
+Architecture Agent — 2 rounds, 3 LLM calls, run via ThreadPoolExecutor.
 
 ROUND 1 (fully independent — run in parallel)
   ├── Call A: core architecture  (tech_stack + system_components + security)
@@ -283,7 +283,7 @@ def _db_srs_block(srs: SRSData) -> str:
 
 
 def _srs_summary_block(srs: SRSData, stack: dict[str, str]) -> str:
-    """Format a condensed SRS summary (functional requirements + tech stack) for the Round 2 call (API contracts) to minimize token usage."""
+    """Format a condensed SRS summary (functional requirements + tech stack) for Round 2 & 3 calls to minimize token usage."""
     return (
         "## Requirements & Tech Stack Summary\n\n"
         "### Functional Requirements\n"

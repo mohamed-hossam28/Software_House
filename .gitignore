@@ -207,7 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 project_context.md
-tests
 SESSION_MEMORY.md
 output
 project_req.md
