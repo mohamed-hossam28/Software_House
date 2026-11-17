@@ -149,13 +149,74 @@ _DEFAULT_ORM: dict[str, str] = {
 }
 
 
-def resolve_db_tooling(database_tech: str) -> dict[str, str]:
-    """Resolve ORM/migration strategy deterministically from a database tech string."""
+def _match_db_mapping(database_tech: str) -> Optional[dict[str, str]]:
+    """Return the DB_ORM_MAP entry whose name appears in the tech string, or None."""
     db_key = (database_tech or "").lower()
     for name, mapping in DB_ORM_MAP.items():
         if name.lower() in db_key:
             return mapping
-    return dict(_DEFAULT_ORM)
+    return None
+
+
+def resolve_db_tooling(database_tech: str) -> dict[str, str]:
+    """Resolve ORM/migration strategy deterministically from a database tech string."""
+    return _match_db_mapping(database_tech) or dict(_DEFAULT_ORM)
+
+
+class PersistenceContract(BaseModel):
+    """How generated code persists data — derived from the tech stack, never by an LLM."""
+    orm:               str
+    migrations_tool:   Optional[str]   # None → schema is created by the ORM (create_all-style)
+    db_url_env_var:    str             # canonical env var every artifact reads the DB URL from
+    connection_module: str             # path relative to the backend root
+    init_command:      str             # run once before serving
+
+
+#: Canonical DB URL env var — every artifact that reads the DB URL uses this name.
+DB_URL_ENV_VAR = "DATABASE_URL"
+
+#: Backend DB connection module, relative to the backend root.
+CONNECTION_MODULE = "db/session.py"
+
+#: Real migration tools → the command that applies migrations before serving.
+#: A DB_ORM_MAP "migrations" value not listed here (e.g. create_all()) means no tool.
+_MIGRATION_INIT_COMMANDS: dict[str, str] = {
+    "Alembic": "alembic upgrade head",
+}
+
+
+class UnknownDatabaseError(ValueError):
+    """The database tech string matches no entry in DB_ORM_MAP."""
+
+
+def build_persistence_contract(database_tech: str) -> PersistenceContract:
+    """Build the persistence contract for a database tech string.
+
+    Raises UnknownDatabaseError for an unrecognised database instead of
+    silently falling back to the SQLite-style mapping.
+    """
+    mapping = _match_db_mapping(database_tech)
+    if mapping is None:
+        raise UnknownDatabaseError(
+            f"No persistence contract for database {database_tech!r}; "
+            f"known databases: {', '.join(DB_ORM_MAP)}"
+        )
+
+    migrations_tool = mapping["migrations"] if mapping["migrations"] in _MIGRATION_INIT_COMMANDS else None
+    if migrations_tool:
+        init_command = _MIGRATION_INIT_COMMANDS[migrations_tool]
+    else:
+        # No migrations tool: running the connection module creates the schema.
+        module = CONNECTION_MODULE.removesuffix(".py").replace("/", ".")
+        init_command = f"python -m {module}"
+
+    return PersistenceContract(
+        orm=mapping["orm"],
+        migrations_tool=migrations_tool,
+        db_url_env_var=DB_URL_ENV_VAR,
+        connection_module=CONNECTION_MODULE,
+        init_command=init_command,
+    )
 
 
 #: Complexity tiers for calibrating output size to user intent (Problem 4).
@@ -204,6 +265,7 @@ class ArchData(BaseModel):
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths
     complexity_tier: str = "STANDARD"                                # MINIMAL | STANDARD | ENTERPRISE
+    persistence_contract: Optional[PersistenceContract] = None       # None → database unknown (error logged)
 
  
 class Task(BaseModel):

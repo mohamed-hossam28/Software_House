@@ -19,7 +19,7 @@ from typing import Any
 
 from .base import BaseAgent
 from agents.utils import _as_list
-from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling
+from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +472,14 @@ class ArchitectureAgent(BaseAgent):
             ps,
         )
 
+        # ── Persistence contract (deterministic — no LLM) ───────────────────────
+        try:
+            persistence_contract = build_persistence_contract(merged_stack.get("database", ""))
+        except UnknownDatabaseError as exc:
+            logger.error("[ArchitectureAgent] %s", exc)
+            ps.log_error(self.name, str(exc))
+            persistence_contract = None
+
         ps.architecture = ArchData(
             tech_stack               = merged_stack,
             system_components        = _as_list(results.get("system_components", [])),
@@ -481,6 +489,7 @@ class ArchitectureAgent(BaseAgent):
             deployment_strategy      = "",
             diagrams                 = [],
             complexity_tier          = str(results.get("complexity_tier", "STANDARD")),
+            persistence_contract     = persistence_contract,
         )
 
         duration = time.perf_counter() - t0
