@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     nvidia_api: Optional[str] = Field(None, validation_alias=AliasChoices("nvidia_api_key", "NVIDIA_API_KEY", "nvidia_api", "NVIDIA_API"))
     nara_api: Optional[str] = Field(None, validation_alias=AliasChoices("nara_api", "nara_api_key", "NARA_API_KEY"))
     apinex_api: Optional[str] = Field(None, validation_alias=AliasChoices("apinex_api", "apinex_api_key", "APINEX_API_KEY"))
+    agent_router_api: Optional[str] = Field(None, validation_alias=AliasChoices("agent_router_api", "AGENT_ROUTER_API_KEY", "AGENTROUTER_API_KEY"))
 
     # Provider and model settings
     # Support both DEFAULY_PROVIDER (as requested) and standard DEFAULT_PROVIDER
@@ -92,6 +93,8 @@ class Settings(BaseSettings):
             return "deepseek-3.2"
         elif provider == "apinex":
             return "free/glm-5.3-flash"
+        elif provider in ("agent_router", "agentrouter"):
+            return "gpt-5.6-sol"
         else:
             return "openai/gpt-oss-120b:free"
 
@@ -122,6 +125,8 @@ class Settings(BaseSettings):
             return self.nara_api
         elif provider == "apinex":
             return self.apinex_api
+        elif provider in ("agent_router", "agentrouter"):
+            return self.agent_router_api
         return None
     
 
