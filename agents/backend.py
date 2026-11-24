@@ -23,7 +23,6 @@ import sys
 import re
 import json as _json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from typing import Any
@@ -43,7 +42,6 @@ from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
-    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -449,16 +447,12 @@ class BackendAgent(BaseAgent):
 
         logger.info("[BackendAgent] Successfully wrote and summarized %s", filepath)
 
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
+    def _work(self, ps: ProjectState) -> None:
 
         be_tasks = ps.tasks.by_agent("backend")
         if not be_tasks:
             logger.info("[BackendAgent] No backend tasks to execute.")
-            return diff_state(before, ps)
+            return
 
         logger.info("[BackendAgent] Sorting and staging %d backend tasks ...", len(be_tasks))
         stages = resolve_backend_stages(be_tasks)
@@ -501,19 +495,14 @@ class BackendAgent(BaseAgent):
                         logger.error("[BackendAgent] Task execution raised exception: %s", exc)
                         ps.log_error(self.name, f"Task execution error: {exc}")
 
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
-
         # Log summary
         unwritten = ps.code_manifest.unwritten()
         be_unwritten = [m for m in unwritten if m.agent == "backend"]
         logger.info(
-            "[BackendAgent] Done in %.2fs. Written: %d backend files. Unwritten remaining: %d.",
-            duration,
+            "[BackendAgent] Done. Written: %d backend files. Unwritten remaining: %d.",
             len(be_tasks) - len(be_unwritten),
             len(be_unwritten)
         )
-        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

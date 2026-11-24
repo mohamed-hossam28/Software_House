@@ -23,7 +23,6 @@ import sys
 import re
 import json as _json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from typing import Any
@@ -41,7 +40,6 @@ from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
-    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -415,16 +413,12 @@ class FrontendAgent(BaseAgent):
         logger.info("[FrontendAgent] ✓ %s", filepath)
 
     # ── Main entry point ──────────────────────────────────────────────────────
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
+    def _work(self, ps: ProjectState) -> None:
 
         fe_tasks = ps.tasks.by_agent("frontend")
         if not fe_tasks:
             logger.info("[FrontendAgent] No frontend tasks — nothing to do.")
-            return diff_state(before, ps)
+            return
 
         fe_tasks.sort(key=lambda t: t.priority)
         stages = resolve_frontend_stages(fe_tasks)
@@ -469,17 +463,12 @@ class FrontendAgent(BaseAgent):
                         logger.error("[FrontendAgent] Unhandled task exception: %s", exc)
                         ps.log_error(self.name, f"Task exception: {exc}")
 
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
-
         unwritten = [m for m in ps.code_manifest.unwritten() if m.agent == "frontend"]
         logger.info(
-            "[FrontendAgent] Done in %.2fs. Written: %d  Unwritten: %d.",
-            duration,
+            "[FrontendAgent] Done. Written: %d  Unwritten: %d.",
             len(fe_tasks) - len(unwritten),
             len(unwritten),
         )
-        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

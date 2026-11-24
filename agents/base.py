@@ -633,11 +633,11 @@ class BaseAgent(ABC):
         ...
 
     def _build_prompt(self, state: ProjectState) -> str:
-        """Build the prompt for single-call agents using default run(). Override in subclass if using default run()."""
+        """Build the prompt for single-call agents using the default _work(). Override in subclass if using the default _work()."""
         raise NotImplementedError(f"[{self.name}] _build_prompt() is not implemented.")
 
     def _parse_response(self, state: ProjectState, raw: str) -> ProjectState:
-        """Parse response for single-call agents using default run(). Override in subclass if using default run()."""
+        """Parse response for single-call agents using the default _work(). Override in subclass if using the default _work()."""
         raise NotImplementedError(f"[{self.name}] _parse_response() is not implemented.")
     
 
@@ -759,16 +759,32 @@ class BaseAgent(ABC):
 
     def run(self, state: dict | ProjectState) -> dict[str, Any]:
         """
-        Run the agent.
-        Accepts the full state (dict or ProjectState) as input.
-        Returns a dict containing ONLY the changed/wanted fields.
+        The run skeleton shared by every agent.
+        Accepts the full state (dict or ProjectState) as input: snapshots it,
+        marks the agent's start, times the work step, records its duration in
+        metrics and returns ONLY the changes, through the state-update module.
+        Agents supply their work in _work(); they do not override run().
         """
         ps = state if isinstance(state, ProjectState) else ProjectState(**state)
         before = ps.model_copy(deep=True)
 
         ps.mark_agent_start(self.name)
-        prompt = self._build_prompt(ps)
         t0 = time.perf_counter()
+
+        self._work(ps)
+
+        duration = time.perf_counter() - t0
+        ps.metrics.agent_durations[self.name] = round(duration, 3)
+        logger.info("[%s] finished in %.2fs via %s", self.name, duration, self.provider.provider_name)
+        return diff_state(before, ps)
+
+    def _work(self, ps: ProjectState) -> None:
+        """
+        The agent's work step: update the state in place; returning early is fine.
+        Default: one LLM call with retries, built by _build_prompt() and parsed
+        by _parse_response(). Agents with other work override this.
+        """
+        prompt = self._build_prompt(ps)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -776,7 +792,7 @@ class BaseAgent(ABC):
                 ps.metrics.total_tokens_used += response.total_tokens
                 ps.metrics.total_llm_calls   += 1
 
-                ps = self._parse_response(ps, response.text)
+                self._parse_response(ps, response.text)
                 break
 
             except Exception as exc:
@@ -789,11 +805,6 @@ class BaseAgent(ABC):
                     ps.log_error(self.name, str(exc))
                 else:
                     time.sleep(self.backoff * attempt)
-
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
-        logger.info("[%s] finished in %.2fs via %s", self.name, duration, self.provider.provider_name)
-        return diff_state(before, ps)
 
 
     # ── JSON helpers ──────────────────────────────────────────────────

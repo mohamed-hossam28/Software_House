@@ -34,7 +34,6 @@ returns only the changed fields as a diff dict.
 import logging
 import os
 import threading
-import time
 from typing import Any
 
 from agents.base import (
@@ -51,7 +50,6 @@ from core.state import (
     StaticVerdict,
     backend_persistence_rules,
     render_persistence_contract,
-    diff_state,
 )
 from core.static_checks import run_all_checks
 from core.static_checks.persistence_checker import PERSISTENCE_CHECKS
@@ -83,13 +81,7 @@ class IntegrationAgent(BaseAgent):
             "and perform bounded, finding-driven repairs."
         )
 
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
-
+    def _work(self, ps: ProjectState) -> None:
         files: dict[str, str] = {}
         for layer in ("backend", "frontend", "database"):
             files.update(getattr(ps.generated_code, layer, {}) or {})
@@ -176,7 +168,6 @@ class IntegrationAgent(BaseAgent):
             location = f"{f.file}:{f.line}" if f.line else f.file
             ps.log_error(self.name, f"{f.check}: {location} {f.message}".strip())
 
-        ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
         logger.info(
             "[IntegrationAgent] verdict=%s errors=%d warnings=%d rounds=%d repaired=%d files=%d",
             ps.static_checks.verdict.value,
@@ -186,7 +177,6 @@ class IntegrationAgent(BaseAgent):
             len(repaired_files),
             len(files),
         )
-        return diff_state(before, ps)
 
     # ── Repair loop ────────────────────────────────────────────────────
 

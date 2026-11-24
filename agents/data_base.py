@@ -34,7 +34,6 @@ import sys
 import json
 import json as _json
 import logging
-import time
 import re
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
@@ -54,7 +53,6 @@ from core.workspace import connection_module_path, dotted_import
 
 from core.state import (
     ProjectState,
-    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -480,16 +478,12 @@ class DatabaseAgent(BaseAgent):
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
+    def _work(self, ps: ProjectState) -> None:
 
         db_tasks = ps.tasks.by_agent("database")
         if not db_tasks:
             logger.info("[DBAgent] No database tasks — nothing to do.")
-            return diff_state(before, ps)
+            return
 
         logger.info("[DBAgent] Resolving stages for %d database tasks …", len(db_tasks))
         stages = resolve_db_stages(db_tasks)
@@ -531,17 +525,12 @@ class DatabaseAgent(BaseAgent):
                         with state_lock:
                             ps.log_error(self.name, f"Task exception: {exc}")
 
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
-
         unwritten = [m for m in ps.code_manifest.unwritten() if m.agent == "database"]
         logger.info(
-            "[DBAgent] Done in %.2fs. Written: %d  Unwritten: %d.",
-            duration,
+            "[DBAgent] Done. Written: %d  Unwritten: %d.",
             len(db_tasks) - len(unwritten),
             len(unwritten),
         )
-        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
