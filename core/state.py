@@ -253,10 +253,10 @@ class ProjectStatus(str, Enum):
 #: Deterministic ORM / migration strategy per database technology.
 #: Used to enforce a single database paradigm (Problem 5) — the LLM can never override it.
 DB_ORM_MAP: dict[str, dict[str, str]] = {
-    "PostgreSQL": {"orm": "SQLAlchemy", "migrations": "Alembic",                 "model_dir": "app/models/", "migration_dir": "alembic/versions/"},
+    "PostgreSQL": {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
     "SQLite":     {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
     "MongoDB":    {"orm": "Beanie",     "migrations": "None",                    "model_dir": "app/models/", "migration_dir": ""},
-    "MySQL":      {"orm": "SQLAlchemy", "migrations": "Alembic",                 "model_dir": "app/models/", "migration_dir": "alembic/versions/"},
+    "MySQL":      {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
 }
 
 #: Fallback used when the database tech string matches no known provider.
@@ -299,7 +299,7 @@ def resolve_db_tooling(database_tech: str) -> dict[str, str]:
 class PersistenceContract(BaseModel):
     """How generated code persists data — derived from the tech stack, never by an LLM."""
     orm:               str
-    migrations_tool:   Optional[str]   # None → schema is created by the ORM (create_all-style)
+    migrations_tool:   Optional[str]   # always None: the ORM creates the schema (create_all-style)
     db_url_env_var:    str             # canonical env var every artifact reads the DB URL from
     connection_module: str             # path relative to the backend root
     init_command:      str             # run once before serving
@@ -315,13 +315,6 @@ CONNECTION_MODULE = "db/session.py"
 #: dependency) — pinned in the manifest so backend imports never depend on
 #: which parallel coding agent writes first.
 CONNECTION_MODULE_EXPORTS: tuple[str, ...] = ("engine", "SessionLocal", "get_db")
-
-#: Real migration tools → the command that applies migrations before serving.
-#: A DB_ORM_MAP "migrations" value not listed here (e.g. create_all()) means no tool.
-_MIGRATION_INIT_COMMANDS: dict[str, str] = {
-    "Alembic": "alembic upgrade head",
-}
-
 
 class UnknownDatabaseError(ValueError):
     """The database tech string matches no entry in DB_ORM_MAP."""
@@ -340,17 +333,14 @@ def build_persistence_contract(database_tech: str) -> PersistenceContract:
             f"known databases: {', '.join(DB_ORM_MAP)}"
         )
 
-    migrations_tool = mapping["migrations"] if mapping["migrations"] in _MIGRATION_INIT_COMMANDS else None
-    if migrations_tool:
-        init_command = _MIGRATION_INIT_COMMANDS[migrations_tool]
-    else:
-        # No migrations tool: running the connection module creates the schema.
-        module = CONNECTION_MODULE.removesuffix(".py").replace("/", ".")
-        init_command = f"python -m {module}"
+    # No migrations tool for any database: running the connection module
+    # creates the schema (create_all() for SQL; a no-op for MongoDB/Beanie).
+    module = CONNECTION_MODULE.removesuffix(".py").replace("/", ".")
+    init_command = f"python -m {module}"
 
     return PersistenceContract(
         orm=mapping["orm"],
-        migrations_tool=migrations_tool,
+        migrations_tool=None,
         db_url_env_var=DB_URL_ENV_VAR,
         connection_module=CONNECTION_MODULE,
         init_command=init_command,
@@ -419,14 +409,12 @@ def build_connection_module(contract: PersistenceContract, model_modules: list[s
     env_var = contract.db_url_env_var
     if contract.orm != "SQLAlchemy":
         return _build_motor_connection_module(contract)
-    create_schema = ""
-    if contract.migrations_tool is None:
-        # No migrations tool: the init command (`python -m <module>`) creates
-        # every table declared by the model modules.
-        create_schema = f'''
+    # The init command (`python -m <module>`) creates every table declared by
+    # the model modules with create_all().
+    create_schema = f'''
 
 def create_schema():
-    """Create every table declared by the model modules (no migrations tool)."""
+    """Create every table declared by the model modules (create_all())."""
     import importlib
 
     from sqlalchemy import MetaData

@@ -6,57 +6,43 @@ import sys
 
 import pytest
 
-from core.state import UnknownDatabaseError, build_persistence_contract
+from core.state import DB_ORM_MAP, PersistenceContract, UnknownDatabaseError, build_persistence_contract
 
 
-def test_postgresql_stack_gets_alembic_migrations():
-    contract = build_persistence_contract("PostgreSQL 16")
+@pytest.mark.parametrize(
+    ("database_tech", "orm"),
+    [
+        ("PostgreSQL 16", "SQLAlchemy"),
+        ("MySQL 8", "SQLAlchemy"),
+        ("SQLite 3", "SQLAlchemy"),
+        ("MongoDB 7", "Beanie"),  # unchanged by dropping Alembic
+        # Strings the resolver / LLM actually produce for known databases.
+        ("Supabase (PostgreSQL)", "SQLAlchemy"),
+        ("PostgreSQL with SQLAlchemy (Alembic)", "SQLAlchemy"),
+        ("sqlite", "SQLAlchemy"),
+    ],
+)
+def test_every_supported_database_creates_its_schema_by_running_the_connection_module(database_tech, orm):
+    contract = build_persistence_contract(database_tech)
 
-    assert contract.orm == "SQLAlchemy"
-    assert contract.migrations_tool == "Alembic"
-    assert contract.db_url_env_var == "DATABASE_URL"
-    assert contract.connection_module == "db/session.py"
-    assert contract.init_command == "alembic upgrade head"
+    assert contract == PersistenceContract(
+        orm=orm,
+        migrations_tool=None,
+        db_url_env_var="DATABASE_URL",
+        connection_module="db/session.py",
+        init_command="python -m db.session",
+    )
 
 
-def test_sqlite_stack_uses_create_all_and_no_migrations_tool():
-    contract = build_persistence_contract("SQLite 3")
-
-    assert contract.orm == "SQLAlchemy"
-    assert contract.migrations_tool is None
-    assert contract.db_url_env_var == "DATABASE_URL"
-    assert contract.connection_module == "db/session.py"
-    # No migrations tool: running the connection module creates the tables.
-    assert contract.init_command == "python -m db.session"
+@pytest.mark.parametrize("database_tech", list(DB_ORM_MAP))
+def test_no_persistence_contract_names_alembic(database_tech):
+    assert "alembic" not in build_persistence_contract(database_tech).model_dump_json().lower()
 
 
 @pytest.mark.parametrize("database_tech", ["Apache Cassandra", "AWS DynamoDB"])
 def test_unknown_database_raises_instead_of_falling_back_to_sqlite(database_tech):
     with pytest.raises(UnknownDatabaseError, match=database_tech):
         build_persistence_contract(database_tech)
-
-
-@pytest.mark.parametrize(
-    ("database_tech", "orm", "migrations_tool", "init_command"),
-    [
-        ("MySQL 8", "SQLAlchemy", "Alembic", "alembic upgrade head"),
-        ("MongoDB 7", "Beanie", None, "python -m db.session"),
-        # Strings the resolver / LLM actually produce for known databases.
-        ("Supabase (PostgreSQL)", "SQLAlchemy", "Alembic", "alembic upgrade head"),
-        ("PostgreSQL with SQLAlchemy (Alembic)", "SQLAlchemy", "Alembic", "alembic upgrade head"),
-        ("sqlite", "SQLAlchemy", None, "python -m db.session"),
-    ],
-)
-def test_known_database_mappings(database_tech, orm, migrations_tool, init_command):
-    contract = build_persistence_contract(database_tech)
-
-    assert (contract.orm, contract.migrations_tool, contract.init_command) == (
-        orm,
-        migrations_tool,
-        init_command,
-    )
-    assert contract.db_url_env_var == "DATABASE_URL"
-    assert contract.connection_module == "db/session.py"
 
 
 def test_contract_has_exactly_the_five_fields():
@@ -148,38 +134,43 @@ class TodoItem(Base):
 
 
 def _run_init_command(tmp_path, database_tech: str) -> list[str]:
-    """Lay out a backend root, run `python -m db.session`, return the created tables."""
+    """Lay out a backend root, run the contract's init command, return the created tables.
+
+    No database server runs in the test suite, so DATABASE_URL points at a
+    SQLite file for every SQL database: the connection module generated from
+    the PostgreSQL / MySQL contract is the same SQLAlchemy module, and the init
+    command is what is under test.
+    """
+    import shlex
+
     from sqlalchemy import create_engine, inspect
 
     from core.state import build_connection_module
 
-    (tmp_path / "db").mkdir()
-    (tmp_path / "db" / "__init__.py").write_text("")
+    contract = build_persistence_contract(database_tech)
+    module_path = tmp_path / contract.connection_module
+    module_path.parent.mkdir(parents=True)
+    (module_path.parent / "__init__.py").write_text("")
     (tmp_path / "models").mkdir()
     (tmp_path / "models" / "__init__.py").write_text("")
     (tmp_path / "models" / "todo.py").write_text(TODO_MODEL_SOURCE)
-    (tmp_path / "db" / "session.py").write_text(
-        build_connection_module(build_persistence_contract(database_tech), model_modules=["models.todo"]),
+    module_path.write_text(
+        build_connection_module(contract, model_modules=["models.todo"]),
         encoding="utf-8",
     )
     url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
     env = {**os.environ, "DATABASE_URL": url}
 
-    subprocess.run([sys.executable, "-m", "db.session"], cwd=tmp_path, env=env, check=True)
+    program, *args = shlex.split(contract.init_command)
+    assert program == "python"
+    subprocess.run([sys.executable, *args], cwd=tmp_path, env=env, check=True)
 
     return inspect(create_engine(url)).get_table_names()
 
 
-def test_create_all_stack_init_command_creates_the_model_tables(tmp_path):
-    contract = build_persistence_contract("SQLite 3")
-    assert contract.init_command == "python -m db.session"
-
-    assert _run_init_command(tmp_path, "SQLite 3") == ["todo_items"]
-
-
-def test_migrations_stack_leaves_schema_creation_to_the_migrations_tool(tmp_path):
-    # Same SQLAlchemy module shape; only the schema-creation path differs.
-    assert _run_init_command(tmp_path, "PostgreSQL 16") == []
+@pytest.mark.parametrize("database_tech", ["SQLite 3", "PostgreSQL 16", "MySQL 8"])
+def test_sql_database_init_command_creates_the_model_tables(tmp_path, database_tech):
+    assert _run_init_command(tmp_path, database_tech) == ["todo_items"]
 
 
 def test_mongodb_connection_module_uses_motor_not_sqlalchemy():
@@ -207,9 +198,10 @@ def test_rendered_contract_carries_every_value_downstream_agents_must_agree_on()
 
     rendered = render_persistence_contract(build_persistence_contract("PostgreSQL 16"))
 
-    for value in ("SQLAlchemy", "Alembic", "DATABASE_URL", "db/session.py",
-                  "from db.session import engine, SessionLocal, get_db", "alembic upgrade head"):
+    for value in ("SQLAlchemy", "DATABASE_URL", "db/session.py",
+                  "from db.session import engine, SessionLocal, get_db", "python -m db.session"):
         assert value in rendered
+    assert "alembic" not in rendered.lower()
 
 
 def _planner_prompt(tier: str, database_tech: str) -> str:
