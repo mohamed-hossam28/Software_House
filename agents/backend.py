@@ -38,6 +38,7 @@ except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_import_contract, align_batch_items, build_pending_contracts
 from agents.schemas.backend import BackendSchema
+from agents.coding_request import request_header
 from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
@@ -266,7 +267,7 @@ Please write the complete code for `{filepath}` and summarize its classes and fu
 Respond with a single valid JSON object containing "code", "classes", and "functions".
 ```json
 """
-    return user_prompt
+    return request_header([filepath]) + user_prompt
 
 
 
@@ -298,7 +299,7 @@ class BackendAgent(BaseAgent):
                 f"Required Exports: {exports}"
             )
         batch_desc = "\n\n".join(entries)
-        return (
+        return request_header([manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]) + (
             f"Generate the following {len(tasks)} trivial/boilerplate {backend_tech} files.\n\n"
             f"{batch_desc}\n\n"
             "Return a JSON ARRAY (not object) — one element per file in the same order:\n"

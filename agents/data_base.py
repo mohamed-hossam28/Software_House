@@ -39,6 +39,7 @@ try:
 except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_import_contract, align_batch_items
+from agents.coding_request import request_header
 from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
@@ -180,7 +181,7 @@ def _build_file_prompt(
 
     import_contract = build_import_contract(manifest, filepath)
 
-    return f"""\
+    return request_header([filepath]) + f"""\
 ## Model File to Generate
 - **File Path** : `{filepath}`
 - **Purpose**   : {purpose}
@@ -262,7 +263,7 @@ class DatabaseAgent(BaseAgent):
                 f"Required Exports: {exports}"
             )
         batch_desc = "\n\n".join(entries)
-        return (
+        return request_header([manifest.by_task(t.id).filepath for t in tasks if manifest.by_task(t.id)]) + (
             f"Generate the following {len(tasks)} trivial/boilerplate {db_tech} model files.\n\n"
             f"{batch_desc}\n\n"
             "Return a JSON ARRAY (not object) — one element per file in the same order:\n"

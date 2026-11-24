@@ -19,38 +19,15 @@ from core.state import (
     StaticVerdict,
 )
 from graph.nodes import make_finalize_node
-from providers.llm.base import BaseLLMProvider, LLMResponse
+from providers.llm.scripted import ScriptedLLMProvider
+from tests.fixtures.scripted_llm import llm_files, scripted_coding_agent, scripted_planner
 from tests.test_persistence_contract import TODO_MODEL_SOURCE
 
-
-class BrokenSeedRepairProvider(BaseLLMProvider):
-    """One-response provider that repairs the seeded Python syntax error."""
-
-    calls = 0
-
-    @property
-    def provider_name(self) -> str:
-        return "broken-seed-repair"
-
-    def complete(
-        self,
-        system_prompt: str,
-        user_message: str,
-        model: str = "",
-        max_tokens: int = 8192,
-        temperature: float = 0.2,
-        stream: bool = False,
-        chunk_callback=None,
-    ) -> LLMResponse:
-        self.calls += 1
-        return LLMResponse(
-            text=json.dumps({
-                "filepath": "output/backend/main.py",
-                "code": "def main():\n    return 'todo'\n",
-            }),
-            input_tokens=30,
-            output_tokens=20,
-        )
+#: The repair call's one reply: it fixes the seeded Python syntax error.
+BROKEN_SEED_REPAIR = {
+    "filepath": "output/backend/main.py",
+    "code": "def main():\n    return 'todo'\n",
+}
 
 
 def test_finalize_writes_summary_and_complete_findings_report(workspace, tmp_path):
@@ -128,7 +105,7 @@ def test_broken_seed_repairs_and_is_recorded_in_reports(workspace, tmp_path, cap
         exports=["main"],
         written=True,
     )
-    provider = BrokenSeedRepairProvider()
+    provider = ScriptedLLMProvider("integration", calls=[BROKEN_SEED_REPAIR])
 
     with caplog.at_level(logging.INFO, logger="agents.integration"):
         diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(state)
@@ -137,8 +114,8 @@ def test_broken_seed_repairs_and_is_recorded_in_reports(workspace, tmp_path, cap
     assert diff["static_checks"]["rounds"] == 1
     assert diff["static_checks"]["repaired_files"] == [path]
     assert diff["metrics"]["total_llm_calls"] == 1
-    assert diff["metrics"]["total_tokens_used"] == 50
-    assert provider.calls == 1
+    assert diff["metrics"]["total_tokens_used"] == 20  # the fake reports 10 in + 10 out
+    assert len(provider.requests) == 1
     assert "verdict=repaired" in caplog.text
     assert "rounds=1" in caplog.text
     assert "repaired=1" in caplog.text
@@ -189,71 +166,60 @@ def test_main_logging_tees_stdout_stderr_and_logger_output(tmp_path):
     assert not ignored_second_path.exists()
 
 
-class AnyCodingFileProvider(BaseLLMProvider):
-    """Answers every backend/database prompt (single file or trivial batch) with stub code."""
-
-    @property
-    def provider_name(self) -> str:
-        return "any-coding-file"
-
-    def complete(self, system_prompt, user_message, model="", max_tokens=8192,
-                 temperature=0.2, stream=False, chunk_callback=None) -> LLMResponse:
-        stub = {"code": "LLM_WROTE_THIS = 1\n", "migration_code": "LLM_WROTE_THIS = 1\n",
-                "classes": [], "functions": []}
-        if "Return a JSON ARRAY" in user_message:
-            paths = [line.split("### File:", 1)[1].strip()
-                     for line in user_message.splitlines() if line.startswith("### File:")]
-            text = json.dumps([{**stub, "filepath": p} for p in paths])
-        else:
-            text = json.dumps(stub)
-        return LLMResponse(text=text, input_tokens=10, output_tokens=10)
-
-
-class TodoModelProvider(AnyCodingFileProvider):
-    """Database-agent LLM stub that writes a real SQLAlchemy model."""
-
-    MODEL = TODO_MODEL_SOURCE
-
-    def complete(self, *args, **kwargs) -> LLMResponse:
-        response = super().complete(*args, **kwargs)
-        data = json.loads(response.text)
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            item["migration_code"] = self.MODEL
-        return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
-
-
-def _run_planner_and_coding_agents(workspace, database_tech: str) -> ProjectState:
-    """Planner → database + backend agents with mocked LLMs, writing under tmp_path."""
-    from agents.backend import BackendAgent
-    from agents.data_base import DatabaseAgent
+def _todo_plan(database_tech: str, project_id: str = "seam") -> ProjectState:
+    """The Planner's todo plan (scripted skeleton) for a FastAPI stack on *database_tech*."""
     from agents.planner import PlannerAgent
     from core.state import ArchData, build_persistence_contract
-    from tests.planner import MockSkeletonLLM
 
-    state = ProjectState(project_id="seam", project_name="TodoSeam")
+    state = ProjectState(project_id=project_id, project_name="TodoSeam")
     state.requirements.raw_prompt = "Build a todo app."
     state.architecture = ArchData(
         tech_stack={"backend": "FastAPI (Python 3.12)", "frontend": "HTML + Vanilla JS",
                     "database": database_tech},
         persistence_contract=build_persistence_contract(database_tech),
     )
-
-    PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=TodoModelProvider(), retries=1, workspace=workspace).run(state)
-    BackendAgent(provider=AnyCodingFileProvider(), retries=1, workspace=workspace).run(state)
+    PlannerAgent(provider=scripted_planner()).run(state)
     return state
+
+
+def _run_coding_agents(workspace, state: ProjectState, database: ScriptedLLMProvider,
+                       backend: ScriptedLLMProvider) -> ProjectState:
+    """Database then backend agent on the planned *state*, writing under the temporary workspace."""
+    from agents.backend import BackendAgent
+    from agents.data_base import DatabaseAgent
+
+    DatabaseAgent(provider=database, retries=1, workspace=workspace).run(state)
+    BackendAgent(provider=backend, retries=1, workspace=workspace).run(state)
+    return state
+
+
+def _todo_model_reply() -> dict:
+    """Database reply: a real SQLAlchemy model."""
+    return {"migration_code": TODO_MODEL_SOURCE, "functions": []}
+
+
+def _run_planner_and_coding_agents(workspace, database_tech: str):
+    """Planner → database + backend agents on scripted fakes; returns the state and both fakes."""
+    state = _todo_plan(database_tech)
+    database = scripted_coding_agent("database", llm_files(state.code_manifest, "database"), _todo_model_reply())
+    backend = scripted_coding_agent("backend", llm_files(state.code_manifest, "backend"))
+    _run_coding_agents(workspace, state, database, backend)
+    return state, database, backend
+
+
+def _asked(fake: ScriptedLLMProvider) -> set[str]:
+    return {path for request in fake.requests for path in request.files}
 
 
 @pytest.mark.parametrize("database_tech", ["PostgreSQL 16", "SQLite 3"])
 def test_database_agent_synthesizes_the_connection_module_without_the_llm(
     workspace, tmp_path, database_tech
 ):
-    state = _run_planner_and_coding_agents(workspace, database_tech)
+    state, database, _ = _run_planner_and_coding_agents(workspace, database_tech)
 
     session_path = "output/backend/db/session.py"
     on_disk = (tmp_path / session_path).read_text(encoding="utf-8")
-    assert "LLM_WROTE_THIS" not in on_disk
+    assert session_path not in _asked(database)
     assert 'os.environ["DATABASE_URL"]' in on_disk
     assert "def get_db" in on_disk
     assert state.code_manifest.files[session_path].written
@@ -261,7 +227,7 @@ def test_database_agent_synthesizes_the_connection_module_without_the_llm(
 
 
 def test_sqlite_stack_init_command_runs_against_the_generated_project(workspace, tmp_path):
-    state = _run_planner_and_coding_agents(workspace, "SQLite 3")
+    state, _, _ = _run_planner_and_coding_agents(workspace, "SQLite 3")
     contract = state.architecture.persistence_contract
     backend_root = tmp_path / "output" / "backend"
     url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
@@ -280,7 +246,7 @@ def test_sqlite_stack_init_command_runs_against_the_generated_project(workspace,
 def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(workspace, tmp_path):
     """Planner → database + backend agents: the connection module is planned and
     written, main.py imports it, and .env.example is written verbatim."""
-    state = _run_planner_and_coding_agents(workspace, "PostgreSQL 16")
+    state, _, backend = _run_planner_and_coding_agents(workspace, "PostgreSQL 16")
 
     manifest = state.code_manifest.files
     session = manifest["output/backend/db/session.py"]
@@ -291,64 +257,49 @@ def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(workspace,
 
     env_path = "output/backend/.env.example"
     on_disk = (tmp_path / env_path).read_text(encoding="utf-8")
+    assert env_path not in _asked(backend)
     assert on_disk == manifest[env_path].planned_content
     assert "DATABASE_URL=postgresql://" in on_disk
     assert manifest[env_path].written
 
 
-class MandateObeyingProvider(TodoModelProvider):
-    """Records every prompt; the backend side writes session-backed code with no in-memory state."""
+#: Backend code that obeys the persistence mandate: session-backed, no in-memory state.
+MANDATE_OBEYING_BACKEND = (
+    "from db.session import get_db\n"
+    "\n"
+    "\n"
+    "def list_items(db):\n"
+    "    return db.execute(__import__('sqlalchemy').text('SELECT 1')).all()\n"
+)
 
-    BACKEND_CODE = (
-        "from db.session import get_db\n"
-        "\n"
-        "\n"
-        "def list_items(db):\n"
-        "    return db.execute(__import__('sqlalchemy').text('SELECT 1')).all()\n"
-    )
+#: Backend code that ignores the mandate and keeps data in a module-level list.
+IN_MEMORY_BACKEND = "todos = []\n\n\ndef list_items():\n    return todos\n"
 
-    def __init__(self):
-        self.prompts: list[tuple[str, str]] = []
 
-    def complete(self, system_prompt, user_message, *args, **kwargs) -> LLMResponse:
-        self.prompts.append((system_prompt, user_message))
-        response = super().complete(system_prompt, user_message, *args, **kwargs)
-        data = json.loads(response.text)
-        for item in data if isinstance(data, list) else [data]:
-            item["code"] = self.BACKEND_CODE
-        return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
+def _backend_writing(state: ProjectState, code: str) -> ScriptedLLMProvider:
+    reply = {"code": code, "classes": [], "functions": []}
+    return scripted_coding_agent("backend", llm_files(state.code_manifest, "backend"), reply)
 
 
 def test_mandate_obeying_backend_persists_through_the_synthesized_module(workspace, tmp_path):
-    """Every DB/backend prompt carries the contract; obeying code imports the real module."""
+    """Every DB/backend request carries the contract; obeying code imports the real module."""
     import ast
 
-    from agents.backend import BackendAgent
-    from agents.data_base import DatabaseAgent
-    from agents.planner import PlannerAgent
-    from core.state import (ArchData, backend_persistence_rules, build_persistence_contract,
-                            render_persistence_contract)
-    from tests.planner import MockSkeletonLLM
+    from core.state import backend_persistence_rules, render_persistence_contract
 
-    contract = build_persistence_contract("SQLite 3")
-    state = ProjectState(project_id="mandate", project_name="TodoMandate")
-    state.requirements.raw_prompt = "Build a todo app."
-    state.architecture = ArchData(
-        tech_stack={"backend": "FastAPI (Python 3.12)", "database": "SQLite 3"},
-        persistence_contract=contract,
-    )
-    db_llm, be_llm = MandateObeyingProvider(), MandateObeyingProvider()
+    state = _todo_plan("SQLite 3", project_id="mandate")
+    contract = state.architecture.persistence_contract
+    db_llm = scripted_coding_agent("database", llm_files(state.code_manifest, "database"), _todo_model_reply())
+    be_llm = _backend_writing(state, MANDATE_OBEYING_BACKEND)
 
-    PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=db_llm, retries=1, workspace=workspace).run(state)
-    BackendAgent(provider=be_llm, retries=1, workspace=workspace).run(state)
+    _run_coding_agents(workspace, state, db_llm, be_llm)
 
     rendered = render_persistence_contract(contract)
-    assert db_llm.prompts and be_llm.prompts
-    for system_prompt, user_message in db_llm.prompts + be_llm.prompts:
-        assert rendered in system_prompt + user_message
-    for system_prompt, _ in be_llm.prompts:
-        assert backend_persistence_rules(contract) in system_prompt
+    assert db_llm.requests and be_llm.requests
+    for request in db_llm.requests + be_llm.requests:
+        assert rendered in request.system_prompt + request.user_message
+    for request in be_llm.requests:
+        assert backend_persistence_rules(contract) in request.system_prompt
 
     backend_root = tmp_path / "output" / "backend"
     for path in ("app/services/todo.py", "app/api/routes/todo.py"):
@@ -364,29 +315,15 @@ def test_mandate_obeying_backend_persists_through_the_synthesized_module(workspa
     assert result.stdout.strip() == "[(1,)]"
 
 
-class InMemoryBackendProvider(MandateObeyingProvider):
-    """Backend LLM stub that ignores the mandate and keeps data in a module-level list."""
-
-    BACKEND_CODE = "todos = []\n\n\ndef list_items():\n    return todos\n"
-
-
 def test_in_memory_backend_is_caught_by_the_integration_checks(workspace):
-    from agents.backend import BackendAgent
-    from agents.data_base import DatabaseAgent
-    from agents.planner import PlannerAgent
-    from core.state import ArchData, build_persistence_contract
     from core.static_checks import run_all_checks
-    from tests.planner import MockSkeletonLLM
 
-    state = ProjectState(project_id="inmem", project_name="TodoInMemory")
-    state.requirements.raw_prompt = "Build a todo app."
-    state.architecture = ArchData(
-        tech_stack={"backend": "FastAPI (Python 3.12)", "database": "SQLite 3"},
-        persistence_contract=build_persistence_contract("SQLite 3"),
+    state = _todo_plan("SQLite 3", project_id="inmem")
+    _run_coding_agents(
+        workspace, state,
+        scripted_coding_agent("database", llm_files(state.code_manifest, "database"), _todo_model_reply()),
+        _backend_writing(state, IN_MEMORY_BACKEND),
     )
-    PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=MandateObeyingProvider(), retries=1, workspace=workspace).run(state)
-    BackendAgent(provider=InMemoryBackendProvider(), retries=1, workspace=workspace).run(state)
 
     files = {**state.generated_code.backend, **state.generated_code.database}
     findings = run_all_checks(files, state.code_manifest, state.architecture)
