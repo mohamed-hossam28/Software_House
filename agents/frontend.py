@@ -37,7 +37,7 @@ try:
 except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items
-from agents.utils import safe_write, parse_metadata, resolve_stages
+from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 MAX_PARALLEL_CALLS = 3
 
 # ── Output directory (all generated files land here) ─────────────────────────
-OUTPUT_DIR = "output"
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -314,7 +313,7 @@ class FrontendAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item, default_return_type="void")
             try:
-                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
+                written_code = self.workspace.write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[FrontendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
                 written_code = None
@@ -349,7 +348,7 @@ class FrontendAgent(BaseAgent):
         if is_barrel_file(filepath):
             content = build_barrel_content(filepath, manifest)
             try:
-                written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
+                written_code = self.workspace.write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[FrontendAgent] Barrel write failed for %s: %s", filepath, exc)
                 with lock:
@@ -399,7 +398,7 @@ class FrontendAgent(BaseAgent):
 
         # Write to disk (safe-write guard refuses corrupted content)
         try:
-            written_code = safe_write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
+            written_code = self.workspace.write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[FrontendAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:

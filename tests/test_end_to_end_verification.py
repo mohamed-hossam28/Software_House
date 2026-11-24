@@ -53,9 +53,8 @@ class BrokenSeedRepairProvider(BaseLLMProvider):
         )
 
 
-def test_finalize_writes_summary_and_complete_findings_report(monkeypatch, tmp_path):
+def test_finalize_writes_summary_and_complete_findings_report(workspace, tmp_path):
     """The pipeline's finalize boundary persists verdict, findings, and repairs."""
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
     state = ProjectState(project_id="e2e", project_name="TodoApp")
     state.static_checks = StaticChecks(
         verdict=StaticVerdict.REPAIRED,
@@ -79,7 +78,7 @@ def test_finalize_writes_summary_and_complete_findings_report(monkeypatch, tmp_p
         repaired_files=["output/backend/main.py"],
     )
 
-    assert finalize_node(state.model_dump(mode="json")) == {}
+    assert finalize_node(state.model_dump(mode="json"), workspace=workspace) == {}
 
     summary_path = tmp_path / "output" / "run_summary.json"
     report_path = tmp_path / "output" / "static_checks_report.json"
@@ -116,11 +115,8 @@ def test_finalize_writes_summary_and_complete_findings_report(monkeypatch, tmp_p
     assert "repaired files: 1" in rendered
 
 
-def test_broken_seed_repairs_and_is_recorded_in_reports(
-    monkeypatch, tmp_path, caplog
-):
+def test_broken_seed_repairs_and_is_recorded_in_reports(workspace, tmp_path, caplog):
     """A deliberately broken generated file heals before final reporting."""
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
     path = "output/backend/main.py"
     state = ProjectState(project_id="broken-seed", project_name="TodoAppBrokenSeed")
     state.generated_code.backend[path] = "def main(:\n    pass\n"
@@ -135,7 +131,7 @@ def test_broken_seed_repairs_and_is_recorded_in_reports(
     provider = BrokenSeedRepairProvider()
 
     with caplog.at_level(logging.INFO, logger="agents.integration"):
-        diff = IntegrationAgent(provider=provider, retries=1).run(state)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(state)
 
     assert diff["static_checks"]["verdict"] == StaticVerdict.REPAIRED.value
     assert diff["static_checks"]["rounds"] == 1
@@ -147,7 +143,7 @@ def test_broken_seed_repairs_and_is_recorded_in_reports(
     assert "rounds=1" in caplog.text
     assert "repaired=1" in caplog.text
 
-    finalize_node(state.model_dump(mode="json"))
+    finalize_node(state.model_dump(mode="json"), workspace=workspace)
     report = json.loads(
         (tmp_path / "output" / "static_checks_report.json").read_text(encoding="utf-8")
     )
@@ -227,7 +223,7 @@ class TodoModelProvider(AnyCodingFileProvider):
         return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
 
 
-def _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech: str) -> ProjectState:
+def _run_planner_and_coding_agents(workspace, database_tech: str) -> ProjectState:
     """Planner → database + backend agents with mocked LLMs, writing under tmp_path."""
     from agents.backend import BackendAgent
     from agents.data_base import DatabaseAgent
@@ -235,7 +231,6 @@ def _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech: str) ->
     from core.state import ArchData, build_persistence_contract
     from tests.planner import MockSkeletonLLM
 
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
     state = ProjectState(project_id="seam", project_name="TodoSeam")
     state.requirements.raw_prompt = "Build a todo app."
     state.architecture = ArchData(
@@ -245,16 +240,16 @@ def _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech: str) ->
     )
 
     PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=TodoModelProvider(), retries=1).run(state)
-    BackendAgent(provider=AnyCodingFileProvider(), retries=1).run(state)
+    DatabaseAgent(provider=TodoModelProvider(), retries=1, workspace=workspace).run(state)
+    BackendAgent(provider=AnyCodingFileProvider(), retries=1, workspace=workspace).run(state)
     return state
 
 
 @pytest.mark.parametrize("database_tech", ["PostgreSQL 16", "SQLite 3"])
 def test_database_agent_synthesizes_the_connection_module_without_the_llm(
-    monkeypatch, tmp_path, database_tech
+    workspace, tmp_path, database_tech
 ):
-    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, database_tech)
+    state = _run_planner_and_coding_agents(workspace, database_tech)
 
     session_path = "output/app/db/session.py"
     on_disk = (tmp_path / session_path).read_text(encoding="utf-8")
@@ -265,8 +260,8 @@ def test_database_agent_synthesizes_the_connection_module_without_the_llm(
     assert state.generated_code.database[session_path] == on_disk
 
 
-def test_sqlite_stack_init_command_runs_against_the_generated_project(monkeypatch, tmp_path):
-    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, "SQLite 3")
+def test_sqlite_stack_init_command_runs_against_the_generated_project(workspace, tmp_path):
+    state = _run_planner_and_coding_agents(workspace, "SQLite 3")
     contract = state.architecture.persistence_contract
     backend_root = tmp_path / "output" / "app"
     url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
@@ -282,10 +277,10 @@ def test_sqlite_stack_init_command_runs_against_the_generated_project(monkeypatc
     assert inspect(create_engine(url)).get_table_names() == ["todo_items"]
 
 
-def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(monkeypatch, tmp_path):
+def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(workspace, tmp_path):
     """Planner → database + backend agents: the connection module is planned and
     written, main.py imports it, and .env.example is written verbatim."""
-    state = _run_planner_and_coding_agents(monkeypatch, tmp_path, "PostgreSQL 16")
+    state = _run_planner_and_coding_agents(workspace, "PostgreSQL 16")
 
     manifest = state.code_manifest.files
     session = manifest["output/app/db/session.py"]
@@ -324,7 +319,7 @@ class MandateObeyingProvider(TodoModelProvider):
         return LLMResponse(text=json.dumps(data), input_tokens=10, output_tokens=10)
 
 
-def test_mandate_obeying_backend_persists_through_the_synthesized_module(monkeypatch, tmp_path):
+def test_mandate_obeying_backend_persists_through_the_synthesized_module(workspace, tmp_path):
     """Every DB/backend prompt carries the contract; obeying code imports the real module."""
     import ast
 
@@ -335,7 +330,6 @@ def test_mandate_obeying_backend_persists_through_the_synthesized_module(monkeyp
                             render_persistence_contract)
     from tests.planner import MockSkeletonLLM
 
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
     contract = build_persistence_contract("SQLite 3")
     state = ProjectState(project_id="mandate", project_name="TodoMandate")
     state.requirements.raw_prompt = "Build a todo app."
@@ -346,8 +340,8 @@ def test_mandate_obeying_backend_persists_through_the_synthesized_module(monkeyp
     db_llm, be_llm = MandateObeyingProvider(), MandateObeyingProvider()
 
     PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=db_llm, retries=1).run(state)
-    BackendAgent(provider=be_llm, retries=1).run(state)
+    DatabaseAgent(provider=db_llm, retries=1, workspace=workspace).run(state)
+    BackendAgent(provider=be_llm, retries=1, workspace=workspace).run(state)
 
     rendered = render_persistence_contract(contract)
     assert db_llm.prompts and be_llm.prompts
@@ -376,7 +370,7 @@ class InMemoryBackendProvider(MandateObeyingProvider):
     BACKEND_CODE = "todos = []\n\n\ndef list_items():\n    return todos\n"
 
 
-def test_in_memory_backend_is_caught_by_the_integration_checks(monkeypatch, tmp_path):
+def test_in_memory_backend_is_caught_by_the_integration_checks(workspace):
     from agents.backend import BackendAgent
     from agents.data_base import DatabaseAgent
     from agents.planner import PlannerAgent
@@ -384,7 +378,6 @@ def test_in_memory_backend_is_caught_by_the_integration_checks(monkeypatch, tmp_
     from core.static_checks import run_all_checks
     from tests.planner import MockSkeletonLLM
 
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
     state = ProjectState(project_id="inmem", project_name="TodoInMemory")
     state.requirements.raw_prompt = "Build a todo app."
     state.architecture = ArchData(
@@ -392,8 +385,8 @@ def test_in_memory_backend_is_caught_by_the_integration_checks(monkeypatch, tmp_
         persistence_contract=build_persistence_contract("SQLite 3"),
     )
     PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    DatabaseAgent(provider=MandateObeyingProvider(), retries=1).run(state)
-    BackendAgent(provider=InMemoryBackendProvider(), retries=1).run(state)
+    DatabaseAgent(provider=MandateObeyingProvider(), retries=1, workspace=workspace).run(state)
+    BackendAgent(provider=InMemoryBackendProvider(), retries=1, workspace=workspace).run(state)
 
     files = {**state.generated_code.backend, **state.generated_code.database}
     findings = run_all_checks(files, state.code_manifest, state.architecture, "sqlite")

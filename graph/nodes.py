@@ -22,6 +22,7 @@ from agents.integration import IntegrationAgent
 # Import core state and statuses
 from core.state import ProjectState, ProjectStatus
 from core.config import settings
+from core.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,7 @@ def planner_node(state: dict) -> dict:
     return agent.run(state)
 
 
-def database_node(state: dict) -> dict:
+def database_node(state: dict, workspace: Workspace | None = None) -> dict:
     """
     Database node: runs the DatabaseAgent to generate SQL and schema structures.
     Receives full state dict, returns only changed fields as dict.
@@ -167,11 +168,12 @@ def database_node(state: dict) -> dict:
         retries=settings.default_retries,
         backoff=settings.default_backoff,
         temperature=0.2,
+        workspace=workspace,
     )
     return agent.run(state)
 
 
-def backend_node(state: dict) -> dict:
+def backend_node(state: dict, workspace: Workspace | None = None) -> dict:
     """
     Backend node: runs the BackendAgent to generate backend endpoint logic.
     Receives full state dict, returns only changed fields as dict.
@@ -184,11 +186,12 @@ def backend_node(state: dict) -> dict:
         retries=settings.default_retries,
         backoff=settings.default_backoff,
         temperature=0.2,
+        workspace=workspace,
     )
     return agent.run(state)
 
 
-def frontend_node(state: dict) -> dict:
+def frontend_node(state: dict, workspace: Workspace | None = None) -> dict:
     """
     Frontend node: runs the FrontendAgent to generate user interface components and styling.
     Receives full state dict, returns only changed fields as dict.
@@ -201,11 +204,12 @@ def frontend_node(state: dict) -> dict:
         retries=settings.default_retries,
         backoff=settings.default_backoff,
         temperature=0.2,
+        workspace=workspace,
     )
     return agent.run(state)
 
 
-def integration_node(state: dict) -> dict:
+def integration_node(state: dict, workspace: Workspace | None = None) -> dict:
     """
     Integration node: runs the IntegrationAgent's static checks over everything
     the coding agents generated and records a pass/failed verdict in
@@ -218,11 +222,12 @@ def integration_node(state: dict) -> dict:
         model=settings.model_name,
         retries=settings.default_retries,
         backoff=settings.default_backoff,
+        workspace=workspace,
     )
     return agent.run(state)
 
 
-def finalize_node(state: dict) -> dict:
+def finalize_node(state: dict, workspace: Workspace | None = None) -> dict:
     """
     Finalize node: persists the run summary and complete static-check findings
     report next to the generated project. Never fails the run.
@@ -232,8 +237,8 @@ def finalize_node(state: dict) -> dict:
     logger.info("[GraphNode] Finalizing — writing run summary...")
     ps = _state_from_dict(state)
 
-    report_path = write_static_checks_report(ps)
-    path = write_run_summary(ps, static_report_path=report_path)
+    report_path = write_static_checks_report(ps, workspace)
+    path = write_run_summary(ps, static_report_path=report_path, workspace=workspace)
     logger.info("[GraphNode] Static findings report written: %s", report_path or "(skipped)")
     logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
     return {}

@@ -43,7 +43,6 @@ from agents.base import (
     build_import_contract,
     filter_api_contracts_by_relevance,
 )
-from agents.utils import safe_write
 from core.state import (
     FindingSeverity,
     ProjectState,
@@ -290,7 +289,7 @@ class IntegrationAgent(BaseAgent):
             return file_errors
 
         try:
-            written = safe_write(filepath, code, on_corrupt=refuse)
+            written = self.workspace.write(filepath, code, on_corrupt=refuse)
         except Exception as exc:
             logger.error("[IntegrationAgent] repair write failed for %s: %s", filepath, exc)
             return file_errors

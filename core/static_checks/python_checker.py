@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.state import FindingSeverity, StaticFinding
-from core.workspace_paths import _module_path_for
+from core.workspace import dotted_import
 
 
 def check_python(
@@ -107,7 +107,7 @@ def _build_module_index(files: dict[str, str], manifest: Any) -> ModuleIndex:
     index = ModuleIndex()
     for filepath in _manifest_files(manifest):
         if filepath.endswith(".py"):
-            index.planned.add(_module_path_for(filepath))
+            index.planned.add(dotted_import(filepath))
 
     for filepath in sorted(files):
         if not filepath.endswith(".py") or not files.get(filepath):
@@ -116,7 +116,7 @@ def _build_module_index(files: dict[str, str], manifest: Any) -> ModuleIndex:
             tree = ast.parse(files[filepath])
         except SyntaxError:
             continue
-        mod = _module_path_for(filepath)
+        mod = dotted_import(filepath)
         if not mod:
             continue
         index.resolved[mod] = {
@@ -169,7 +169,7 @@ def _classify_candidate(candidate: str, index: ModuleIndex) -> str | None:
 
 def _resolve_relative(filepath: str, node: ast.ImportFrom) -> str:
     """Dotted module target of a relative import, clamped at the layer root."""
-    module_path = _module_path_for(filepath)
+    module_path = dotted_import(filepath)
     package = _package_parts(filepath, module_path)
     drop = max(node.level - 1, 0)
     anchor = package[: max(0, len(package) - drop)]

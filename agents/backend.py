@@ -39,7 +39,7 @@ except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
 from agents.schemas.backend import BackendSchema
-from agents.utils import safe_write, parse_metadata, resolve_stages
+from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
@@ -357,7 +357,7 @@ class BackendAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item, default_return_type="None")
             try:
-                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
+                written_code = self.workspace.write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[BackendAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
                 written_code = None
@@ -433,7 +433,7 @@ class BackendAgent(BaseAgent):
 
         # Write code to disk (safe-write guard refuses corrupted content)
         try:
-            written_code = safe_write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
+            written_code = self.workspace.write(filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[BackendAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:

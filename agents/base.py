@@ -15,13 +15,8 @@ import sys
 from pathlib import Path
 from threading import Lock
 
-from agents.utils import _ESCAPED_CHAR_RE, safe_write
-from core.workspace_paths import (  # noqa: F401  (re-export: shared with the checker layer)
-    _layer_root_for,
-    _module_path_for,
-    _normalized_src,
-    _rel_import_path,
-)
+from agents.utils import _ESCAPED_CHAR_RE
+from core.workspace import Workspace, dotted_import, relative_import, workspace_path
 
 logger = logging.getLogger(__name__)
 
@@ -245,20 +240,20 @@ def build_import_contract(manifest: Any, filepath: str) -> str:
     lines: list[str] = []
     missing: list[str] = []
     for src_raw, names in imports_from.items():
-        src = _normalized_src(src_raw)
+        src = workspace_path(src_raw)
         if src not in manifest.files or src == filepath:
             if src not in manifest.files:
                 missing.append(src)
             continue
         names = [str(n) for n in names if str(n).strip()]
         if filepath.endswith(".py"):
-            mod = _module_path_for(src)
+            mod = dotted_import(src)
             if names:
                 lines.append(f"from {mod} import {', '.join(names)}")
             else:
                 lines.append(f"import {mod}")
         else:
-            rel = _rel_import_path(filepath, src)
+            rel = relative_import(filepath, src)
             if names:
                 lines.append(f"import {{ {', '.join(names)} }} from '{rel}'")
             else:
@@ -301,7 +296,7 @@ def build_pending_contracts(manifest: Any, filepath: str) -> str:
     blocks: list[str] = []
     seen: set[str] = set()
     for src_raw in imports_from:
-        src = _normalized_src(src_raw)
+        src = workspace_path(src_raw)
         if src not in manifest.files or src == filepath or src in seen:
             continue
         seen.add(src)
@@ -349,7 +344,7 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
 
     sources: list[tuple[str, list[str]]] = []
     for src_raw, names in imports_from.items():
-        src = _normalized_src(src_raw)
+        src = workspace_path(src_raw)
         if src not in manifest.files or src == filepath:
             continue
         sources.append((src, [str(n) for n in names if str(n).strip()]))
@@ -369,14 +364,14 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
     if filepath.endswith("__init__.py"):
         lines: list[str] = []
         for src, names in sources:
-            rel = _module_path_for(src)
+            rel = dotted_import(src)
             if names:
                 lines.append(f"from {rel} import {', '.join(names)}")
         return "\n".join(lines) + ("\n" if lines else "")
 
     lines = []
     for src, names in sources:
-        rel = _rel_import_path(filepath, src)
+        rel = relative_import(filepath, src)
         if names:
             lines.append(f"export {{ {', '.join(names)} }} from '{rel}'")
         else:
@@ -533,7 +528,7 @@ def build_scaffold_context(manifest: Any, filepath: str) -> str:
                 continue
             exports = getattr(fm, "exports", []) or []
             if "router" in exports or "routes" in path.lower() or "controllers" in path.lower():
-                routers.append(f"- `{path}` → `from {_module_path_for(path)} import router`")
+                routers.append(f"- `{path}` → `from {dotted_import(path)} import router`")
         header = "## Scaffold Wiring — You MUST register these routers (their files already exist):"
         note = "\n**IMPORT RULE**: Import each router with the EXACT import line shown (layer-root-relative), NEVER with the `output.backend.` / `output.` workspace prefix."
         return header + note + ("\n" + "\n".join(routers) if routers else "\n(none found)")
@@ -574,8 +569,11 @@ class BaseAgent(ABC):
         backoff: float = DEFAULT_BACKOFF,
         temperature: float = 0.2,
         provider: BaseLLMProvider | str | None = None,
+        workspace: Workspace | None = None,
     ):
-        """Initialize the base agent."""
+        """Initialize the base agent. *workspace* is the output root generated
+        files are written under; it defaults to the real project directory."""
+        self.workspace = workspace if workspace is not None else Workspace()
         self.model = model
         self.max_tokens = max_tokens
         self.max_retries = retries if retries is not None else max_retries
@@ -612,9 +610,9 @@ class BaseAgent(ABC):
         self, task_id: str, filepath: str, content: str, kind: str, state: ProjectState, lock: Lock,
     ) -> None:
         """Write non-LLM content (barrel, planned content, connection module) through
-        safe-write and mark the manifest entry written."""
+        the workspace's write guard and mark the manifest entry written."""
         try:
-            written_code = safe_write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
+            written_code = self.workspace.write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[%s] %s write failed for %s: %s", self.name, kind, filepath, exc)
             with lock:

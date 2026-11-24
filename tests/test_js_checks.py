@@ -179,7 +179,7 @@ class TestNoFalsePositives:
 
 
 class TestPipelineVerdict:
-    def test_js_finding_drives_failed_verdict_through_integration_agent(self):
+    def test_js_finding_drives_failed_verdict_through_integration_agent(self, workspace):
         from agents.integration import IntegrationAgent
         from providers.llm.base import BaseLLMProvider
 
@@ -199,7 +199,7 @@ class TestPipelineVerdict:
         }
         state.architecture = make_architecture([("GET", "/api/v1/todos")])
 
-        diff = IntegrationAgent(provider=_RefusingProvider(), retries=1, backoff=0.01).run(state)
+        diff = IntegrationAgent(provider=_RefusingProvider(), retries=1, backoff=0.01, workspace=workspace).run(state)
 
         assert diff["static_checks"]["verdict"] == "failed"
         assert any(

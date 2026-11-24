@@ -49,8 +49,8 @@ try:
 except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items
-from agents.utils import safe_write, parse_metadata, resolve_stages
-from core.workspace_paths import _module_path_for
+from agents.utils import parse_metadata, resolve_stages
+from core.workspace import dotted_import
 
 from core.state import (
     ProjectState,
@@ -70,7 +70,6 @@ from core.state import (
 logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_CALLS = 3
-OUTPUT_DIR = "output"
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -167,7 +166,7 @@ def _deterministic_kind(fm: FileManifest | None, contract: PersistenceContract |
 def _model_modules(manifest: CodeManifest) -> list[str]:
     """Dotted modules of the database agent's ORM model files (under a models/ package) for create-all."""
     return sorted(
-        _module_path_for(path) for path, fm in manifest.files.items()
+        dotted_import(path) for path, fm in manifest.files.items()
         if fm.agent == "database" and "/models/" in path
         and path.endswith(".py") and not is_barrel_file(path)
     )
@@ -372,7 +371,7 @@ class DatabaseAgent(BaseAgent):
                 continue
             classes, functions = parse_metadata(item)
             try:
-                written_code = safe_write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
+                written_code = self.workspace.write(fm.filepath, code, on_corrupt=agent_refuse_corrupt(state, lock))
             except Exception as exc:
                 logger.error("[DBAgent] Batch disk write failed for %s: %s", fm.filepath, exc)
                 written_code = None
@@ -460,7 +459,7 @@ class DatabaseAgent(BaseAgent):
 
         # Write migration file to disk (safe-write guard refuses corrupted content)
         try:
-            written_code = safe_write(filepath, migration_code, on_corrupt=agent_refuse_corrupt(state, lock))
+            written_code = self.workspace.write(filepath, migration_code, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:
             logger.error("[DBAgent] Disk write failed for %s: %s", filepath, exc)
             with lock:

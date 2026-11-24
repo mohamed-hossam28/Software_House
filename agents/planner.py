@@ -19,6 +19,7 @@ from typing import Any
 
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 from providers.llm.base import BaseLLMProvider
+from core.workspace import workspace_path
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
     CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
@@ -282,8 +283,7 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             file_path = f"{folder}{sanitized_title}{ext}"
             logger.info("[PlannerAgent] task '%s' missing 'file' field — created fallback path: %s", task.id, file_path)
 
-        if not file_path.startswith("output/") and not file_path.startswith("output\\"):
-            file_path = f"output/{file_path}"
+        file_path = workspace_path(file_path)
 
         if file_path in manifest_files:
             # Disambiguate duplicate file paths by suffixing task_id
@@ -308,10 +308,7 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             continue
         imports_from: dict[str, list[str]] = {}
         for src_path, names in (raw_item.get("imports_from") or {}).items():
-            src = str(src_path).strip().lstrip("/").lstrip("\\")
-            if not src.startswith("output/") and not src.startswith("output\\"):
-                src = f"output/{src}"
-            src = src.replace("\\", "/")
+            src = workspace_path(src_path)
             if src == fm.filepath or src not in manifest_files:
                 if src not in manifest_files:
                     logger.warning(

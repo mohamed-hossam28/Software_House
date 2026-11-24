@@ -113,7 +113,7 @@ def make_state(
 
 
 class TestIntegrationAgentDiff:
-    def test_clean_project_passes_with_no_errors(self):
+    def test_clean_project_passes_with_no_errors(self, workspace):
         ps = make_state(
             files={
                 "output/backend/api/todo.py": GOOD_TODO,
@@ -124,27 +124,27 @@ class TestIntegrationAgentDiff:
                 "output/backend/db/models.py": ["TodoItem"],
             },
         )
-        diff = IntegrationAgent(provider=FakeProvider()).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), workspace=workspace).run(ps)
         assert diff["static_checks"]["verdict"] == StaticVerdict.PASS.value
         assert diff["static_checks"]["findings"] == []
         assert "errors" not in diff
         assert diff["current_agent"] == "IntegrationAgent"
 
-    def test_broken_python_fails_and_mirrors_errors(self):
+    def test_broken_python_fails_and_mirrors_errors(self, workspace):
         ps = make_state(
             files={"output/backend/main.py": BROKEN_PY},
             manifest_entries={"output/backend/main.py": ["main"]},
         )
         # The fake provider refuses every repair call, so the file survives
         # both repair rounds and its findings are mirrored into the error list.
-        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01, workspace=workspace).run(ps)
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert any(f["check"] == "python_syntax" for f in diff["static_checks"]["findings"])
         assert diff["errors"], "error findings must flow into the state error list"
         assert all(e["agent"] == "IntegrationAgent" for e in diff["errors"])
         assert any("python_syntax" in e["message"] for e in diff["errors"])
 
-    def test_undeclared_dependency_fails_when_unrepairable(self):
+    def test_undeclared_dependency_fails_when_unrepairable(self, workspace):
         # third_party is now an error; the fake provider refuses every repair
         # call, so the finding survives both rounds and the project fails
         ps = make_state(
@@ -154,38 +154,38 @@ class TestIntegrationAgentDiff:
             },
             manifest_entries={"output/backend/api/todo.py": ["r"]},
         )
-        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01, workspace=workspace).run(ps)
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert "errors" in diff
         assert any(f["check"] == "third_party" for f in diff["static_checks"]["findings"])
 
-    def test_manifest_written_missing_content_is_error(self):
+    def test_manifest_written_missing_content_is_error(self, workspace):
         ps = make_state(
             files={"output/backend/api/todo.py": GOOD_TODO},
             manifest_entries={"output/backend/db/models.py": ["TodoItem"]},
             written=("output/backend/db/models.py",),
         )
-        diff = IntegrationAgent(provider=FakeProvider()).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), workspace=workspace).run(ps)
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert any(f["check"] == "manifest_written" for f in diff["static_checks"]["findings"])
         assert any("manifest_written" in e["message"] for e in diff["errors"])
 
-    def test_checker_crash_is_logged_and_never_raises(self, monkeypatch):
+    def test_checker_crash_is_logged_and_never_raises(self, monkeypatch, workspace):
         def boom(*args, **kwargs):
             raise RuntimeError("checker exploded")
 
         monkeypatch.setattr("agents.integration.run_all_checks", boom)
         ps = make_state(files={"output/backend/main.py": "x = 1\n"})
-        diff = IntegrationAgent(provider=FakeProvider()).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), workspace=workspace).run(ps)
         assert any("Static checks failed" in e["message"] for e in diff["errors"])
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert diff["static_checks"]["findings"][0]["check"] == "static_checks"
 
-    def test_unrepairable_file_gets_two_rounds_then_fails(self):
+    def test_unrepairable_file_gets_two_rounds_then_fails(self, workspace):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         # No provider cooperation: every repair call fails, so the file gets
         # its full allowance of repair rounds before the verdict stays failed.
-        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01).run(ps)
+        diff = IntegrationAgent(provider=FakeProvider(), retries=1, backoff=0.01, workspace=workspace).run(ps)
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert diff["static_checks"]["rounds"] == 2
         assert diff["static_checks"]["repaired_files"] == []
@@ -223,8 +223,7 @@ class TestGraphWiring:
 
 
 class TestRunSummaryVerdict:
-    def test_summary_includes_verdict_and_counts(self, monkeypatch, tmp_path: Path):
-        monkeypatch.setattr("agents.utils._root_dir", tmp_path)
+    def test_summary_includes_verdict_and_counts(self, workspace, tmp_path: Path):
         from agents.utils import write_run_summary
 
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
@@ -240,7 +239,7 @@ class TestRunSummaryVerdict:
         ]
         ps.static_checks.verdict = StaticVerdict.FAILED
 
-        rel = write_run_summary(ps)
+        rel = write_run_summary(ps, workspace=workspace)
         assert rel == "output/run_summary.json"
         import json
 

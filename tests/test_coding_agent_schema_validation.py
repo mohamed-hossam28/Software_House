@@ -82,15 +82,13 @@ def make_state(agent_name: str) -> tuple[ProjectState, str]:
     ],
 )
 def test_valid_per_file_output_passes_without_repair(
-    monkeypatch, agent_cls, agent_name, module_name
+    workspace, agent_cls, agent_name, module_name
 ):
-    provider = QueuedProvider([{"code": "generated code", "classes": [], "functions": []}])
+    provider = QueuedProvider([{"code": "generated_code = 1", "classes": [], "functions": []}])
     state, filepath = make_state(agent_name)
-    monkeypatch.setattr(f"{module_name}.safe_write", lambda _path, code, **_kwargs: code)
+    agent_cls(provider=provider, workspace=workspace).run(state)
 
-    agent_cls(provider=provider).run(state)
-
-    assert state.generated_code.model_dump()[agent_name][filepath] == "generated code"
+    assert state.generated_code.model_dump()[agent_name][filepath] == "generated_code = 1"
     assert len(provider.calls) == 1
 
 
@@ -102,20 +100,18 @@ def test_valid_per_file_output_passes_without_repair(
     ],
 )
 def test_schema_invalid_per_file_output_uses_repair_pipeline(
-    monkeypatch, agent_cls, agent_name, module_name
+    workspace, agent_cls, agent_name, module_name
 ):
     provider = QueuedProvider(
         [
             {"classes": [], "functions": []},  # valid JSON, invalid file schema
-            {"code": "repaired code", "classes": [], "functions": []},
+            {"code": "repaired_code = 1", "classes": [], "functions": []},
         ]
     )
     state, filepath = make_state(agent_name)
-    monkeypatch.setattr(f"{module_name}.safe_write", lambda _path, code, **_kwargs: code)
+    agent_cls(provider=provider, workspace=workspace).run(state)
 
-    agent_cls(provider=provider).run(state)
-
-    assert state.generated_code.model_dump()[agent_name][filepath] == "repaired code"
+    assert state.generated_code.model_dump()[agent_name][filepath] == "repaired_code = 1"
     assert len(provider.calls) == 2
     repair_system, repair_prompt = provider.calls[1]
     assert "repairs JSON syntax" in repair_system

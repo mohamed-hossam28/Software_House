@@ -27,12 +27,6 @@ from core.state import (
 from agents.integration import IntegrationAgent
 
 
-@pytest.fixture(autouse=True)
-def _tmp_root(monkeypatch, tmp_path):
-    """Repaired files are written through the safe-write guard — keep that off the repo."""
-    monkeypatch.setattr("agents.utils._root_dir", tmp_path)
-
-
 BROKEN_PY = "def broken(:\n    pass\n"
 FIXED_PY = "def broken():\n    pass"   # repair writes strip trailing whitespace
 
@@ -112,10 +106,10 @@ def make_import_state() -> ProjectState:
 
 
 class TestRepairLoop:
-    def test_repaired_file_fixed_within_two_rounds(self):
+    def test_repaired_file_fixed_within_two_rounds(self, workspace):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         provider = FakeRepairProvider([repair_reply("output/backend/main.py", FIXED_PY)])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.REPAIRED.value
@@ -131,7 +125,7 @@ class TestRepairLoop:
         assert ps.generated_code.backend["output/backend/main.py"] == FIXED_PY
         assert provider.calls == 1
 
-    def test_repair_retry_succeeds_on_second_round(self):
+    def test_repair_retry_succeeds_on_second_round(self, workspace):
         ps = make_import_state()
         path, _ = BAD_IMPORT
         # round 1 returns still-broken code, round 2 returns the fix
@@ -139,7 +133,7 @@ class TestRepairLoop:
             repair_reply(path, BAD_IMPORT[1]),
             repair_reply(path, GOOD_IMPORT[1]),
         ])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.REPAIRED.value
@@ -147,7 +141,7 @@ class TestRepairLoop:
         assert checks["repaired_files"] == [path]
         assert provider.calls == 2
 
-    def test_unrepairable_file_stops_after_two_rounds_and_fails(self):
+    def test_unrepairable_file_stops_after_two_rounds_and_fails(self, workspace):
         ps = make_import_state()
         path, _ = BAD_IMPORT
         # always returns the same broken code — never fixable
@@ -155,7 +149,7 @@ class TestRepairLoop:
             repair_reply(path, BAD_IMPORT[1]),
             repair_reply(path, BAD_IMPORT[1]),
         ])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.FAILED.value
@@ -173,7 +167,7 @@ class TestRepairLoop:
             for f in checks["findings"]
         )
 
-    def test_multiple_surviving_findings_are_not_duplicated(self):
+    def test_multiple_surviving_findings_are_not_duplicated(self, workspace):
         path = "output/backend/api/todo.py"
         ps = make_state(files={
             path: (
@@ -187,7 +181,7 @@ class TestRepairLoop:
             repair_reply(path, ps.generated_code.backend[path]),
         ])
 
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         survivors = [
             f for f in diff["static_checks"]["findings"]
@@ -196,7 +190,7 @@ class TestRepairLoop:
         assert len(survivors) == 2
         assert {f["line"] for f in survivors} == {1, 2}
 
-    def test_final_check_refreshes_cross_file_survivors(self):
+    def test_final_check_refreshes_cross_file_survivors(self, workspace):
         api_path = "output/backend/api/todo.py"
         model_path = "output/backend/db/models.py"
         api_code = "from db.models import TodoItem\n"
@@ -214,7 +208,7 @@ class TestRepairLoop:
             repair_reply(model_path, "class TodoItem:\n    pass\n"),
         ])
 
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert diff["static_checks"]["verdict"] == StaticVerdict.REPAIRED.value
         assert diff["static_checks"]["findings"] == []
@@ -222,7 +216,7 @@ class TestRepairLoop:
         assert diff["static_checks"]["rounds"] == 3
         assert "errors" not in diff
 
-    def test_final_error_removes_file_from_repaired_files(self):
+    def test_final_error_removes_file_from_repaired_files(self, workspace):
         api_path = "output/backend/api/todo.py"
         model_path = "output/backend/db/models.py"
         ps = make_state(files={
@@ -242,7 +236,7 @@ class TestRepairLoop:
             repair_reply(model_path, "class Other:\n    pass\n"),
         ])
 
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
         assert diff["static_checks"]["repaired_files"] == [model_path]
@@ -251,19 +245,19 @@ class TestRepairLoop:
             for f in diff["static_checks"]["findings"]
         )
 
-    def test_manifest_owner_removes_stale_non_owner_bucket_copy(self):
+    def test_manifest_owner_removes_stale_non_owner_bucket_copy(self, workspace):
         path = "output/shared/module.py"
         ps = make_state(files={path: BROKEN_PY})
         add_manifest(ps, path, exports=["broken"], agent="database")
         provider = FakeRepairProvider([repair_reply(path, FIXED_PY)])
 
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert diff["static_checks"]["verdict"] == StaticVerdict.REPAIRED.value
         assert path not in ps.generated_code.backend
         assert ps.generated_code.database[path] == FIXED_PY
 
-    def test_final_check_crash_is_always_reported(self, monkeypatch):
+    def test_final_check_crash_is_always_reported(self, monkeypatch, workspace):
         calls = 0
 
         def checker(*args, **kwargs):
@@ -279,7 +273,7 @@ class TestRepairLoop:
             raise RuntimeError("final validation exploded")
 
         monkeypatch.setattr("agents.integration.run_all_checks", checker)
-        diff = IntegrationAgent(provider=FakeRepairProvider([]), retries=1).run(
+        diff = IntegrationAgent(provider=FakeRepairProvider([]), retries=1, workspace=workspace).run(
             make_state()
         )
 
@@ -289,7 +283,7 @@ class TestRepairLoop:
             for f in diff["static_checks"]["findings"]
         )
 
-    def test_warning_only_findings_never_trigger_repair(self, monkeypatch):
+    def test_warning_only_findings_never_trigger_repair(self, monkeypatch, workspace):
         """Findings below error severity must not consume repair rounds."""
         def checker(*args, **kwargs):
             return [StaticFinding(
@@ -303,14 +297,14 @@ class TestRepairLoop:
         monkeypatch.setattr("agents.integration.run_all_checks", checker)
         ps = make_state(files={"output/backend/api/todo.py": "x = 1\n"})
         provider = FakeRepairProvider([])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert diff["static_checks"]["verdict"] == StaticVerdict.PASS.value
         assert diff["static_checks"]["rounds"] == 0
         assert diff["static_checks"]["repaired_files"] == []
         assert provider.calls == 0, "warn-only findings must not call the LLM"
 
-    def test_undeclared_dependency_triggers_repair(self):
+    def test_undeclared_dependency_triggers_repair(self, workspace):
         # third_party is now an error: the importing file is repaired
         ps = make_state(files={
             "output/backend/api/todo.py": "import requests\n\nr = requests\n",
@@ -319,7 +313,7 @@ class TestRepairLoop:
         provider = FakeRepairProvider([
             repair_reply("output/backend/api/todo.py", "x = 1\n")
         ])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.REPAIRED.value
@@ -327,7 +321,7 @@ class TestRepairLoop:
         assert provider.calls == 1
         assert not any(f["check"] == "third_party" for f in checks["findings"])
 
-    def test_missing_contract_routes_are_repaired_into_target_file(self):
+    def test_missing_contract_routes_are_repaired_into_target_file(self, workspace):
         # route errors attribute to the manifest-planned entry file and the
         # repair round writes the missing route into it
         ps = make_state(files={
@@ -347,7 +341,7 @@ class TestRepairLoop:
             '@app.post("/api/v1/todos")\ndef create_todo(): ...\n'
         )
         provider = FakeRepairProvider([repair_reply("output/backend/main.py", fixed)])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.REPAIRED.value
@@ -355,7 +349,7 @@ class TestRepairLoop:
         assert provider.calls == 1
         assert not any(f["check"] == "backend_routes" for f in checks["findings"])
 
-    def test_route_error_without_planned_route_file_fails_without_repair(self):
+    def test_route_error_without_planned_route_file_fails_without_repair(self, workspace):
         # no backend .py in the manifest → the gap cannot be attributed to any
         # file, so it fails honestly instead of guessing a repair target
         ps = make_state(files={
@@ -368,7 +362,7 @@ class TestRepairLoop:
             APIContract(method="POST", path="/api/v1/todos", description="create todo"),
         ])
         provider = FakeRepairProvider([])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.FAILED.value
@@ -380,24 +374,24 @@ class TestRepairLoop:
         )
         assert "errors" in diff
 
-    def test_repair_llm_usage_counts_in_shared_metrics(self):
+    def test_repair_llm_usage_counts_in_shared_metrics(self, workspace):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         provider = FakeRepairProvider(
             [repair_reply("output/backend/main.py", FIXED_PY)], tokens_per_call=120
         )
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert diff["metrics"]["total_llm_calls"] == 1
         assert diff["metrics"]["total_tokens_used"] == 120
 
-    def test_unusable_reply_still_consumes_full_round_allowance(self):
+    def test_unusable_reply_still_consumes_full_round_allowance(self, workspace):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         # both replies are unusable (empty code) — the file still gets 2 rounds
         provider = FakeRepairProvider([
             repair_reply("output/backend/main.py", ""),
             repair_reply("output/backend/main.py", ""),
         ])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.FAILED.value
@@ -405,7 +399,7 @@ class TestRepairLoop:
         assert checks["repaired_files"] == []
         assert provider.calls == 2
 
-    def test_corruption_refused_write_consumes_a_round(self):
+    def test_corruption_refused_write_consumes_a_round(self, workspace):
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         # every reply re-pastes the unparseable file — the safe-write guard
         # refuses both writes, each refusal costs one round
@@ -413,7 +407,7 @@ class TestRepairLoop:
             repair_reply("output/backend/main.py", BROKEN_PY),
             repair_reply("output/backend/main.py", BROKEN_PY),
         ])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.FAILED.value
@@ -456,7 +450,7 @@ def add_manifest(
 
 
 class TestRepairPromptAndTargets:
-    def test_prompt_holds_content_findings_and_api_contract(self):
+    def test_prompt_holds_content_findings_and_api_contract(self, workspace):
         path = "output/frontend/js/app.js"
         ps = make_state(files={path: JS_BAD})
         ps.architecture = ArchData(api_contracts=[
@@ -464,7 +458,7 @@ class TestRepairPromptAndTargets:
                         response_body={"name": "str"}),
         ])
         provider = FakeRepairProvider([repair_reply(path, JS_GOOD)])
-        IntegrationAgent(provider=provider, retries=1).run(ps)
+        IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         assert provider.calls == 1
         _, user = provider.prompts[0]
@@ -474,7 +468,7 @@ class TestRepairPromptAndTargets:
         assert "GET /api/v1/boards" in user, "HTTP findings get the API contract excerpt"
         assert "name: str" in user, "contract request/response fields are included"
 
-    def test_prompt_holds_manifest_field_contract(self):
+    def test_prompt_holds_manifest_field_contract(self, workspace):
         path = "output/backend/api/query.py"
         ps = make_state(files={
             path: "QUERY = 'SELECT id FROM todos'\n",
@@ -492,14 +486,14 @@ class TestRepairPromptAndTargets:
         provider = FakeRepairProvider([
             repair_reply(path, "QUERY = 'SELECT id FROM users'\n")
         ])
-        IntegrationAgent(provider=provider, retries=1).run(ps)
+        IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         _, user = provider.prompts[0]
         assert "[sql_tables] line 1" in user
         assert "SCHEMA FIELD CONTRACT" in user
         assert "`User` fields: id: int, name: str" in user
 
-    def test_missing_written_file_is_regenerated(self):
+    def test_missing_written_file_is_regenerated(self, workspace):
         # Deliberately use no conventional layer segment: placement must come
         # from the manifest owner, not path inference.
         path = "output/shared/models.py"
@@ -508,7 +502,7 @@ class TestRepairPromptAndTargets:
             ps, path, exports=["TodoItem"], written=True, agent="database"
         )
         provider = FakeRepairProvider([repair_reply(path, "class TodoItem:\n    name: str\n")])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert checks["verdict"] == StaticVerdict.REPAIRED.value
@@ -539,12 +533,12 @@ class TestPersistenceRepair:
         ps.architecture = ArchData(persistence_contract=build_persistence_contract("SQLite 3"))
         return ps
 
-    def test_in_memory_file_is_repaired_with_the_persistence_contract_in_the_prompt(self):
+    def test_in_memory_file_is_repaired_with_the_persistence_contract_in_the_prompt(self, workspace):
         from core.state import render_persistence_contract
 
         ps = self._state()
         provider = FakeRepairProvider([repair_reply(self.PATH, self.PERSISTED)])
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         _, prompt = provider.prompts[0]
         assert "[in_memory_state] line 1" in prompt
@@ -552,10 +546,10 @@ class TestPersistenceRepair:
         assert diff["static_checks"]["verdict"] == StaticVerdict.REPAIRED.value
         assert diff["static_checks"]["repaired_files"] == [self.PATH]
 
-    def test_unrepaired_in_memory_state_survives_as_error_after_two_rounds(self):
+    def test_unrepaired_in_memory_state_survives_as_error_after_two_rounds(self, workspace):
         ps = self._state()
         provider = FakeRepairProvider([repair_reply(self.PATH, self.IN_MEMORY)] * 2)
-        diff = IntegrationAgent(provider=provider, retries=1).run(ps)
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
         assert provider.calls == 2
