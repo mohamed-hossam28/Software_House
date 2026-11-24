@@ -11,6 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # Import the agents
+from agents.base import BaseAgent
 from agents.Requirements import RequirementsAgent
 from agents.architecture import ArchitectureAgent
 from agents.planner import PlannerAgent
