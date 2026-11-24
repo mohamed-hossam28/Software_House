@@ -10,7 +10,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # Import the agents
-from agents.base import BaseAgent
 from agents.Requirements import RequirementsAgent
 from agents.architecture import ArchitectureAgent
 from agents.planner import PlannerAgent
@@ -20,7 +19,7 @@ from agents.frontend import FrontendAgent
 from agents.integration import IntegrationAgent
 
 # Import core state and statuses
-from core.state import ProjectState, ProjectStatus
+from core.state import ProjectState, ProjectStatus, diff_state
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -117,7 +116,7 @@ def human_clarifying_questions_node(state: dict) -> dict:
             except ImportError:
                 logger.info("[GraphNode] Langsmith/Langgraph NodeInterrupt not available. Waiting...")
 
-    return BaseAgent._compute_diff(before, ps)
+    return diff_state(before, ps)
 
 
 def architecture_node(state: dict) -> dict:

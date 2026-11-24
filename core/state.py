@@ -6,14 +6,16 @@ Every agent reads from and writes to a typed subset of ProjectState.
 LangGraph passes this object through every node boundary and checkpoints it automatically.
 
 Parallel-safe design:
-  Each graph node returns ONLY the state keys it changed (a "diff dict").
-  Shared keys (metrics, errors) use custom reducer functions so that
-  LangGraph can merge outputs from parallel nodes without conflicts.
+  Each graph node returns ONLY the state keys it changed, computed by diff_state().
+  Keys that parallel nodes change (Code Manifest, generated code, metrics, errors,
+  current agent) each have a state-update policy pairing the delta a node sends
+  with the reducer that merges it, so the fan-in is independent of finish order.
 """
 
 from pydantic import BaseModel, Field
 from enum import Enum
-from typing import Any, Optional, Annotated
+from typing import Any, Callable, Optional, Annotated, get_type_hints
+from functools import cache
 from datetime import datetime
 
 
@@ -104,6 +106,137 @@ def merge_code_map(current: Any, update: Any) -> Any:
     return res
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# State-update policies: one per reducer key, holding its delta rule and its merge rule
+# ────────────────────────────────────────────────────────────────────────────────
+#
+# A node computes its changes with diff_state(before, after). For a key with a
+# policy, the change sent is the policy's delta; LangGraph folds it into the
+# current value with the policy's merge (the reducer annotated on ProjectState).
+# Keys without a policy are replaced by the node that changed them.
+#
+# One owner per file: each File Manifest has exactly one owning coding agent, and
+# the database, backend and frontend coding agents running in parallel only
+# change their own File Manifests (and their own generated code). That is what
+# makes the per-path merges below order-independent at the fan-in. The merge
+# does no conflict detection: a reducer can't tell a sibling's change apart
+# from the Planner's original value, so breaking the rule means last writer wins.
+
+class StatePolicy:
+    """How one reducer key's changes travel between nodes.
+
+    delta(before, after) takes the key's JSON values from an agent's before and
+    after snapshots and returns the change to send, or None when nothing changed.
+    merge(current, update) is the reducer that folds a sent change into state.
+    Keeping both halves together means changing one can't silently break the other.
+    """
+
+    def __init__(self, delta: Callable[[Any, Any], Any], merge: Callable[[Any, Any], Any]) -> None:
+        self._delta = delta
+        self._merge = merge
+
+    def delta(self, before: Any, after: Any) -> Any:
+        return self._delta(before, after)
+
+    def merge(self, current: Any, update: Any) -> Any:
+        return self._merge(current, update)
+
+
+def _code_manifest_delta(before: dict, after: dict) -> Optional[dict]:
+    """Only the File Manifests that differ from the before snapshot."""
+    before_files = before.get("files", {})
+    changed = {
+        path: fm for path, fm in after.get("files", {}).items()
+        if before_files.get(path) != fm
+    }
+    return {"files": changed} if changed else None
+
+
+def _code_map_delta(before: dict, after: dict) -> Optional[dict]:
+    """Only the generated files, per bucket, that differ from the before snapshot."""
+    changed = {
+        bucket: {
+            path: code for path, code in files.items()
+            if before.get(bucket, {}).get(path) != code
+        }
+        for bucket, files in after.items()
+    }
+    return changed if any(changed.values()) else None
+
+
+def _metrics_delta(before: dict, after: dict) -> Optional[dict]:
+    """Counter deltas plus the agent durations that changed."""
+    tokens = after["total_tokens_used"] - before["total_tokens_used"]
+    calls = after["total_llm_calls"] - before["total_llm_calls"]
+    durations = {
+        agent: seconds for agent, seconds in after["agent_durations"].items()
+        if before["agent_durations"].get(agent) != seconds
+    }
+    if not (tokens or calls or durations):
+        return None
+    return PerformanceMetrics(
+        total_tokens_used=tokens,
+        total_llm_calls=calls,
+        agent_durations=durations,
+    ).model_dump(mode="json")
+
+
+def _errors_delta(before: list, after: list) -> Optional[list]:
+    """Only the errors appended since the before snapshot."""
+    return after[len(before):] or None
+
+
+def _current_agent_delta(before: str, after: str) -> Optional[str]:
+    return after if after != before else None
+
+
+#: Code Manifest: per-File-Manifest deltas, merged by per-path overwrite.
+CODE_MANIFEST_POLICY  = StatePolicy(_code_manifest_delta, merge_code_manifest)
+#: Generated code: per-file deltas within each bucket, merged per file.
+GENERATED_CODE_POLICY = StatePolicy(_code_map_delta, merge_code_map)
+#: Metrics: counter deltas, summed.
+METRICS_POLICY        = StatePolicy(_metrics_delta, merge_performance_metrics)
+#: Errors: new entries only, appended.
+ERRORS_POLICY         = StatePolicy(_errors_delta, merge_errors)
+#: Current agent: the latest wins.
+CURRENT_AGENT_POLICY  = StatePolicy(_current_agent_delta, pick_latest_agent)
+
+
+@cache
+def _state_policies() -> dict[str, StatePolicy]:
+    """Every ProjectState key whose annotated reducer is a policy's merge."""
+    policies: dict[str, StatePolicy] = {}
+    hints = get_type_hints(ProjectState, include_extras=True)
+    for key, hint in hints.items():
+        for meta in getattr(hint, "__metadata__", ()):
+            owner = getattr(meta, "__self__", None)
+            if isinstance(owner, StatePolicy):
+                policies[key] = owner
+    return policies
+
+
+def diff_state(before: "ProjectState", after: "ProjectState") -> dict[str, Any]:
+    """The changes a node returns: only the state keys that differ between its
+    before and after snapshots, as JSON.
+
+    Keys with a state-update policy send that policy's delta, so LangGraph's
+    reducers can merge parallel nodes' changes; every other key is sent whole.
+    """
+    before_dict = before.model_dump(mode="json")
+    after_dict = after.model_dump(mode="json")
+    policies = _state_policies()
+
+    changes: dict[str, Any] = {}
+    for key, after_value in after_dict.items():
+        policy = policies.get(key)
+        if policy is None:
+            if before_dict[key] != after_value:
+                changes[key] = after_value
+            continue
+        delta = policy.delta(before_dict[key], after_value)
+        if delta is not None:
+            changes[key] = delta
+    return changes
 
 
 ################ Enum Values######################################################################  
@@ -633,19 +766,19 @@ class ProjectState(BaseModel):
     requirements:    SRSData       = Field(default_factory=SRSData)
     architecture:    ArchData      = Field(default_factory=ArchData)
     tasks:           TaskList      = Field(default_factory=TaskList)       # Planner writes; coding agents only read
-    code_manifest:   Annotated[CodeManifest, merge_code_manifest] = Field(default_factory=CodeManifest)   # ← file-level contracts
-    generated_code:  Annotated[CodeMap, merge_code_map] = Field(default_factory=CodeMap)
+    code_manifest:   Annotated[CodeManifest, CODE_MANIFEST_POLICY.merge] = Field(default_factory=CodeManifest)   # ← file-level contracts
+    generated_code:  Annotated[CodeMap, GENERATED_CODE_POLICY.merge] = Field(default_factory=CodeMap)
     static_checks:   StaticChecks  = Field(default_factory=StaticChecks)
 
     ## human in the loop
     hitl: Optional[HITLRequest]=None
 
     # ── Supporting layers (parallel-safe via reducers) ──────────────────────
-    metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
+    metrics: Annotated[PerformanceMetrics, METRICS_POLICY.merge] = Field(default_factory=PerformanceMetrics)
 
     # ── Error tracking (parallel-safe via reducers) ─────────────────────────
-    errors: Annotated[list[dict[str, str]], merge_errors] = Field(default_factory=list)     # [{agent, message, ts}]
-    current_agent: Annotated[str, pick_latest_agent] = ""
+    errors: Annotated[list[dict[str, str]], ERRORS_POLICY.merge] = Field(default_factory=list)     # [{agent, message, ts}]
+    current_agent: Annotated[str, CURRENT_AGENT_POLICY.merge] = ""
 
     # ── Helpers ───────────────────────────────
     def log_error(self, agent: str, message: str) -> None:

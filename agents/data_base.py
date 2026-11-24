@@ -54,6 +54,7 @@ from core.workspace_paths import _module_path_for
 
 from core.state import (
     ProjectState,
+    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -490,7 +491,7 @@ class DatabaseAgent(BaseAgent):
         db_tasks = ps.tasks.by_agent("database")
         if not db_tasks:
             logger.info("[DBAgent] No database tasks — nothing to do.")
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         logger.info("[DBAgent] Resolving stages for %d database tasks …", len(db_tasks))
         stages = resolve_db_stages(db_tasks)
@@ -542,7 +543,7 @@ class DatabaseAgent(BaseAgent):
             len(db_tasks) - len(unwritten),
             len(unwritten),
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

@@ -43,6 +43,7 @@ from agents.utils import safe_write, parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
+    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -459,7 +460,7 @@ class BackendAgent(BaseAgent):
         be_tasks = ps.tasks.by_agent("backend")
         if not be_tasks:
             logger.info("[BackendAgent] No backend tasks to execute.")
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         logger.info("[BackendAgent] Sorting and staging %d backend tasks ...", len(be_tasks))
         stages = resolve_backend_stages(be_tasks)
@@ -514,7 +515,7 @@ class BackendAgent(BaseAgent):
             len(be_tasks) - len(be_unwritten),
             len(be_unwritten)
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
