@@ -37,13 +37,13 @@ def skeleton(backend_prefix: str, frontend_prefix: str) -> dict:
     ]}
 
 
-def plan(skel: dict, database_tech: str | None = "SQLite 3") -> ProjectState:
+def plan(skel: dict, database_tech: str = "SQLite 3") -> ProjectState:
     state = ProjectState(project_id="layer-roots", project_name="Todo")
     state.requirements.raw_prompt = "Build a very simple todo app."
     state.architecture = ArchData(
         tech_stack={"backend": "FastAPI (Python 3.12)", "frontend": "HTML + Vanilla JS",
-                    **({"database": database_tech} if database_tech else {})},
-        persistence_contract=build_persistence_contract(database_tech) if database_tech else None,
+                    "database": database_tech},
+        persistence_contract=build_persistence_contract(database_tech),
     )
     mock = MockSkeletonLLM()
     mock.SKELETON = skel

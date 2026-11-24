@@ -101,11 +101,10 @@ def _orm_constraint_block(arch: Any) -> str:
 
 def _system_prompt_for(arch: Any) -> str:
     """System prompt for this project: DB tooling, ORM constraint and persistence contract."""
-    contract = arch.persistence_contract if arch else None
-    return _build_system_prompt(_resolve_db_tech(arch), _orm_constraint_block(arch), contract)
+    return _build_system_prompt(_resolve_db_tech(arch), _orm_constraint_block(arch), arch.persistence_contract)
 
 
-def _build_system_prompt(db_tech: str, orm_block: str = "", contract: PersistenceContract | None = None) -> str:
+def _build_system_prompt(db_tech: str, orm_block: str, contract: PersistenceContract) -> str:
     return f"""\
 You are an expert database engineer specialising in {db_tech}.
 Generate a complete, runnable database migration file AND a structured manifest block.
@@ -576,7 +575,8 @@ if __name__ == "__main__":
     print("[PASS] resolve_db_stages — 3 stages, correct membership")
 
     # ── 2. System prompt contains tech stack ───────────────────────────────────
-    sp = _build_system_prompt("MySQL with SQLAlchemy")
+    from core.state import build_persistence_contract
+    sp = _build_system_prompt("MySQL with SQLAlchemy", "", build_persistence_contract("MySQL 8"))
     assert "MySQL with SQLAlchemy" in sp
     print("[PASS] _build_system_prompt — tech stack injected")
 

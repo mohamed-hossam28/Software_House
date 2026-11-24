@@ -20,12 +20,12 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
-from typing import Any
+from typing import Any, NamedTuple
 
 from .base import BaseAgent
 from agents.utils import _as_list
 from core.state import diff_state
-from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError, persistence_mandate
+from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, persistence_mandate, DEFAULT_DATABASE, is_supported_database
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ MAX_PARALLEL_CALLS = 3
 DEFAULT_TECH_STACK: dict[str, str] = {
     "backend":  "FastAPI (Python 3.12)",
     "frontend": "React 18 + TypeScript",
-    "database": "PostgreSQL 16",
+    "database": DEFAULT_DATABASE,
     "cache":    "Redis 7",
     "infra":    "Docker + nginx (reverse proxy)",
 }
@@ -95,6 +95,12 @@ _LAYER_TECH_MAP: dict[str, dict[str, str]] = {
         "heroku":      "Heroku",
     },
 }
+
+
+class ResolvedStack(NamedTuple):
+    """The resolver's authoritative stack plus the assumptions it made resolving it."""
+    stack:       dict[str, str]
+    assumptions: list[str]
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -164,7 +170,7 @@ class TechStackResolver:
 
     # ── Resolver ─────────────────────────────────────────────────────────────────
     @classmethod
-    def resolve(cls, state: ProjectState) -> dict[str, str]:
+    def resolve(cls, state: ProjectState) -> ResolvedStack:
         """
         Merge all three sources.  Higher-priority sources overwrite lower ones
         only for layers they have an opinion on — layers with no preference fall
@@ -174,6 +180,10 @@ class TechStackResolver:
           1. SRS-detected preferences
           2. Store preferences
           3. DEFAULT_TECH_STACK
+
+        The unsupported-database policy lives here and nowhere else: a database
+        missing from the supported-database table is replaced by
+        DEFAULT_DATABASE, and the substitution is recorded as an assumption.
         """
         stack: dict[str, str] = {**DEFAULT_TECH_STACK}
 
@@ -193,7 +203,15 @@ class TechStackResolver:
                 len(srs_prefs), list(srs_prefs.keys()),
             )
 
-        return stack
+        assumptions: list[str] = []
+        requested_db = stack.get("database", "")
+        if not is_supported_database(requested_db):
+            if requested_db:
+                assumptions.append(f"{requested_db} is not supported; using {DEFAULT_DATABASE}")
+                logger.warning("[TechStackResolver] %s", assumptions[-1])
+            stack["database"] = DEFAULT_DATABASE
+
+        return ResolvedStack(stack, assumptions)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────
@@ -341,10 +359,10 @@ Return JSON:
 """
 
 
-def _complexity_block(tier: str, has_database: bool = False) -> str:
+def _complexity_block(tier: str) -> str:
     """Calibrate output size/complexity to user intent (Problem 4).
 
-    With a database, the tier also carries the persistence mandate.
+    Every tier carries the persistence mandate: every run has a database.
     """
     constraints = {
         "MINIMAL": (
@@ -370,7 +388,7 @@ def _complexity_block(tier: str, has_database: bool = False) -> str:
         f"## Complexity: {tier}\n"
         "Calibrate the architecture to this tier. Do not over-engineer beyond the tier.\n"
         + constraints.get(tier, constraints["STANDARD"])
-        + ("\n" + persistence_mandate(tier) if has_database else "")
+        + "\n" + persistence_mandate(tier)
     )
 
 
@@ -453,7 +471,10 @@ class ArchitectureAgent(BaseAgent):
         t0 = time.perf_counter()
 
         # Resolve tech stack deterministically (no LLM needed)
-        authoritative_stack = TechStackResolver.resolve(ps)
+        authoritative_stack, stack_assumptions = TechStackResolver.resolve(ps)
+        # The Persistence Contract comes first: every prompt below may depend on it.
+        # The resolver always yields a supported database, and it wins the merge.
+        persistence_contract = build_persistence_contract(authoritative_stack["database"])
         stack_table = _tech_stack_table(authoritative_stack)
         srs_text = _srs_block(ps.requirements)
         db_srs_text = _db_srs_block(ps.requirements)
@@ -465,7 +486,7 @@ class ArchitectureAgent(BaseAgent):
 
         # ── Complexity calibration (Problem 4) ─────────────────────────────────
         tier = classify_complexity(getattr(ps.requirements, "raw_prompt", ""))
-        complexity_block = _complexity_block(tier, has_database=bool(authoritative_stack.get("database")))
+        complexity_block = _complexity_block(tier)
         results["complexity_tier"] = tier
         logger.info("[ArchitectureAgent] complexity tier: %s", tier)
 
@@ -498,14 +519,6 @@ class ArchitectureAgent(BaseAgent):
             ps,
         )
 
-        # ── Persistence contract (deterministic — no LLM) ───────────────────────
-        try:
-            persistence_contract = build_persistence_contract(merged_stack.get("database", ""))
-        except UnknownDatabaseError as exc:
-            logger.error("[ArchitectureAgent] %s", exc)
-            ps.log_error(self.name, str(exc))
-            persistence_contract = None
-
         ps.architecture = ArchData(
             tech_stack               = merged_stack,
             system_components        = _as_list(results.get("system_components", [])),
@@ -516,6 +529,7 @@ class ArchitectureAgent(BaseAgent):
             diagrams                 = [],
             complexity_tier          = str(results.get("complexity_tier", "STANDARD")),
             persistence_contract     = persistence_contract,
+            assumptions              = stack_assumptions,
         )
 
         duration = time.perf_counter() - t0
@@ -557,7 +571,7 @@ if __name__ == "__main__":
     # ── TechStackResolver.resolve — SRS overrides default ──────────────────────
     state = ProjectState(project_id="arch-test", project_name="arch-test")
     state.requirements = srs
-    resolved = TechStackResolver.resolve(state)
+    resolved = TechStackResolver.resolve(state).stack
     assert resolved["backend"]  == detected["backend"],  "FAIL: SRS backend pref not applied"
     assert resolved["database"] == detected["database"], "FAIL: SRS database pref not applied"
     # Layers without SRS opinion fall through to DEFAULT_TECH_STACK

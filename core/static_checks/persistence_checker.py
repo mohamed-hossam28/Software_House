@@ -1,8 +1,8 @@
 """
 Persistence checks — a cheap static stand-in for the future runtime/testing agent.
 
-Run only when the stack has a database (architecture.persistence_contract set),
-over the manifest-owned backend Python files (the synthesized connection module
+Run on every stack (every run has exactly one Persistence Contract), over the
+manifest-owned backend Python files (the synthesized connection module
 itself is skipped). Files that do not parse are skipped: the Python checker
 already reports their syntax errors.
 
@@ -71,10 +71,8 @@ def check_persistence(
     architecture: Any = None,
     dialect: str = "",
 ) -> list[StaticFinding]:
-    """Error findings for in-memory storage in backend files of a database-backed stack."""
-    contract = getattr(architecture, "persistence_contract", None)
-    if contract is None:
-        return []
+    """Error findings for in-memory storage in backend files (every run has a database)."""
+    contract = architecture.persistence_contract
 
     findings: list[StaticFinding] = []
     for path in _backend_python_files(files, manifest, contract):

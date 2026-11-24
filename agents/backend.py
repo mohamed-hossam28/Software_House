@@ -62,11 +62,9 @@ logger = logging.getLogger(__name__)
 MAX_PARALLEL_CALLS = 3
 
 # ── System Prompt Builder ──────────────────────────────────────────────────────
-def _build_system_prompt(backend_tech: str, contract: PersistenceContract | None = None) -> str:
+def _build_system_prompt(backend_tech: str, contract: PersistenceContract) -> str:
     """Builds a system prompt tailored to the backend tech, carrying the persistence contract + mandate."""
-    persistence = "\n\n".join(
-        b for b in (render_persistence_contract(contract), backend_persistence_rules(contract)) if b
-    )
+    persistence = render_persistence_contract(contract) + "\n\n" + backend_persistence_rules(contract)
     return f"""\
 You are an expert backend engineer specializing in {backend_tech}.
 Your job is to generate the complete source code for a backend file and its manifest details.
@@ -90,7 +88,7 @@ def _system_prompt_for(arch: Any) -> str:
     """System prompt for this project: backend tech + persistence contract and mandate."""
     default_tech = "FastAPI (Python 3.12)"
     backend_tech = arch.tech_stack.get("backend", default_tech) if arch and arch.tech_stack else default_tech
-    return _build_system_prompt(backend_tech, arch.persistence_contract if arch else None)
+    return _build_system_prompt(backend_tech, arch.persistence_contract)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
