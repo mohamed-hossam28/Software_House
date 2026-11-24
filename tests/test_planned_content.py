@@ -25,23 +25,8 @@ from core.state import (
     TaskList,
     build_persistence_contract,
 )
-from providers.llm.base import BaseLLMProvider
-from tests.planner import MockSkeletonLLM
-
-
-class NoLLM(BaseLLMProvider):
-    """A provider that fails the test if any request reaches it."""
-
-    def __init__(self):
-        self.calls: list[str] = []
-
-    @property
-    def provider_name(self) -> str:
-        return "no-llm"
-
-    def complete(self, system_prompt, user_message, *args, **kwargs):
-        self.calls.append(user_message)
-        raise AssertionError("Planned Content must never reach the LLM")
+from providers.llm.scripted import ScriptedLLMProvider
+from tests.fixtures.scripted_llm import scripted_planner
 
 
 def _arch(database_tech: str = "SQLite 3") -> ArchData:
@@ -75,9 +60,7 @@ def _plan() -> ProjectState:
     state = ProjectState(project_id="planned-content", project_name="Todo")
     state.requirements.raw_prompt = "Build a very simple todo app."
     state.architecture = _arch()
-    mock = MockSkeletonLLM()
-    mock.SKELETON = SKELETON
-    PlannerAgent(provider=mock).run(state)
+    PlannerAgent(provider=scripted_planner(SKELETON)).run(state)
     return state
 
 
@@ -141,11 +124,11 @@ def test_coding_agent_writes_planned_content_verbatim_without_the_llm(agent, wor
                                    exports=["X"], planned_content=content)
     state.tasks = TaskList(tasks=tasks)
     state.code_manifest = CodeManifest(files=files)
-    provider = NoLLM()
+    provider = ScriptedLLMProvider(agent)  # unscripted: any request fails
 
     agent_cls(provider=provider, workspace=workspace).run(state)
 
-    assert provider.calls == []
+    assert provider.requests == []
     assert not state.errors, state.errors
     for path, content in planned.items():
         on_disk = workspace.abs_path(path).read_text(encoding="utf-8")

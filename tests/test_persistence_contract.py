@@ -233,7 +233,7 @@ def test_rendered_contract_carries_every_value_downstream_agents_must_agree_on()
 def _planner_prompt(tier: str, database_tech: str) -> str:
     from agents.planner import PlannerAgent
     from core.state import ArchData, ProjectState
-    from tests.planner import MockSkeletonLLM
+    from tests.fixtures.scripted_llm import scripted_planner
 
     state = ProjectState(project_id="tier", project_name="Tier")
     state.architecture = ArchData(
@@ -241,9 +241,9 @@ def _planner_prompt(tier: str, database_tech: str) -> str:
         persistence_contract=build_persistence_contract(database_tech),
         complexity_tier=tier,
     )
-    mock = MockSkeletonLLM()
-    PlannerAgent(provider=mock).run(state)
-    return mock.last_user_message
+    fake = scripted_planner()
+    PlannerAgent(provider=fake).run(state)
+    return fake.requests[-1].user_message
 
 
 @pytest.mark.parametrize("tier", ["MINIMAL", "STANDARD", "ENTERPRISE"])

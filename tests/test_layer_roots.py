@@ -14,7 +14,7 @@ from agents.base import build_import_contract
 from agents.planner import PlannerAgent
 from core.state import ArchData, ProjectState, build_persistence_contract, connection_import_line
 from core.workspace import connection_module_path
-from tests.planner import MockSkeletonLLM
+from tests.fixtures.scripted_llm import scripted_planner
 
 
 def skeleton(backend_prefix: str, frontend_prefix: str) -> dict:
@@ -45,9 +45,7 @@ def plan(skel: dict, database_tech: str = "SQLite 3") -> ProjectState:
                     "database": database_tech},
         persistence_contract=build_persistence_contract(database_tech),
     )
-    mock = MockSkeletonLLM()
-    mock.SKELETON = skel
-    PlannerAgent(provider=mock).run(state)
+    PlannerAgent(provider=scripted_planner(skel)).run(state)
     return state
 
 

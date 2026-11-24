@@ -655,27 +655,15 @@ class BaseAgent(ABC):
         prefix = agent_name if agent_name is not None else self.name
 
         printer = LineBufferedPrinter(prefix)
-        try:
-            response = self.provider.complete(
-                system_prompt = sys_prompt,
-                user_message  = prompt,
-                model         = self.model,
-                max_tokens    = self.max_tokens,
-                temperature   = self.temperature,
-                stream        = True,
-                chunk_callback = printer,
-            )
-        except TypeError as e:
-            if "unexpected keyword argument" in str(e) or "complete() got" in str(e):
-                response = self.provider.complete(
-                    system_prompt = sys_prompt,
-                    user_message  = prompt,
-                    model         = self.model,
-                    max_tokens    = self.max_tokens,
-                    temperature   = self.temperature,
-                )
-            else:
-                raise
+        response = self.provider.complete(
+            system_prompt = sys_prompt,
+            user_message  = prompt,
+            model         = self.model,
+            max_tokens    = self.max_tokens,
+            temperature   = self.temperature,
+            stream        = True,
+            chunk_callback = printer,
+        )
         printer.flush()
         return response
 

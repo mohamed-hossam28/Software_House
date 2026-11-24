@@ -139,7 +139,7 @@ def test_planner_assigns_every_file_manifest_to_exactly_one_coding_agent():
     tasks only ever changes its own File Manifests. The fan-in relies on this."""
     from agents.planner import PlannerAgent
     from core.state import ArchData, build_persistence_contract
-    from tests.planner import MockSkeletonLLM
+    from tests.fixtures.scripted_llm import scripted_planner
 
     state = ProjectState(project_id="owners", project_name="Owners")
     state.requirements.raw_prompt = "Build a todo app."
@@ -149,7 +149,7 @@ def test_planner_assigns_every_file_manifest_to_exactly_one_coding_agent():
         persistence_contract=build_persistence_contract("SQLite 3"),
     )
     plan = ProjectState.model_validate(
-        fold(state.model_dump(mode="json"), PlannerAgent(provider=MockSkeletonLLM()).run(state.model_copy(deep=True)))
+        fold(state.model_dump(mode="json"), PlannerAgent(provider=scripted_planner()).run(state.model_copy(deep=True)))
     )
 
     task_owner = {t.id: t.agent for t in plan.tasks.tasks}
