@@ -275,6 +275,16 @@ def _match_db_name(database_tech: str) -> Optional[str]:
     return None
 
 
+#: The database every run falls back to: the stack resolver uses it when no
+#: database is requested and substitutes it for an unsupported one.
+DEFAULT_DATABASE = "PostgreSQL 16"
+
+
+def is_supported_database(database_tech: str) -> bool:
+    """True when the database tech string names a database in DB_ORM_MAP."""
+    return _match_db_name(database_tech) is not None
+
+
 def _match_db_mapping(database_tech: str) -> Optional[dict[str, str]]:
     """Return the DB_ORM_MAP entry whose name appears in the tech string, or None."""
     name = _match_db_name(database_tech)
@@ -470,10 +480,8 @@ def connection_import_line(contract: PersistenceContract) -> str:
     return f"from {connection_module_dotted(contract)} import {', '.join(CONNECTION_MODULE_EXPORTS)}"
 
 
-def render_persistence_contract(contract: Optional[PersistenceContract]) -> str:
+def render_persistence_contract(contract: PersistenceContract) -> str:
     """Prompt block giving every downstream agent identical persistence values."""
-    if contract is None:
-        return "## Persistence Contract\n(no database in this stack — nothing to persist to)"
     migrations = contract.migrations_tool or "none (the ORM creates the schema)"
     return (
         "## Persistence Contract (fixed — every agent uses exactly these values)\n"
@@ -486,10 +494,8 @@ def render_persistence_contract(contract: Optional[PersistenceContract]) -> str:
     )
 
 
-def backend_persistence_rules(contract: Optional[PersistenceContract]) -> str:
-    """Backend system-prompt rules forcing real persistence (empty with no database)."""
-    if contract is None:
-        return ""
+def backend_persistence_rules(contract: PersistenceContract) -> str:
+    """Backend system-prompt rules forcing real persistence."""
     return (
         "## Persistence Mandate (MUST follow)\n"
         f"- Routers and services obtain database sessions ONLY from the connection module: "
@@ -562,7 +568,11 @@ class ArchData(BaseModel):
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths
     complexity_tier: str = "STANDARD"                                # MINIMAL | STANDARD | ENTERPRISE
-    persistence_contract: Optional[PersistenceContract] = None       # None → database unknown (error logged)
+    # Every run has exactly one; the architecture step sets it from the resolved stack.
+    persistence_contract: PersistenceContract = Field(
+        default_factory=lambda: build_persistence_contract(DEFAULT_DATABASE)
+    )
+    assumptions: list[str] = Field(default_factory=list)            # e.g. an unsupported-database substitution
 
  
 class Task(BaseModel):

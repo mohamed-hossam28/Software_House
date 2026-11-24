@@ -157,6 +157,7 @@ def _make_state() -> ProjectState:
         api_contracts=[],
         database_schema_overview="todo_items (id, title, done)",
         complexity_tier="MINIMAL",
+        persistence_contract=build_persistence_contract("SQLite 3"),
     )
     return state
 
@@ -371,29 +372,11 @@ def test_backend_entrypoint_depends_on_the_connection_module_task():
     assert manifest[SESSION_MODULE].task_id in main_task.depends_on
 
 
-def test_stack_without_database_gets_no_connection_module():
-    state = _make_state()  # no persistence contract → no database
-    PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    manifest = state.code_manifest.files
-
-    assert not any(p.endswith("/db/session.py") for p in manifest)
-    assert not any("session" in src for src in manifest["output/app/main.py"].imports_from)
-
-
 def test_env_example_is_deterministic_content_from_the_contract():
     env = _plan_with_database("PostgreSQL 16").code_manifest.files["output/app/.env.example"]
 
     assert env.planned_content is not None, ".env.example must not be left to the LLM"
     assert "DATABASE_URL=postgresql://" in env.planned_content
-
-
-def test_env_example_without_database_has_no_url_variable():
-    state = _make_state()
-    PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    env = state.code_manifest.files["output/app/.env.example"]
-
-    assert env.planned_content is not None
-    assert "DATABASE_URL" not in env.planned_content
 
 
 def test_skeleton_prompt_carries_the_persistence_contract():
@@ -432,9 +415,10 @@ def test_full_two_pass_run():
         print(f"    {t.id:8} [{t.agent:8}] depends_on={t.depends_on or '[]'}")
 
     # All 6 skeleton files + 2 scaffolds + 3 pinned project files
-    # (requirements.txt, README.md, backend .env.example) from Phase C.
-    assert len(tasks) == 11, f"expected 11 tasks (6 skeleton + 2 scaffold + 3 project files), got {len(tasks)}"
-    assert len(manifest) == 11, len(manifest)
+    # (requirements.txt, README.md, backend .env.example) from Phase C
+    # + the DB connection module every run's Persistence Contract implies.
+    assert len(tasks) == 12, f"expected 12 tasks (6 skeleton + 2 scaffold + 3 project files + connection module), got {len(tasks)}"
+    assert len(manifest) == 12, len(manifest)
     assert "output/app/main.py" in manifest
     assert "output/assets/index.html" in manifest
     assert "output/requirements.txt" in manifest
@@ -447,7 +431,8 @@ def test_full_two_pass_run():
 
     # Scaffold ordering
     main_tid = manifest["output/app/main.py"].task_id
-    assert by_id[main_tid].depends_on == ["be-001", "be-002", "be-003"]
+    session_tid = manifest["output/app/db/session.py"].task_id
+    assert by_id[main_tid].depends_on == ["be-001", "be-002", "be-003", session_tid]
 
     # No FE->BE deps, no cycles, all deps valid
     be_ids = {t.id for t in tasks if t.agent == "backend"}

@@ -13,6 +13,7 @@ from core.state import (
     FileManifest,
 )
 from core.static_checks import run_all_checks
+from core.state import ArchData
 from core.static_checks.python_checker import check_python
 
 
@@ -282,12 +283,12 @@ class TestRunAllChecks:
 
     def test_clean_project_zero_findings(self):
         files, manifest = self._project()
-        assert run_all_checks(files, manifest, architecture=None, dialect="sqlite") == []
+        assert run_all_checks(files, manifest, architecture=ArchData(), dialect="sqlite") == []
 
     def test_broken_project_yields_sorted_errors(self):
         files, manifest = self._project()
         files["output/backend/api/todo.py"] = "def broken(:\n"
-        findings = run_all_checks(files, manifest)
+        findings = run_all_checks(files, manifest, ArchData())
         assert findings
         assert all(f.severity in (FindingSeverity.ERROR, FindingSeverity.WARN) for f in findings)
 
@@ -298,7 +299,7 @@ class TestRunAllChecks:
         # the Python checker itself ignores non-.py files…
         assert check_python(files, manifest) == []
         # …and run_all_checks routes the broken JS file to the JS checker
-        findings = run_all_checks(files, manifest)
+        findings = run_all_checks(files, manifest, ArchData())
         assert all(f.check == "js_syntax" for f in findings)
 
 
@@ -309,7 +310,7 @@ class TestPersistenceChecks:
 
     SERVICE = "output/backend/services/todo.py"
 
-    def _check(self, code: str = "", path: str = SERVICE, database: str | None = "SQLite 3",
+    def _check(self, code: str = "", path: str = SERVICE, database: str = "SQLite 3",
                files: dict[str, tuple[str, str]] | None = None):
         """Run the checker over one backend file, or over {path: (owner agent, code)}."""
         from core.state import ArchData, build_persistence_contract
@@ -320,7 +321,7 @@ class TestPersistenceChecks:
             p: FileManifest(agent=owner, task_id=f"t-{p}", filepath=p, purpose="", exports=[])
             for p, (owner, _) in files.items()
         })
-        arch = ArchData(persistence_contract=build_persistence_contract(database) if database else None)
+        arch = ArchData(persistence_contract=build_persistence_contract(database))
         return check_persistence({p: c for p, (_, c) in files.items()}, manifest, arch, "sqlite")
 
     def test_module_level_list_store_is_error_with_line(self):
@@ -362,9 +363,6 @@ class TestPersistenceChecks:
     ])
     def test_unmutated_config_locals_and_non_containers_are_not_flagged(self, statement):
         assert self._check(f"{statement}\n") == []
-
-    def test_stack_without_database_is_not_checked(self):
-        assert self._check("todos = []\n", database=None) == []
 
     @pytest.mark.parametrize("session_path", ["output/backend/db/session.py", "db/session.py"])
     def test_non_backend_and_connection_module_files_are_not_checked(self, session_path):
