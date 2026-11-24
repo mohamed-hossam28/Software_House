@@ -251,7 +251,7 @@ def test_database_agent_synthesizes_the_connection_module_without_the_llm(
 ):
     state = _run_planner_and_coding_agents(workspace, database_tech)
 
-    session_path = "output/app/db/session.py"
+    session_path = "output/backend/db/session.py"
     on_disk = (tmp_path / session_path).read_text(encoding="utf-8")
     assert "LLM_WROTE_THIS" not in on_disk
     assert 'os.environ["DATABASE_URL"]' in on_disk
@@ -263,7 +263,7 @@ def test_database_agent_synthesizes_the_connection_module_without_the_llm(
 def test_sqlite_stack_init_command_runs_against_the_generated_project(workspace, tmp_path):
     state = _run_planner_and_coding_agents(workspace, "SQLite 3")
     contract = state.architecture.persistence_contract
-    backend_root = tmp_path / "output" / "app"
+    backend_root = tmp_path / "output" / "backend"
     url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
     env = {**os.environ, contract.db_url_env_var: url}
 
@@ -283,13 +283,13 @@ def test_planned_persistence_seam_reaches_the_final_manifest_and_disk(workspace,
     state = _run_planner_and_coding_agents(workspace, "PostgreSQL 16")
 
     manifest = state.code_manifest.files
-    session = manifest["output/app/db/session.py"]
+    session = manifest["output/backend/db/session.py"]
     assert (session.agent, session.exports) == ("database", ["engine", "SessionLocal", "get_db"])
     assert session.written
-    assert (tmp_path / "output/app/db/session.py").is_file()
-    assert "output/app/db/session.py" in manifest["output/app/main.py"].imports_from
+    assert (tmp_path / "output/backend/db/session.py").is_file()
+    assert "output/backend/db/session.py" in manifest["output/backend/main.py"].imports_from
 
-    env_path = "output/app/.env.example"
+    env_path = "output/backend/.env.example"
     on_disk = (tmp_path / env_path).read_text(encoding="utf-8")
     assert on_disk == manifest[env_path].planned_content
     assert "DATABASE_URL=postgresql://" in on_disk
@@ -350,14 +350,14 @@ def test_mandate_obeying_backend_persists_through_the_synthesized_module(workspa
     for system_prompt, _ in be_llm.prompts:
         assert backend_persistence_rules(contract) in system_prompt
 
-    backend_root = tmp_path / "output" / "app"
-    for path in ("services/todo.py", "api/routes/todo.py"):
+    backend_root = tmp_path / "output" / "backend"
+    for path in ("app/services/todo.py", "app/api/routes/todo.py"):
         tree = ast.parse((backend_root / path).read_text(encoding="utf-8"))
         assert not [n for n in tree.body if isinstance(n, ast.Assign)
                     and isinstance(n.value, (ast.List, ast.Dict))], path
 
     env = {**os.environ, "DATABASE_URL": f"sqlite:///{(tmp_path / 'app.db').as_posix()}"}
-    probe = "import services.todo, db.session as s; print(services.todo.list_items(next(s.get_db())))"
+    probe = "import app.services.todo, db.session as s; print(app.services.todo.list_items(next(s.get_db())))"
     result = subprocess.run([sys.executable, "-c", probe], cwd=backend_root, env=env,
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -392,5 +392,5 @@ def test_in_memory_backend_is_caught_by_the_integration_checks(workspace):
     findings = run_all_checks(files, state.code_manifest, state.architecture, "sqlite")
 
     flagged = {f.file for f in findings if f.check == "in_memory_state"}
-    assert "output/app/services/todo.py" in flagged
-    assert "output/app/db/session.py" not in flagged
+    assert "output/backend/app/services/todo.py" in flagged
+    assert "output/backend/db/session.py" not in flagged

@@ -234,23 +234,23 @@ def test_scaffold_injection():
         Task(id="db-001", agent="database", title="d", description="", depends_on=[], priority=1),
     ]
     manifest = {
-        "output/app/schemas/todo.py": FileManifest(agent="backend", task_id="be-001",
-                                                   filepath="output/app/schemas/todo.py", purpose="", exports=["TodoItemCreate"]),
-        "output/assets/js/todoList.js": FileManifest(agent="frontend", task_id="fe-001",
-                                                     filepath="output/assets/js/todoList.js", purpose="", exports=["TodoList"]),
-        "output/app/models/todo.py": FileManifest(agent="database", task_id="db-001",
-                                                  filepath="output/app/models/todo.py", purpose="", exports=["TodoItem"]),
+        "output/backend/app/schemas/todo.py": FileManifest(agent="backend", task_id="be-001",
+                                                   filepath="output/backend/app/schemas/todo.py", purpose="", exports=["TodoItemCreate"]),
+        "output/frontend/assets/js/todoList.js": FileManifest(agent="frontend", task_id="fe-001",
+                                                     filepath="output/frontend/assets/js/todoList.js", purpose="", exports=["TodoList"]),
+        "output/backend/app/models/todo.py": FileManifest(agent="database", task_id="db-001",
+                                                  filepath="output/backend/app/models/todo.py", purpose="", exports=["TodoItem"]),
     }
     next_tasks, next_manifest = _inject_scaffold_tasks(tasks, manifest)
 
-    assert "output/app/main.py" in next_manifest, "backend scaffold missing"
-    assert "output/assets/index.html" in next_manifest, "frontend scaffold missing"
+    assert "output/backend/main.py" in next_manifest, "backend scaffold missing"
+    assert "output/frontend/index.html" in next_manifest, "frontend scaffold missing"
 
-    main_task = next(t for t in next_tasks if next_manifest["output/app/main.py"].task_id == t.id)
+    main_task = next(t for t in next_tasks if next_manifest["output/backend/main.py"].task_id == t.id)
     assert main_task.agent == "backend"
     assert main_task.depends_on == ["be-001"], main_task.depends_on  # runs after all backend
 
-    index_task = next(t for t in next_tasks if next_manifest["output/assets/index.html"].task_id == t.id)
+    index_task = next(t for t in next_tasks if next_manifest["output/frontend/index.html"].task_id == t.id)
     assert index_task.depends_on == ["fe-001"], index_task.depends_on
     print("  [PASS] Scaffold tasks injected (main.py + index.html), ordered last")
 
@@ -298,7 +298,7 @@ def test_complexity_constraint():
 
 # ── Persistence seam (ticket #13) ─────────────────────────────────────────────
 
-SESSION_MODULE = "output/app/db/session.py"
+SESSION_MODULE = "output/backend/db/session.py"
 
 
 def _plan_with_database(database_tech: str = "SQLite 3") -> ProjectState:
@@ -320,7 +320,7 @@ def test_stack_with_database_gets_connection_module_with_fixed_exports():
 def test_backend_entrypoint_imports_the_connection_module():
     manifest = _plan_with_database().code_manifest.files
 
-    assert manifest["output/app/main.py"].imports_from[SESSION_MODULE] == [
+    assert manifest["output/backend/main.py"].imports_from[SESSION_MODULE] == [
         "engine", "SessionLocal", "get_db",
     ]
 
@@ -330,7 +330,7 @@ def test_skeleton_planned_connection_module_is_taken_over_by_the_database_agent(
     state.architecture.persistence_contract = build_persistence_contract("SQLite 3")
     skeleton = {"skeleton": MockSkeletonLLM.SKELETON["skeleton"] + [{
         "id": "be-009", "agent": "backend", "title": "DB session",
-        "description": "Session helper.", "file": "app/db/session.py",
+        "description": "Session helper.", "file": "db/session.py",
         "exports": ["get_session"], "imports_from": {},
     }]}
     mock = MockSkeletonLLM()
@@ -350,23 +350,23 @@ def test_files_importing_a_taken_over_connection_module_get_the_fixed_exports():
     state.architecture.persistence_contract = build_persistence_contract("SQLite 3")
     skeleton = {"skeleton": MockSkeletonLLM.SKELETON["skeleton"] + [
         {"id": "be-009", "agent": "backend", "title": "DB session", "description": "",
-         "file": "app/db/session.py", "exports": ["get_session"], "imports_from": {}},
+         "file": "db/session.py", "exports": ["get_session"], "imports_from": {}},
         {"id": "be-010", "agent": "backend", "title": "Repo", "description": "",
          "file": "app/repo.py", "exports": ["Repo"],
-         "imports_from": {"app/db/session.py": ["get_session"]}},
+         "imports_from": {"db/session.py": ["get_session"]}},
     ]}
     mock = MockSkeletonLLM()
     mock.SKELETON = skeleton
     PlannerAgent(provider=mock).run(state)
 
-    repo = state.code_manifest.files["output/app/repo.py"]
+    repo = state.code_manifest.files["output/backend/app/repo.py"]
     assert repo.imports_from[SESSION_MODULE] == ["engine", "SessionLocal", "get_db"]
 
 
 def test_backend_entrypoint_depends_on_the_connection_module_task():
     state = _plan_with_database()
     manifest = state.code_manifest.files
-    main_task = next(t for t in state.tasks.tasks if t.id == manifest["output/app/main.py"].task_id)
+    main_task = next(t for t in state.tasks.tasks if t.id == manifest["output/backend/main.py"].task_id)
 
     assert manifest[SESSION_MODULE].task_id in main_task.depends_on
 
@@ -377,11 +377,11 @@ def test_stack_without_database_gets_no_connection_module():
     manifest = state.code_manifest.files
 
     assert not any(p.endswith("/db/session.py") for p in manifest)
-    assert not any("session" in src for src in manifest["output/app/main.py"].imports_from)
+    assert not any("session" in src for src in manifest["output/backend/main.py"].imports_from)
 
 
 def test_env_example_is_deterministic_content_from_the_contract():
-    env = _plan_with_database("PostgreSQL 16").code_manifest.files["output/app/.env.example"]
+    env = _plan_with_database("PostgreSQL 16").code_manifest.files["output/backend/.env.example"]
 
     assert env.planned_content is not None, ".env.example must not be left to the LLM"
     assert "DATABASE_URL=postgresql://" in env.planned_content
@@ -390,7 +390,7 @@ def test_env_example_is_deterministic_content_from_the_contract():
 def test_env_example_without_database_has_no_url_variable():
     state = _make_state()
     PlannerAgent(provider=MockSkeletonLLM()).run(state)
-    env = state.code_manifest.files["output/app/.env.example"]
+    env = state.code_manifest.files["output/backend/.env.example"]
 
     assert env.planned_content is not None
     assert "DATABASE_URL" not in env.planned_content
@@ -435,18 +435,18 @@ def test_full_two_pass_run():
     # (requirements.txt, README.md, backend .env.example) from Phase C.
     assert len(tasks) == 11, f"expected 11 tasks (6 skeleton + 2 scaffold + 3 project files), got {len(tasks)}"
     assert len(manifest) == 11, len(manifest)
-    assert "output/app/main.py" in manifest
-    assert "output/assets/index.html" in manifest
-    assert "output/requirements.txt" in manifest
+    assert "output/backend/main.py" in manifest
+    assert "output/frontend/index.html" in manifest
+    assert "output/backend/requirements.txt" in manifest
     assert "output/README.md" in manifest
-    assert "output/app/.env.example" in manifest
+    assert "output/backend/.env.example" in manifest
 
     by_id = {t.id: t for t in tasks}
     assert by_id["be-002"].depends_on == ["be-001", "db-001"]
     assert by_id["be-003"].depends_on == []  # phantom import dropped
 
     # Scaffold ordering
-    main_tid = manifest["output/app/main.py"].task_id
+    main_tid = manifest["output/backend/main.py"].task_id
     assert by_id[main_tid].depends_on == ["be-001", "be-002", "be-003"]
 
     # No FE->BE deps, no cycles, all deps valid

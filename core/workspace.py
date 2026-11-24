@@ -2,6 +2,10 @@
 The workspace module: where generated files live and how they get there.
 
 One home for:
+  - the fixed Layer roots (`BACKEND_ROOT`, `FRONTEND_ROOT`), re-rooting a planned
+    path under its owning coding agent's Layer root (`reroot`), and the
+    connection module's workspace path from the Persistence Contract
+    (`connection_module_path`),
   - the single "put this path under `output/`" normalisation (`workspace_path`),
   - conversion between a workspace path and a dotted import (`dotted_import`,
     `module_workspace_path`) and JS/TS relative imports (`relative_import`),
@@ -21,6 +25,18 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 #: Workspace directory every generated file lives under.
 OUTPUT_DIR = "output"
+
+#: The fixed Layer roots. Every import inside a layer is relative to its Layer
+#: root; database code lives under the backend's.
+BACKEND_ROOT = f"{OUTPUT_DIR}/backend/"
+FRONTEND_ROOT = f"{OUTPUT_DIR}/frontend/"
+
+#: Layer root of each coding agent's files.
+LAYER_ROOTS: dict[str, str] = {
+    "database": BACKEND_ROOT,
+    "backend": BACKEND_ROOT,
+    "frontend": FRONTEND_ROOT,
+}
 
 
 # ── Workspace paths ──────────────────────────────────────────────────────────
@@ -68,6 +84,41 @@ def module_workspace_path(dotted: str, layer_root: str) -> str:
     """
     root = workspace_path(layer_root).rstrip("/") + "/"
     return f"{root}{dotted.strip().replace('.', '/')}.py"
+
+
+def layer_root(agent: str) -> str:
+    """Layer root of a coding agent's files: 'output/backend/' or 'output/frontend/'."""
+    return LAYER_ROOTS[agent]
+
+
+def reroot(path: str, agent: str) -> tuple[str, bool]:
+    """
+    Place a planned path under its owning coding agent's Layer root.
+
+    - Already under the owner's Layer root (with or without `output/`): kept.
+    - Starts with the other layer's directory: that directory is dropped and the
+      path re-rooted under the owner; the second value is True (misplaced).
+    - Otherwise the owner's Layer root is prepended.
+
+    ('app/main.py', 'backend') → ('output/backend/app/main.py', False);
+    ('frontend/db/x.py', 'database') → ('output/backend/db/x.py', True).
+    """
+    rel = workspace_path(path)[len(OUTPUT_DIR) + 1:]
+    root = layer_root(agent)
+    own_dir = root[len(OUTPUT_DIR) + 1:]
+    if rel.startswith(own_dir):
+        return f"{root}{rel[len(own_dir):]}", False
+    for other in set(LAYER_ROOTS.values()) - {root}:
+        other_dir = other[len(OUTPUT_DIR) + 1:]
+        if rel.startswith(other_dir):
+            return f"{root}{rel[len(other_dir):]}", True
+    return f"{root}{rel}", False
+
+
+def connection_module_path(contract) -> str:
+    """Workspace path of the Persistence Contract's connection module, e.g.
+    'output/backend/db/session.py' — it lives under the backend Layer root."""
+    return f"{BACKEND_ROOT}{contract.connection_module.strip().lstrip('/')}"
 
 
 def relative_import(from_file: str, to_file: str) -> str:

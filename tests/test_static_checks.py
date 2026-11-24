@@ -366,7 +366,7 @@ class TestPersistenceChecks:
     def test_stack_without_database_is_not_checked(self):
         assert self._check("todos = []\n", database=None) == []
 
-    @pytest.mark.parametrize("session_path", ["output/backend/db/session.py", "db/session.py"])
+    @pytest.mark.parametrize("session_path", ["output/backend/db/session.py"])
     def test_non_backend_and_connection_module_files_are_not_checked(self, session_path):
         files = {
             session_path: ("backend", 'from sqlalchemy import create_engine\n_cache = {}\nengine = create_engine("x")\n'),

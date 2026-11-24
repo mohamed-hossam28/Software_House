@@ -42,6 +42,7 @@ from core.state import (
     connection_import_line,
     connection_module_dotted,
 )
+from core.workspace import connection_module_path
 
 IN_MEMORY_STATE = "in_memory_state"
 DB_WITHOUT_CONNECTION_MODULE = "db_without_connection_module"
@@ -88,12 +89,12 @@ def check_persistence(
 
 def _backend_python_files(files: dict[str, str], manifest: Any, contract: PersistenceContract) -> list[str]:
     manifest_files = getattr(manifest, "files", {}) or {}
-    module = contract.connection_module
+    module = connection_module_path(contract)
     return sorted(
         path for path in files
         if path.endswith(".py")
         and str(getattr(manifest_files.get(path), "agent", "") or "").lower() == "backend"
-        and path != module and not path.endswith("/" + module)
+        and path != module
     )
 
 

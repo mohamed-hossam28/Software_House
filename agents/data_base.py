@@ -50,7 +50,7 @@ except ImportError:
     # Fallback for direct execution
     from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items
 from agents.utils import parse_metadata, resolve_stages
-from core.workspace import dotted_import
+from core.workspace import connection_module_path, dotted_import
 
 from core.state import (
     ProjectState,
@@ -146,10 +146,10 @@ No prose outside the JSON object.
 # ── Priority-based stage resolver ──────────────────────────────────────────────
 
 def is_connection_module(fm: FileManifest | None, contract: PersistenceContract | None) -> bool:
-    """True for the planner-pinned DB connection module (matched by the contract path)."""
+    """True for the planner-pinned DB connection module (at the contract's workspace path)."""
     return (
         fm is not None and contract is not None and fm.agent == "database"
-        and fm.filepath.endswith("/" + contract.connection_module)
+        and fm.filepath == connection_module_path(contract)
     )
 
 
@@ -659,19 +659,19 @@ if __name__ == "__main__":
     # ── Connection module detection + model module discovery ──────────────────
     from core.state import build_persistence_contract
     sqlite_contract = build_persistence_contract("SQLite 3")
-    session_fm = FileManifest(agent="database", task_id="db-900", filepath="output/app/db/session.py",
+    session_fm = FileManifest(agent="database", task_id="db-900", filepath="output/backend/db/session.py",
                               purpose="conn", exports=list(CONNECTION_MODULE_EXPORTS))
-    model_fm = FileManifest(agent="database", task_id="db-001", filepath="output/app/models/todo.py",
+    model_fm = FileManifest(agent="database", task_id="db-001", filepath="output/backend/app/models/todo.py",
                             purpose="model", exports=["TodoItem"])
     assert is_connection_module(session_fm, sqlite_contract)
     assert not is_connection_module(model_fm, sqlite_contract)
     assert not is_connection_module(session_fm, None)
     reordered_fm = session_fm.model_copy(update={"exports": ["get_db", "engine"]})
     assert is_connection_module(reordered_fm, sqlite_contract), "matched by contract path, not exports"
-    helper_fm = FileManifest(agent="database", task_id="db-002", filepath="output/app/db/seed.py",
+    helper_fm = FileManifest(agent="database", task_id="db-002", filepath="output/backend/app/db/seed.py",
                              purpose="seed helper", exports=["seed"])
     cm_conn = CodeManifest(files={p.filepath: p for p in (session_fm, model_fm, helper_fm)})
-    assert _model_modules(cm_conn) == ["models.todo"], "only models/ files feed create-all"
+    assert _model_modules(cm_conn) == ["app.models.todo"], "only models/ files feed create-all"
     print("[PASS] is_connection_module / _model_modules — pinned module detected, models discovered")
 
     # Cleanup

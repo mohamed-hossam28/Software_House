@@ -19,7 +19,9 @@ from typing import Any
 
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 from providers.llm.base import BaseLLMProvider
-from core.workspace import workspace_path
+from core.workspace import (
+    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, reroot, workspace_path,
+)
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
     diff_state,
@@ -59,6 +61,14 @@ Rules:
 - EVERY file referenced in imports_from MUST itself appear in the skeleton. No phantom imports.
 - Include entrypoint/wiring files: backend main.py (registers routers) and frontend index.html.
 - Unique, non-empty, repo-relative file paths.
+
+Layer roots (fixed — every path MUST start with one of them):
+- backend/  — every backend AND database file (ORM models, the DB connection module, any .sql),
+  plus requirements.txt and .env.example. The entrypoint is backend/main.py. Python imports are
+  relative to backend/ (backend/db/session.py is imported as `db.session`).
+- frontend/ — every frontend file, including package manifest and bundler config. The entrypoint
+  is frontend/index.html.
+- README.md is the only file outside a Layer root.
 """
 
 SKELETON_USER_TEMPLATE = """\
@@ -255,8 +265,38 @@ def _validate_tasks(raw_list: list[Any]) -> tuple[list[Task], list[str]]:
     return tasks, warnings
 
 
-def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) -> dict[str, FileManifest]:
-    """Build CodeManifest entries from validated tasks + raw LLM dicts."""
+#: Project-level file that stays at the top of `output/`, outside any Layer root.
+_TOP_LEVEL_FILES = frozenset({"README.md"})
+
+
+def _place(path: str, agent: str, errors: list[str] | None = None) -> str:
+    """
+    Workspace path of a skeleton path under its owning coding agent's Layer root.
+    A path that names the other layer's directory is re-rooted and logged.
+    """
+    rel = workspace_path(path)[len(OUTPUT_DIR) + 1:]
+    if rel in _TOP_LEVEL_FILES:
+        return f"{OUTPUT_DIR}/{rel}"
+    placed, misplaced = reroot(path, agent)
+    if misplaced and errors is not None:
+        errors.append(
+            f"skeleton path '{path}' (owner: {agent}) names the other layer's directory "
+            f"— re-rooted under its Layer root as '{placed}'"
+        )
+    return placed
+
+
+def _build_manifest(
+    tasks: list[Task], raw_list: list[Any], arch: Any = None, errors: list[str] | None = None,
+) -> dict[str, FileManifest]:
+    """
+    Build CodeManifest entries from validated tasks + raw LLM dicts.
+
+    Every path is re-rooted under its owning coding agent's Layer root
+    (`output/backend/` for database and backend, `output/frontend/` for
+    frontend), whatever layout the skeleton used. Misplaced paths are
+    appended to *errors*.
+    """
     raw_by_id: dict[str, dict] = {}
     for item in raw_list:
         if isinstance(item, dict) and item.get("id"):
@@ -268,6 +308,7 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
         db_model_dir = resolve_db_tooling(arch.tech_stack.get("database", "")).get("model_dir", "app/models/")
 
     manifest_files: dict[str, FileManifest] = {}
+    placed_paths: dict[str, str] = {}   # skeleton path (workspace form) → re-rooted path
     for task in tasks:
         raw_item  = raw_by_id.get(task.id, {})
         file_path = str(raw_item.get("file", "")).strip().lstrip("/").lstrip("\\")
@@ -284,7 +325,8 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             file_path = f"{folder}{sanitized_title}{ext}"
             logger.info("[PlannerAgent] task '%s' missing 'file' field — created fallback path: %s", task.id, file_path)
 
-        file_path = workspace_path(file_path)
+        raw_path = file_path
+        file_path = _place(raw_path, task.agent, errors)
 
         if file_path in manifest_files:
             # Disambiguate duplicate file paths by suffixing task_id
@@ -297,6 +339,7 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
             purpose=str(raw_item.get("description", ""))[:120],
             exports=[str(e) for e in raw_item.get("exports", [])],
         )
+        placed_paths[workspace_path(raw_path)] = file_path
 
     # Persist the Pass-1 import graph (imports_from) into each manifest entry.
     # The coding agents read this to know their EXACT allowed imports — the LLM
@@ -310,6 +353,7 @@ def _build_manifest(tasks: list[Task], raw_list: list[Any], arch: Any = None) ->
         imports_from: dict[str, list[str]] = {}
         for src_path, names in (raw_item.get("imports_from") or {}).items():
             src = workspace_path(src_path)
+            src = placed_paths.get(src, src)
             if src == fm.filepath or src not in manifest_files:
                 if src not in manifest_files:
                     logger.warning(
@@ -484,53 +528,6 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
                     fm.contract[export] = fields
 
 
-def _detect_backend_root(manifest_files: dict[str, FileManifest]) -> str | None:
-    """Return the common parent directory of all backend files, e.g. 'output/backend/'."""
-    backend_paths = [fm.filepath for fm in manifest_files.values() if fm.agent == "backend"]
-    if not backend_paths:
-        return None
-    parts_list = [p.rstrip("/").split("/") for p in backend_paths]
-    common = parts_list[0][:-1]  # exclude filename
-    for p in parts_list[1:]:
-        common = [a for a, b in zip(common, p[:-1]) if a == b]
-    if not common:
-        return None
-    root = "/".join(common) + "/"
-    # If all backend files live in the same directory, go up one level
-    # so that main.py sits alongside the subdirectory, not inside it.
-    dirs = {p.rsplit("/", 1)[0] + "/" for p in backend_paths}
-    if len(dirs) <= 1:
-        root_parts = root.rstrip("/").split("/")
-        if len(root_parts) > 1:
-            root = "/".join(root_parts[:-1]) + "/"
-    return root
-
-
-def _detect_frontend_root(manifest_files: dict[str, FileManifest]) -> str | None:
-    """Return the common parent directory of all frontend files, e.g. 'output/frontend/'."""
-    frontend_paths = [fm.filepath for fm in manifest_files.values() if fm.agent == "frontend"]
-    if not frontend_paths:
-        return None
-    parts_list = [p.rstrip("/").split("/") for p in frontend_paths]
-    common = parts_list[0][:-1]
-    for p in parts_list[1:]:
-        common = [a for a, b in zip(common, p[:-1]) if a == b]
-    if not common:
-        return None
-    root = "/".join(common) + "/"
-    dirs = {p.rsplit("/", 1)[0] + "/" for p in frontend_paths}
-    if len(dirs) <= 1:
-        root_parts = root.rstrip("/").split("/")
-        if len(root_parts) > 1:
-            root = "/".join(root_parts[:-1]) + "/"
-    return root
-
-
-#: Backend root used when no planned backend file reveals one. Shared by every
-#: injection pass so main.py, the router and the connection module agree.
-_DEFAULT_BACKEND_ROOT = "output/app/"
-
-
 def _next_task_id(prefix: str, existing_ids: set[str]) -> str:
     """Reserve and return the first free injected-task id ('<prefix>-900' upward)."""
     n = 900
@@ -547,10 +544,9 @@ def _inject_scaffold_tasks(
 ) -> tuple[list[Task], dict[str, FileManifest]]:
     """
     Add mandatory wiring/scaffold tasks (Problem 2):
-      - backend  → <backend_root>/main.py  (registers every backend router)
-      - frontend → <frontend_root>/index.html   (loads every stylesheet + script)
-    Paths are inferred from the skeleton's existing file structure so that
-    entrypoints always land in the same directory tree as the rest of the code.
+      - backend  → output/backend/main.py      (registers every backend router)
+      - frontend → output/frontend/index.html  (loads every stylesheet + script)
+    Both sit directly at their fixed Layer root.
     Each scaffold depends on ALL of its own agent's tasks so it runs last in that
     agent's execution order and sees the complete list of files to wire.
     """
@@ -559,12 +555,8 @@ def _inject_scaffold_tasks(
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
 
-    # Infer root directories from the skeleton's actual file paths
-    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
-    frontend_root = _detect_frontend_root(manifest_files) or "output/"
-
-    be_main = f"{backend_root}main.py"
-    fe_index = f"{frontend_root}index.html"
+    be_main = f"{BACKEND_ROOT}main.py"
+    fe_index = f"{FRONTEND_ROOT}index.html"
 
     backend_task_ids = [t.id for t in tasks if t.agent == "backend"]
     if backend_task_ids and be_main not in existing_paths:
@@ -630,8 +622,7 @@ def _inject_router_task(
     if not backend_task_ids:
         return tasks, manifest_files
 
-    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
-    be_prefix = backend_root.rstrip("/") + "/"
+    be_prefix = BACKEND_ROOT
 
     def _router_shaped(path: str) -> bool:
         base = path.split("/")[-1]
@@ -660,7 +651,7 @@ def _inject_router_task(
             break
     module_name = module_name or "api"
 
-    router_path = f"{backend_root}api/routes/{module_name}.py"
+    router_path = f"{BACKEND_ROOT}api/routes/{module_name}.py"
     if router_path in next_manifest:
         return tasks, manifest_files
 
@@ -691,7 +682,7 @@ def _inject_router_task(
     )
 
     # Backend entrypoint must depend on (and thus run after) the router task.
-    be_main = f"{backend_root}main.py"
+    be_main = f"{BACKEND_ROOT}main.py"
     main_fm = next_manifest.get(be_main)
     if main_fm:
         main_fm.imports_from[router_path] = ["router"]
@@ -710,9 +701,9 @@ def _inject_project_files(
     """
     Commit to the deliverable's project-scaffolding file set (Phase C3).
     These files are REQUIRED for a runnable deliverable:
-      - output/requirements.txt          (Python dependency manifest)
+      - output/backend/requirements.txt  (Python dependency manifest)
       - output/README.md                 (run instructions)
-      - <backend_root>.env.example       (environment template — no real secrets)
+      - output/backend/.env.example      (environment template — no real secrets)
 
     `.env.example` carries deterministic content built from the persistence
     contract (canonical DB URL variable), so no LLM writes it.
@@ -723,12 +714,10 @@ def _inject_project_files(
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
 
-    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
-
     # (path, title, purpose, exports, planned_content — None → LLM writes it)
     specs = [
         (
-            "output/requirements.txt",
+            f"{BACKEND_ROOT}requirements.txt",
             "Python dependencies (requirements.txt)",
             "Locked Python dependency manifest covering every third-party import used by the backend.",
             ["requirements"],
@@ -742,7 +731,7 @@ def _inject_project_files(
             None,
         ),
         (
-            f"{backend_root}.env.example",
+            f"{BACKEND_ROOT}.env.example",
             "Environment template (.env.example)",
             "Example environment variables (canonical DB URL) — never real secrets.",
             ["env_example"],
@@ -776,7 +765,8 @@ def _inject_persistence_seam(
     Guarantee the DB connection module whenever the stack has a database
     (i.e. the architecture produced a persistence contract).
 
-    The entry lives at <backend_root> + contract.connection_module, is owned by
+    The entry lives at the connection module's workspace path (under the
+    backend Layer root, from contract.connection_module), is owned by
     the database agent, and carries the fixed CONNECTION_MODULE_EXPORTS.
 
     If the skeleton already planned that path, its task is taken over (same
@@ -793,8 +783,7 @@ def _inject_persistence_seam(
     if contract is None:
         return tasks, manifest_files
 
-    backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
-    session_path = f"{backend_root}{contract.connection_module}"
+    session_path = connection_module_path(contract)
     exports = list(CONNECTION_MODULE_EXPORTS)
     title = "DB connection module"
     purpose = (
@@ -831,7 +820,7 @@ def _inject_persistence_seam(
         if session_path in fm.imports_from:
             fm.imports_from[session_path] = list(exports)
 
-    main_fm = next_manifest.get(f"{backend_root}main.py")
+    main_fm = next_manifest.get(f"{BACKEND_ROOT}main.py")
     if main_fm is not None:
         main_fm.imports_from[session_path] = list(exports)
         for t in next_tasks:
@@ -1009,7 +998,11 @@ class PlannerAgent(BaseAgent):
             ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
             return diff_state(before, ps)
 
-        manifest_files = _build_manifest(tasks, skeleton, arch)
+        layout_errors: list[str] = []
+        manifest_files = _build_manifest(tasks, skeleton, arch, layout_errors)
+        for e in layout_errors:
+            logger.error("[PlannerAgent] %s", e)
+            ps.log_error(self.name, e)
 
         # Inject mandatory wiring/scaffold tasks (Problem 2) — run last per agent.
         tasks, manifest_files = _inject_scaffold_tasks(tasks, manifest_files)
@@ -1138,12 +1131,12 @@ if __name__ == "__main__":
         {"id": "be-001", "file": "app/schemas/todo.py", "exports": ["TodoCreate", "TodoResponse"], "imports_from": {}},
     ]
     mfc = _build_manifest(ct_tasks, ct_raw, arch_c)
-    assert mfc["output/app/models/todo.py"].contract["TodoItem"]["is_completed"] == "BOOLEAN"
-    assert mfc["output/app/models/todo.py"].contract["TodoItem"]["user_id"] == "UUID"
-    assert mfc["output/app/models/user.py"].contract == {
+    assert mfc["output/backend/app/models/todo.py"].contract["TodoItem"]["is_completed"] == "BOOLEAN"
+    assert mfc["output/backend/app/models/todo.py"].contract["TodoItem"]["user_id"] == "UUID"
+    assert mfc["output/backend/app/models/user.py"].contract == {
         "User": {"id": "UUID PK", "email": "VARCHAR UNIQUE"}}
-    assert mfc["output/app/schemas/todo.py"].contract["TodoCreate"] == {"title": "str", "description": "str"}
-    assert mfc["output/app/schemas/todo.py"].contract["TodoResponse"]["is_completed"] == "bool"
+    assert mfc["output/backend/app/schemas/todo.py"].contract["TodoCreate"] == {"title": "str", "description": "str"}
+    assert mfc["output/backend/app/schemas/todo.py"].contract["TodoResponse"]["is_completed"] == "bool"
     assert _match_entity("Workspace", {"todos": {}, "users": {}}) is None
     print("[PASS] _populate_contracts — DB model + schema field contracts populated deterministically")
 

@@ -101,5 +101,8 @@ def test_graph_runs_end_to_end_inside_the_temporary_workspace(workspace, tmp_pat
     assert written
     for path in written:
         assert (tmp_path / path).is_file(), path
+        assert path == "output/README.md" or path.startswith(("output/backend/", "output/frontend/")), path
+    assert (tmp_path / "output" / "backend" / "db" / "session.py").is_file()
+    assert (tmp_path / "output" / "frontend" / "index.html").is_file()
     assert (tmp_path / "output" / "run_summary.json").is_file()
     assert _real_output_snapshot() == before
