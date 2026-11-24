@@ -192,16 +192,13 @@ class TestIntegrationAgentDiff:
 
 
 class TestIntegrationNode:
-    def test_node_returns_diff_for_dict_state(self, monkeypatch):
+    def test_node_returns_diff_for_dict_state(self, workspace):
         # The provider keeps returning broken content, so both repair rounds
         # run and the verdict stays failed — with no retry sleeps.
         broken_provider = ScriptedProvider([fenced(BROKEN_PY), fenced(BROKEN_PY)])
-        monkeypatch.setattr(
-            "agents.base.llmFactory.get",
-            staticmethod(lambda name, api_key=None: broken_provider),
-        )
-        from graph.nodes import integration_node
+        from graph.nodes import make_integration_node
 
+        integration_node = make_integration_node(broken_provider, workspace)
         ps = make_state(files={"output/backend/main.py": BROKEN_PY})
         diff = integration_node(ps.model_dump(mode="json"))
         assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value

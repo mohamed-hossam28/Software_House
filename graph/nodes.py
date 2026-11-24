@@ -3,6 +3,7 @@ import os
 import sys
 import json
 from threading import Lock
+from typing import Callable
 
 # Force workspace root on sys.path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +24,7 @@ from agents.integration import IntegrationAgent
 from core.state import ProjectState, ProjectStatus
 from core.config import settings
 from core.workspace import Workspace
+from providers.llm.base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +42,27 @@ def _state_from_dict(state: dict | ProjectState) -> ProjectState:
 
 # ── Node Definitions ─────────────────────────────────────────────────────────
 
-def requirements_node(state: dict) -> dict:
+def make_requirements_node(provider: BaseLLMProvider | str) -> Callable[[dict], dict]:
     """
     Requirements node: runs the RequirementsAgent to generate the SRS.
     Receives full state dict, returns only changed fields as dict.
     """
-    logger.info("[GraphNode] Running RequirementsAgent...")
-    agent = RequirementsAgent(
-        provider=settings.default_provider,
-        model=settings.model_name,
-        max_tokens=settings.req_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.0,
-    )
-    return agent.run(state)
+    model, max_tokens = settings.model_name, settings.req_max_tokens
+    retries, backoff = settings.default_retries, settings.default_backoff
+
+    def requirements_node(state: dict) -> dict:
+        logger.info("[GraphNode] Running RequirementsAgent...")
+        agent = RequirementsAgent(
+            provider=provider,
+            model=model,
+            max_tokens=max_tokens,
+            retries=retries,
+            backoff=backoff,
+            temperature=0.0,
+        )
+        return agent.run(state)
+
+    return requirements_node
 
 
 def human_clarifying_questions_node(state: dict) -> dict:
@@ -121,124 +129,129 @@ def human_clarifying_questions_node(state: dict) -> dict:
     return BaseAgent._compute_diff(before, ps)
 
 
-def architecture_node(state: dict) -> dict:
+def make_architecture_node(provider: BaseLLMProvider | str) -> Callable[[dict], dict]:
     """
     Architecture node: runs the ArchitectureAgent to generate design specs and API contracts.
     Receives full state dict, returns only changed fields as dict.
     """
-    logger.info("[GraphNode] Running ArchitectureAgent...")
-    agent = ArchitectureAgent(
-        provider=settings.default_provider,
-        model=settings.model_name,
-        max_tokens=settings.arch_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.0,
-    )
-    return agent.run(state)
+    model, max_tokens = settings.model_name, settings.arch_max_tokens
+    retries, backoff = settings.default_retries, settings.default_backoff
+
+    def architecture_node(state: dict) -> dict:
+        logger.info("[GraphNode] Running ArchitectureAgent...")
+        agent = ArchitectureAgent(
+            provider=provider,
+            model=model,
+            max_tokens=max_tokens,
+            retries=retries,
+            backoff=backoff,
+            temperature=0.0,
+        )
+        return agent.run(state)
+
+    return architecture_node
 
 
-def planner_node(state: dict) -> dict:
+def make_planner_node(provider: BaseLLMProvider | str) -> Callable[[dict], dict]:
     """
     Planner node: runs the PlannerAgent to decompose the design into prioritized files and tasks.
     Receives full state dict, returns only changed fields as dict.
     """
-    logger.info("[GraphNode] Running PlannerAgent...")
-    agent = PlannerAgent(
-        provider=settings.default_provider,
-        model=settings.model_name,
-        max_tokens=settings.planner_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.0,
-    )
-    return agent.run(state)
+    model, max_tokens = settings.model_name, settings.planner_max_tokens
+    retries, backoff = settings.default_retries, settings.default_backoff
+
+    def planner_node(state: dict) -> dict:
+        logger.info("[GraphNode] Running PlannerAgent...")
+        agent = PlannerAgent(
+            provider=provider,
+            model=model,
+            max_tokens=max_tokens,
+            retries=retries,
+            backoff=backoff,
+            temperature=0.0,
+        )
+        return agent.run(state)
+
+    return planner_node
 
 
-def database_node(state: dict, workspace: Workspace | None = None) -> dict:
-    """
-    Database node: runs the DatabaseAgent to generate SQL and schema structures.
-    Receives full state dict, returns only changed fields as dict.
-    """
-    logger.info("[GraphNode] Running DatabaseAgent...")
-    agent = DatabaseAgent(
-        provider=settings.coding_provider_name,
-        model=settings.coding_model_name,
-        max_tokens=settings.db_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.2,
-        workspace=workspace,
-    )
-    return agent.run(state)
+def _make_coding_node(
+    agent_cls: type[BaseAgent], provider: BaseLLMProvider | str, max_tokens: int, workspace: Workspace,
+) -> Callable[[dict], dict]:
+    """A coding agent node: runs *agent_cls*, writing its files through *workspace*."""
+    model = settings.coding_model_name
+    retries, backoff = settings.default_retries, settings.default_backoff
+
+    def coding_node(state: dict) -> dict:
+        logger.info("[GraphNode] Running %s...", agent_cls.__name__)
+        agent = agent_cls(
+            provider=provider,
+            model=model,
+            max_tokens=max_tokens,
+            retries=retries,
+            backoff=backoff,
+            temperature=0.2,
+            workspace=workspace,
+        )
+        return agent.run(state)
+
+    return coding_node
 
 
-def backend_node(state: dict, workspace: Workspace | None = None) -> dict:
-    """
-    Backend node: runs the BackendAgent to generate backend endpoint logic.
-    Receives full state dict, returns only changed fields as dict.
-    """
-    logger.info("[GraphNode] Running BackendAgent...")
-    agent = BackendAgent(
-        provider=settings.coding_provider_name,
-        model=settings.coding_model_name,
-        max_tokens=settings.be_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.2,
-        workspace=workspace,
-    )
-    return agent.run(state)
+def make_database_node(provider: BaseLLMProvider | str, workspace: Workspace) -> Callable[[dict], dict]:
+    """Database node: runs the DatabaseAgent to generate SQL and schema structures."""
+    return _make_coding_node(DatabaseAgent, provider, settings.db_max_tokens, workspace)
 
 
-def frontend_node(state: dict, workspace: Workspace | None = None) -> dict:
-    """
-    Frontend node: runs the FrontendAgent to generate user interface components and styling.
-    Receives full state dict, returns only changed fields as dict.
-    """
-    logger.info("[GraphNode] Running FrontendAgent...")
-    agent = FrontendAgent(
-        provider=settings.coding_provider_name,
-        model=settings.coding_model_name,
-        max_tokens=settings.fe_max_tokens,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        temperature=0.2,
-        workspace=workspace,
-    )
-    return agent.run(state)
+def make_backend_node(provider: BaseLLMProvider | str, workspace: Workspace) -> Callable[[dict], dict]:
+    """Backend node: runs the BackendAgent to generate backend endpoint logic."""
+    return _make_coding_node(BackendAgent, provider, settings.be_max_tokens, workspace)
 
 
-def integration_node(state: dict, workspace: Workspace | None = None) -> dict:
+def make_frontend_node(provider: BaseLLMProvider | str, workspace: Workspace) -> Callable[[dict], dict]:
+    """Frontend node: runs the FrontendAgent to generate user interface components and styling."""
+    return _make_coding_node(FrontendAgent, provider, settings.fe_max_tokens, workspace)
+
+
+def make_integration_node(provider: BaseLLMProvider | str, workspace: Workspace) -> Callable[[dict], dict]:
     """
     Integration node: runs the IntegrationAgent's static checks over everything
-    the coding agents generated and records a pass/failed verdict in
-    state.static_checks. Error-level findings flow into the state error list.
-    Returns only changed fields as dict. No repair yet.
+    the coding agents generated, repairs error findings through *workspace*, and
+    records the verdict in state.static_checks. Error-level findings flow into
+    the state error list. Returns only changed fields as dict.
     """
-    logger.info("[GraphNode] Running IntegrationAgent (static checks)...")
-    agent = IntegrationAgent(
-        provider=settings.default_provider,
-        model=settings.model_name,
-        retries=settings.default_retries,
-        backoff=settings.default_backoff,
-        workspace=workspace,
-    )
-    return agent.run(state)
+    model = settings.model_name
+    retries, backoff = settings.default_retries, settings.default_backoff
+
+    def integration_node(state: dict) -> dict:
+        logger.info("[GraphNode] Running IntegrationAgent (static checks)...")
+        agent = IntegrationAgent(
+            provider=provider,
+            model=model,
+            retries=retries,
+            backoff=backoff,
+            workspace=workspace,
+        )
+        return agent.run(state)
+
+    return integration_node
 
 
-def finalize_node(state: dict, workspace: Workspace | None = None) -> dict:
+def make_finalize_node(workspace: Workspace) -> Callable[[dict], dict]:
     """
     Finalize node: persists the run summary and complete static-check findings
-    report next to the generated project. Never fails the run.
+    report next to the generated project in *workspace*. Never fails the run.
     """
     from agents.utils import write_run_summary, write_static_checks_report
 
-    logger.info("[GraphNode] Finalizing — writing run summary...")
-    ps = _state_from_dict(state)
+    def finalize_node(state: dict) -> dict:
+        logger.info("[GraphNode] Finalizing — writing run summary...")
+        ps = _state_from_dict(state)
 
-    report_path = write_static_checks_report(ps, workspace)
-    path = write_run_summary(ps, static_report_path=report_path, workspace=workspace)
-    logger.info("[GraphNode] Static findings report written: %s", report_path or "(skipped)")
-    logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
-    return {}
+        report_path = write_static_checks_report(ps, workspace)
+        path = write_run_summary(ps, static_report_path=report_path, workspace=workspace)
+        logger.info("[GraphNode] Static findings report written: %s", report_path or "(skipped)")
+        logger.info("[GraphNode] Run summary written: %s", path or "(skipped)")
+        return {}
+
+    return finalize_node

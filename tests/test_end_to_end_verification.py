@@ -18,7 +18,7 @@ from core.state import (
     StaticFinding,
     StaticVerdict,
 )
-from graph.nodes import finalize_node
+from graph.nodes import make_finalize_node
 from providers.llm.base import BaseLLMProvider, LLMResponse
 from tests.test_persistence_contract import TODO_MODEL_SOURCE
 
@@ -78,7 +78,7 @@ def test_finalize_writes_summary_and_complete_findings_report(workspace, tmp_pat
         repaired_files=["output/backend/main.py"],
     )
 
-    assert finalize_node(state.model_dump(mode="json"), workspace=workspace) == {}
+    assert make_finalize_node(workspace)(state.model_dump(mode="json")) == {}
 
     summary_path = tmp_path / "output" / "run_summary.json"
     report_path = tmp_path / "output" / "static_checks_report.json"
@@ -143,7 +143,7 @@ def test_broken_seed_repairs_and_is_recorded_in_reports(workspace, tmp_path, cap
     assert "rounds=1" in caplog.text
     assert "repaired=1" in caplog.text
 
-    finalize_node(state.model_dump(mode="json"), workspace=workspace)
+    make_finalize_node(workspace)(state.model_dump(mode="json"))
     report = json.loads(
         (tmp_path / "output" / "static_checks_report.json").read_text(encoding="utf-8")
     )
