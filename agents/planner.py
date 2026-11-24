@@ -20,7 +20,7 @@ from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES,
 from providers.llm.base import BaseLLMProvider
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
-    CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
+    CONNECTION_MODULE_EXPORTS, DEFAULT_DATABASE, build_env_example, persistence_mandate,
     render_persistence_contract,
 )
 import re
@@ -94,10 +94,10 @@ def _fmt_tech_stack(stack: dict[str, str]) -> str:
     return "\n".join(f"- {k}: {v}" for k, v in stack.items())
 
 
-def _complexity_constraint(tier: str, has_database: bool = False) -> str:
+def _complexity_constraint(tier: str) -> str:
     """Prompt-level constraint calibrating file count to user intent (Problem 4).
 
-    With a database, the tier also carries the persistence mandate.
+    Every tier carries the persistence mandate: every run has a database.
     """
     tier = (tier or "STANDARD").upper()
     limits = {"MINIMAL": "8-12", "STANDARD": "15-30", "ENTERPRISE": "30-60+"}
@@ -113,7 +113,7 @@ def _complexity_constraint(tier: str, has_database: bool = False) -> str:
             "ENTERPRISE": "- Full auth/RBAC/monitoring as warranted.\n"
                           "- Every file must map to a stated requirement.",
         }.get(tier, "- Only create files that map to stated requirements.")
-        + ("\n" + persistence_mandate(tier) if has_database else "")
+        + "\n" + persistence_mandate(tier)
     )
 
 
@@ -718,7 +718,7 @@ def _inject_project_files(
     `.env.example` carries deterministic content built from the persistence
     contract (canonical DB URL variable), so no LLM writes it.
     """
-    database_tech = arch.tech_stack.get("database", "") if arch.persistence_contract else ""
+    database_tech = arch.tech_stack.get("database") or DEFAULT_DATABASE
 
     existing_ids = {t.id for t in tasks}
     next_tasks = list(tasks)
@@ -774,8 +774,8 @@ def _inject_persistence_seam(
     arch: ArchData,
 ) -> tuple[list[Task], dict[str, FileManifest]]:
     """
-    Guarantee the DB connection module whenever the stack has a database
-    (i.e. the architecture produced a persistence contract).
+    Guarantee the DB connection module from the architecture's Persistence
+    Contract (every run has exactly one).
 
     The entry lives at <backend_root> + contract.connection_module, is owned by
     the database agent, and carries the fixed CONNECTION_MODULE_EXPORTS.
@@ -791,8 +791,6 @@ def _inject_persistence_seam(
     database agent runs in parallel.
     """
     contract = arch.persistence_contract
-    if contract is None:
-        return tasks, manifest_files
 
     backend_root = _detect_backend_root(manifest_files) or _DEFAULT_BACKEND_ROOT
     session_path = f"{backend_root}{contract.connection_module}"
@@ -965,10 +963,7 @@ class PlannerAgent(BaseAgent):
             api_contracts       = _fmt_api_contracts(arch.api_contracts),
             database_schema_overview = arch.database_schema_overview or "(none provided)",
             persistence_contract     = render_persistence_contract(arch.persistence_contract),
-            complexity_constraint    = _complexity_constraint(
-                getattr(arch, "complexity_tier", "STANDARD"),
-                has_database=arch.persistence_contract is not None,
-            ),
+            complexity_constraint    = _complexity_constraint(getattr(arch, "complexity_tier", "STANDARD")),
         )
 
         # ── PASS 1: single skeleton LLM call ────────────────────────────────
@@ -1013,7 +1008,7 @@ class PlannerAgent(BaseAgent):
         tasks, manifest_files = _inject_router_task(tasks, manifest_files, arch)
 
         # Guarantee the DB connection module (fixed exports) and wire it into
-        # the backend entrypoint whenever the stack has a database.
+        # the backend entrypoint.
         tasks, manifest_files = _inject_persistence_seam(tasks, manifest_files, arch)
 
         # Inject the committed project-scaffolding file set (Phase C3).
@@ -1247,10 +1242,10 @@ if __name__ == "__main__":
     print("[PASS] _inject_persistence_seam — connection module pinned, main.py wired, .env.example deterministic")
 
     t6, m6 = _inject_persistence_seam(tasks_m, mf_m, ArchData())
-    assert set(m6) == set(mf_m), "no connection module without a database"
+    assert m6["output/backend/db/session.py"].agent == "database", "default contract → connection module"
     _, m6 = _inject_project_files(t6, m6, ArchData())
-    assert "DATABASE_URL" not in m6["output/backend/.env.example"].planned_content
-    print("[PASS] _inject_persistence_seam — nothing injected without a database")
+    assert "DATABASE_URL=postgresql" in m6["output/backend/.env.example"].planned_content
+    print("[PASS] _inject_persistence_seam — no named database still gets the default contract's seam")
 
     print("\n" + "=" * 60)
     print("All PlannerAgent smoke-tests PASSED")

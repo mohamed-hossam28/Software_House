@@ -382,11 +382,8 @@ class IntegrationAgent(BaseAgent):
             lines.extend(field_contracts or ["(no manifest field contracts available)"])
 
         if any(f.check in PERSISTENCE_CHECKS for f in file_errors):
-            contract = getattr(architecture, "persistence_contract", None)
-            lines += ["", render_persistence_contract(contract)]
-            rules = backend_persistence_rules(contract)
-            if rules:
-                lines += ["", rules]
+            contract = architecture.persistence_contract
+            lines += ["", render_persistence_contract(contract), "", backend_persistence_rules(contract)]
 
         fm = getattr(manifest, "files", {}).get(filepath) if manifest is not None else None
         if fm is not None:
