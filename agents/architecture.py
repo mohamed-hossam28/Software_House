@@ -24,6 +24,7 @@ from typing import Any
 
 from .base import BaseAgent
 from agents.utils import _as_list
+from core.state import diff_state
 from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError, persistence_mandate
 
 logger = logging.getLogger(__name__)
@@ -526,7 +527,7 @@ class ArchitectureAgent(BaseAgent):
             len(ps.architecture.system_components),
             len(ps.architecture.api_contracts),
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

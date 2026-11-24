@@ -60,7 +60,12 @@ class TestFindingModels:
         assert StaticVerdict.PASS == "pass"
         assert StaticVerdict.REPAIRED == "repaired"
         assert StaticVerdict.FAILED == "failed"
-        assert StaticChecks().verdict == StaticVerdict.PASS
+        assert StaticVerdict.NOT_RUN == "not_run"
+
+    def test_fresh_state_verdict_is_not_run(self):
+        """A run where Integration never ran must not look like a pass."""
+        assert StaticChecks().verdict == StaticVerdict.NOT_RUN
+        assert ProjectState().static_checks.verdict == StaticVerdict.NOT_RUN
 
     def test_project_state_has_static_checks(self):
         state = ProjectState()

@@ -43,6 +43,7 @@ from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
+    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -369,7 +370,6 @@ class BackendAgent(BaseAgent):
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
                 state.code_manifest.mark_written(fm.filepath, classes, functions)
-                state.completed_task_ids.add(task.id)
             logger.info("[BackendAgent] ✓ batch trivial: %s", fm.filepath)
 
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
@@ -448,7 +448,6 @@ class BackendAgent(BaseAgent):
         with lock:
             state.generated_code.backend[filepath] = code
             state.code_manifest.mark_written(filepath, classes, functions)
-            state.completed_task_ids.add(task.id)
 
         logger.info("[BackendAgent] Successfully wrote and summarized %s", filepath)
 
@@ -461,7 +460,7 @@ class BackendAgent(BaseAgent):
         be_tasks = ps.tasks.by_agent("backend")
         if not be_tasks:
             logger.info("[BackendAgent] No backend tasks to execute.")
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         logger.info("[BackendAgent] Sorting and staging %d backend tasks ...", len(be_tasks))
         stages = resolve_backend_stages(be_tasks)
@@ -493,11 +492,8 @@ class BackendAgent(BaseAgent):
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
                 for batch in batches:
-                    for t in batch:
-                        t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
                 for task in non_trivial:
-                    task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
                 for future in futures:
@@ -519,7 +515,7 @@ class BackendAgent(BaseAgent):
             len(be_tasks) - len(be_unwritten),
             len(be_unwritten)
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

@@ -9,7 +9,7 @@ from typing import Any, Optional
 from providers.llm.base import BaseLLMProvider
 from providers.llm.llmFactory import LLMFactory as llmFactory
 
-from core.state import ProjectState
+from core.state import ProjectState, diff_state
 import os
 import sys
 from pathlib import Path
@@ -624,7 +624,6 @@ class BaseAgent(ABC):
         with lock:
             getattr(state.generated_code, self.code_bucket)[filepath] = written_code
             state.code_manifest.mark_written(filepath, [], [])
-            state.completed_task_ids.add(task_id)
         logger.info("[%s] ✓ %s (deterministic): %s", self.name, kind, filepath)
 
     @property
@@ -758,61 +757,6 @@ class BaseAgent(ABC):
         raise ValueError(f"Batch JSON parse failed: {raw[:300]}")
 
 
-    @staticmethod
-    def _compute_diff(before: ProjectState, after: ProjectState) -> dict[str, Any]:
-        """
-        Compare two ProjectState snapshots and return only the fields that changed as a dict.
-
-        For Annotated/reducer fields (metrics, errors, current_agent), returns
-        only the delta so LangGraph reducers merge correctly.
-        """
-        from core.state import PerformanceMetrics
-
-        before_dict = before.model_dump(mode="json")
-        after_dict = after.model_dump(mode="json")
-
-        diff: dict[str, Any] = {}
-        for key in after_dict:
-            if key == "metrics":
-                bm = before_dict["metrics"]
-                am = after_dict["metrics"]
-                dt = am["total_tokens_used"] - bm["total_tokens_used"]
-                dc = am["total_llm_calls"] - bm["total_llm_calls"]
-                nd = {k: v for k, v in am["agent_durations"].items()
-                      if bm["agent_durations"].get(k) != v}
-                if dt or dc or nd:
-                    diff["metrics"] = PerformanceMetrics(
-                        total_tokens_used=dt,
-                        total_llm_calls=dc,
-                        agent_durations=nd,
-                    ).model_dump(mode="json")
-                continue
-
-            if key == "errors":
-                new_errors = after_dict["errors"][len(before_dict["errors"]):]
-                if new_errors:
-                    diff["errors"] = new_errors
-                continue
-
-            if key == "current_agent":
-                if after_dict["current_agent"] != before_dict["current_agent"]:
-                    diff["current_agent"] = after_dict["current_agent"]
-                continue
-
-            if key == "completed_task_ids":
-                b_ids = set(before_dict.get("completed_task_ids") or [])
-                a_ids = set(after_dict.get("completed_task_ids") or [])
-                new_ids = a_ids - b_ids
-                if new_ids:
-                    diff["completed_task_ids"] = list(new_ids)
-                continue
-
-            if before_dict[key] != after_dict[key]:
-                diff[key] = after_dict[key]
-
-        return diff
-
-
     def run(self, state: dict | ProjectState) -> dict[str, Any]:
         """
         Run the agent.
@@ -849,7 +793,7 @@ class BaseAgent(ABC):
         duration = time.perf_counter() - t0
         ps.metrics.agent_durations[self.name] = round(duration, 3)
         logger.info("[%s] finished in %.2fs via %s", self.name, duration, self.provider.provider_name)
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
     # ── JSON helpers ──────────────────────────────────────────────────

@@ -41,6 +41,7 @@ from agents.utils import parse_metadata, resolve_stages
 
 from core.state import (
     ProjectState,
+    diff_state,
     Task,
     TaskList,
     FileManifest,
@@ -325,7 +326,6 @@ class FrontendAgent(BaseAgent):
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
                 state.code_manifest.mark_written(fm.filepath, classes, functions)
-                state.completed_task_ids.add(task.id)
             logger.info("[FrontendAgent] ✓ batch trivial: %s", fm.filepath)
 
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
@@ -360,7 +360,6 @@ class FrontendAgent(BaseAgent):
             with lock:
                 state.generated_code.frontend[filepath] = written_code
                 state.code_manifest.mark_written(filepath, [], [])
-                state.completed_task_ids.add(task.id)
             logger.info("[FrontendAgent] ✓ barrel (deterministic): %s", filepath)
             return
 
@@ -412,7 +411,6 @@ class FrontendAgent(BaseAgent):
         with lock:
             state.generated_code.frontend[filepath] = code
             state.code_manifest.mark_written(filepath, classes, functions)
-            state.completed_task_ids.add(task.id)
 
         logger.info("[FrontendAgent] ✓ %s", filepath)
 
@@ -426,7 +424,7 @@ class FrontendAgent(BaseAgent):
         fe_tasks = ps.tasks.by_agent("frontend")
         if not fe_tasks:
             logger.info("[FrontendAgent] No frontend tasks — nothing to do.")
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         fe_tasks.sort(key=lambda t: t.priority)
         stages = resolve_frontend_stages(fe_tasks)
@@ -460,11 +458,8 @@ class FrontendAgent(BaseAgent):
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
                 for batch in batches:
-                    for t in batch:
-                        t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
                 for task in non_trivial:
-                    task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
                 for future in futures:
@@ -484,7 +479,7 @@ class FrontendAgent(BaseAgent):
             len(fe_tasks) - len(unwritten),
             len(unwritten),
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

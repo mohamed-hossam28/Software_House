@@ -22,6 +22,7 @@ from providers.llm.base import BaseLLMProvider
 from core.workspace import workspace_path
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
+    diff_state,
     CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
     render_persistence_contract,
 )
@@ -983,7 +984,7 @@ class PlannerAgent(BaseAgent):
             logger.error("[PlannerAgent] skeleton call failed: %s", exc)
             ps.log_error(self.name, f"skeleton call failed: {exc}")
             ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         skeleton = data.get("skeleton", []) if isinstance(data, dict) else []
         logger.info("[PlannerAgent] ✓ skeleton produced (%d files)", len(skeleton))
@@ -992,7 +993,7 @@ class PlannerAgent(BaseAgent):
             logger.error("[PlannerAgent] %s", msg)
             ps.log_error(self.name, msg)
             ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         # ── PASS 2: deterministic task generation (no LLM) ─────────────────
         warnings: list[str] = []
@@ -1006,7 +1007,7 @@ class PlannerAgent(BaseAgent):
             logger.error("[PlannerAgent] %s", msg)
             ps.log_error(self.name, msg)
             ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return self._compute_diff(before, ps)
+            return diff_state(before, ps)
 
         manifest_files = _build_manifest(tasks, skeleton, arch)
 
@@ -1039,7 +1040,7 @@ class PlannerAgent(BaseAgent):
             counts["database"], counts["backend"], counts["frontend"],
             len(manifest_files),
         )
-        return self._compute_diff(before, ps)
+        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
