@@ -283,7 +283,7 @@ class TestRunAllChecks:
 
     def test_clean_project_zero_findings(self):
         files, manifest = self._project()
-        assert run_all_checks(files, manifest, architecture=ArchData(), dialect="sqlite") == []
+        assert run_all_checks(files, manifest, architecture=ArchData()) == []
 
     def test_broken_project_yields_sorted_errors(self):
         files, manifest = self._project()
@@ -322,7 +322,7 @@ class TestPersistenceChecks:
             for p, (owner, _) in files.items()
         })
         arch = ArchData(persistence_contract=build_persistence_contract(database))
-        return check_persistence({p: c for p, (_, c) in files.items()}, manifest, arch, "sqlite")
+        return check_persistence({p: c for p, (_, c) in files.items()}, manifest, arch)
 
     def test_module_level_list_store_is_error_with_line(self):
         findings = self._check("from db.session import get_db\n\ntodos = []\n")

@@ -9,20 +9,18 @@ from core.state import (
     FileManifest,
     FindingSeverity,
     ProjectState,
+    build_persistence_contract,
 )
 from core.static_checks import run_all_checks
 from core.static_checks.sql_checker import (
     check_sql,
     extract_sql_schema,
-    resolve_sql_dialect,
 )
 
 
-def make_architecture(database: str | None) -> ArchData:
-    arch = ArchData()
-    if database is not None:
-        arch.tech_stack = {"database": database}
-    return arch
+def make_architecture(database: str) -> ArchData:
+    """Architecture whose Persistence Contract is built for *database*."""
+    return ArchData(persistence_contract=build_persistence_contract(database))
 
 
 def make_manifest(contracts: dict[str, dict[str, str]]) -> CodeManifest:
@@ -47,27 +45,27 @@ CREATE TABLE todos (
 """
 
 
-class TestResolveSqlDialect:
-    def test_known_sql_dialects_map(self):
-        assert resolve_sql_dialect(None, "PostgreSQL") == "postgres"
-        assert resolve_sql_dialect(None, "MySQL") == "mysql"
-        assert resolve_sql_dialect(None, "SQLite") == "sqlite"
+class TestDialectFromContract:
+    BACKTICK_QUERY = {"output/backend/app/api/todos.py": 'text("SELECT `title` FROM todos")\n'}
 
-    def test_dialect_family_matching(self):
-        assert resolve_sql_dialect(None, "postgresql+asyncpg") == "postgres"
-        assert resolve_sql_dialect(None, "MySQL 8") == "mysql"
+    def test_mysql_contract_parses_mysql_sql(self):
+        assert check_sql(self.BACKTICK_QUERY, None, make_architecture("MySQL 8")) == []
 
-    def test_non_sql_and_unknown_skip(self):
-        assert resolve_sql_dialect(None, "MongoDB") is None
-        assert resolve_sql_dialect(None, "") is None
-        assert resolve_sql_dialect(None, None) is None
-        assert resolve_sql_dialect(None, "Cassandra") is None
+    def test_postgresql_contract_rejects_mysql_only_sql(self):
+        findings = check_sql(self.BACKTICK_QUERY, None, make_architecture("PostgreSQL 16"))
+        assert [f.check for f in findings] == ["sql_parse"]
+
+    def test_mongodb_contract_has_no_sql_dialect_so_sql_checks_are_skipped(self):
+        files = {"output/backend/app/api/todos.py": 'text("SELEC broken FROM todos")\n'}
+        assert check_sql(files, None, make_architecture("MongoDB 7")) == []
+        assert extract_sql_schema({"output/backend/schema.sql": MIGRATION_SQL}, None,
+                                  make_architecture("MongoDB 7")) == {}
 
 
 class TestExtractSqlSchema:
     def test_create_table_sql_defines_schema(self):
         files = {"output/backend/alembic/versions/001_init.sql": MIGRATION_SQL}
-        assert extract_sql_schema(files, make_architecture("PostgreSQL"), "PostgreSQL") == {
+        assert extract_sql_schema(files, None, make_architecture("PostgreSQL")) == {
             "todos": {"id", "title", "is_completed", "user_id"}
         }
 
@@ -82,7 +80,7 @@ def upgrade():
         sa.Column("title", sa.String(), nullable=False),
     )
 """}
-        assert extract_sql_schema(files, make_architecture("PostgreSQL"), "PostgreSQL") == {
+        assert extract_sql_schema(files, None, make_architecture("PostgreSQL")) == {
             "todos": {"id", "title"}
         }
 
@@ -96,7 +94,7 @@ todos = sa.Table(
     sa.Column("title", sa.String),
 )
 """}
-        assert extract_sql_schema(files, make_architecture("SQLite"), "SQLite") == {
+        assert extract_sql_schema(files, None, make_architecture("SQLite")) == {
             "todos": {"id", "title"}
         }
 
@@ -112,18 +110,18 @@ def upgrade():
         sa.Column("id", sa.Integer(), primary_key=True),
     )
 """}
-        schema = extract_sql_schema({**base, **files}, make_architecture("PostgreSQL"), "PostgreSQL")
+        schema = extract_sql_schema({**base, **files}, None, make_architecture("PostgreSQL"))
         assert schema == {"todos": {"id", "priority"}}
 
     def test_manifest_contract_fallback(self):
         manifest = make_manifest({"User": {"id": "UUID PK", "email": "VARCHAR"}})
         files = {"output/backend/app/models/user.py": "x = 1\n"}
-        assert extract_sql_schema(files, manifest, "PostgreSQL") == {
+        assert extract_sql_schema(files, manifest, make_architecture("PostgreSQL")) == {
             "users": {"id", "email"}
         }
 
     def test_no_schema_sources_empty(self):
-        assert extract_sql_schema({}, None, "PostgreSQL") == {}
+        assert extract_sql_schema({}, None, make_architecture("PostgreSQL")) == {}
 
 
 class TestSchemaMatchingStrictness:
@@ -133,14 +131,14 @@ class TestSchemaMatchingStrictness:
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
             "output/backend/app/api/todos.py": 'text("SELECT title FROM user")\n',
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert any(f.check == "sql_tables" for f in findings)
 
     def test_contract_names_tolerate_singular(self):
         # contract-derived names are approximate entities: 'user' matches 'users'
         manifest = make_manifest({"User": {"id": "UUID PK", "email": "VARCHAR"}})
         files = {"output/backend/app/api/users.py": 'text("SELECT email FROM user")\n'}
-        findings = check_sql(files, manifest, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, manifest, make_architecture("PostgreSQL"))
         assert [f.check for f in findings if f.check == "sql_tables"] == []
 
 
@@ -154,11 +152,11 @@ class TestCheckSql:
                 '    return text("SELECT title, is_completed FROM todos WHERE user_id = :u")\n'
             ),
         }
-        assert check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL") == []
+        assert check_sql(files, None, make_architecture("PostgreSQL")) == []
 
     def test_syntax_broken_sql_is_error(self):
         files = {"output/backend/alembic/versions/001_init.sql": "CREATE TABLE todos (id\n"}
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert len(findings) == 1
         f = findings[0]
         assert f.severity == FindingSeverity.ERROR
@@ -171,7 +169,7 @@ class TestCheckSql:
             "output/backend/app/api/todos.py": 'text("SELEC title FROM todos")\n',
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert len(findings) == 1
         assert findings[0].check == "sql_parse"
         assert findings[0].severity == FindingSeverity.ERROR
@@ -181,7 +179,7 @@ class TestCheckSql:
         # MIGRATION_SQL occupies lines 1-6; two statements on line 7, broken on line 8
         code = 'SELECT 1; SELECT 2;\nSELEC title FROM todos;\nSELECT 3;'
         files = {"output/backend/alembic/versions/001_init.sql": MIGRATION_SQL + code}
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         parses = [f for f in findings if f.check == "sql_parse"]
         assert len(parses) == 1
         assert parses[0].line == 8
@@ -191,7 +189,7 @@ class TestCheckSql:
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
             "output/backend/app/api/ghosts.py": 'text("SELECT title FROM ghosts")\n',
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         tables = [f for f in findings if f.check == "sql_tables"]
         assert len(tables) == 1
         f = tables[0]
@@ -203,7 +201,7 @@ class TestCheckSql:
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
             "output/backend/app/api/todos.py": 'text("SELECT body FROM todos")\n',
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         cols = [f for f in findings if f.check == "sql_columns"]
         assert len(cols) == 1
         f = cols[0]
@@ -215,7 +213,7 @@ class TestCheckSql:
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
             "output/backend/app/api/todos.py": 'text("SELECT t.body FROM todos t")\n',
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert [f.check for f in findings] == ["sql_columns"]
 
     def test_insert_column_list_checked(self):
@@ -225,7 +223,7 @@ class TestCheckSql:
                 'text("INSERT INTO todos (title, body) VALUES (:t, :b)")\n'
             ),
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         cols = [f for f in findings if f.check == "sql_columns"]
         assert len(cols) == 1
         assert "body" in cols[0].message
@@ -240,7 +238,7 @@ class TestCheckSql:
                 'text("SELECT u.email, t.body FROM todos t JOIN users u ON u.id = t.user_id")\n'
             ),
         }
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert [f.check for f in findings] == ["sql_columns"]
         assert "body" in findings[0].message
 
@@ -252,27 +250,19 @@ class TestCheckSql:
                 'SELECT title FROM recent")\n'
             ),
         }
-        assert check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL") == []
-
-    def test_non_sql_dialect_skips_entirely(self):
-        files = {
-            "output/backend/app/api/todos.py": 'text("SELEC broken FROM todos")\n',
-        }
-        assert check_sql(files, None, make_architecture("MongoDB"), "MongoDB") == []
-        assert check_sql(files, None, make_architecture(""), "") == []
-        assert check_sql(files, None, None, None) == []
+        assert check_sql(files, None, make_architecture("PostgreSQL")) == []
 
     def test_empty_schema_skips_cross_check_but_not_parse(self):
         # no migrations and no manifest contracts → parsing still reports, no table findings
         files = {"output/backend/app/api/todos.py": 'text("SELECT title FROM todos")\n'}
-        findings = check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL")
+        findings = check_sql(files, None, make_architecture("PostgreSQL"))
         assert findings == []
 
     def test_non_sql_files_ignored(self):
         files = {
             "output/static/app.js": 'fetch("/api/v1/todos").then(r => r.json());\n',
         }
-        assert check_sql(files, None, make_architecture("PostgreSQL"), "PostgreSQL") == []
+        assert check_sql(files, None, make_architecture("PostgreSQL")) == []
 
 
 class TestRunAllChecksIntegration:
@@ -284,7 +274,7 @@ class TestRunAllChecksIntegration:
                 'text("SELEC broken FROM todos")\n'
             ),
         }
-        findings = run_all_checks(files, None, architecture=make_architecture("PostgreSQL"), dialect="PostgreSQL")
+        findings = run_all_checks(files, None, architecture=make_architecture("PostgreSQL"))
         checks = {(f.check, f.severity) for f in findings if f.check.startswith("sql_")}
         assert ("sql_parse", FindingSeverity.ERROR) in checks
         assert ("sql_columns", FindingSeverity.ERROR) in checks
@@ -294,5 +284,5 @@ class TestRunAllChecksIntegration:
             "output/backend/alembic/versions/001_init.sql": MIGRATION_SQL,
             "output/backend/app/api/todos.py": 'text("SELECT title FROM todos")\n',
         }
-        findings = run_all_checks(files, None, architecture=make_architecture("PostgreSQL"), dialect="PostgreSQL")
+        findings = run_all_checks(files, None, architecture=make_architecture("PostgreSQL"))
         assert findings == []

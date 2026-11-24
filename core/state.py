@@ -250,19 +250,22 @@ class ProjectStatus(str, Enum):
 
 ###################### data models##############################################################
 
-#: Deterministic ORM / migration strategy per database technology.
-#: Used to enforce a single database paradigm (Problem 5) — the LLM can never override it.
-DB_ORM_MAP: dict[str, dict[str, str]] = {
-    "PostgreSQL": {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
-    "SQLite":     {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
-    "MongoDB":    {"orm": "Beanie",     "migrations": "None",                    "model_dir": "app/models/", "migration_dir": ""},
-    "MySQL":      {"orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()", "model_dir": "app/models/", "migration_dir": "app/db/"},
-}
-
-#: Fallback used when the database tech string matches no known provider.
-_DEFAULT_ORM: dict[str, str] = {
-    "orm": "SQLAlchemy", "migrations": "SQLAlchemy create_all()",
-    "model_dir": "app/models/", "migration_dir": "app/db/",
+#: The supported-database table: the single source of each database's tooling.
+#: The Persistence Contract is built from it, so the LLM can never override it.
+#:   orm           — the one data-access layer every coding agent uses
+#:   dialect       — sqlglot dialect name; None for non-SQL databases
+#:   model_dir     — where ORM model files live, relative to the backend Layer root
+#:   migration_dir — empty: Alembic is gone, the ORM creates the schema
+#:   example_url   — placeholder DB URL for `.env.example` (never real secrets)
+DB_ORM_MAP: dict[str, dict[str, Optional[str]]] = {
+    "PostgreSQL": {"orm": "SQLAlchemy", "dialect": "postgres", "model_dir": "app/models/", "migration_dir": "",
+                   "example_url": "postgresql://app:change-me@localhost:5432/app"},
+    "SQLite":     {"orm": "SQLAlchemy", "dialect": "sqlite",   "model_dir": "app/models/", "migration_dir": "",
+                   "example_url": "sqlite:///./app.db"},
+    "MongoDB":    {"orm": "Beanie",     "dialect": None,       "model_dir": "app/models/", "migration_dir": "",
+                   "example_url": "mongodb://localhost:27017/app"},
+    "MySQL":      {"orm": "SQLAlchemy", "dialect": "mysql",    "model_dir": "app/models/", "migration_dir": "",
+                   "example_url": "mysql+pymysql://app:change-me@localhost:3306/app"},
 }
 
 
@@ -285,20 +288,13 @@ def is_supported_database(database_tech: str) -> bool:
     return _match_db_name(database_tech) is not None
 
 
-def _match_db_mapping(database_tech: str) -> Optional[dict[str, str]]:
-    """Return the DB_ORM_MAP entry whose name appears in the tech string, or None."""
-    name = _match_db_name(database_tech)
-    return DB_ORM_MAP[name] if name else None
-
-
-def resolve_db_tooling(database_tech: str) -> dict[str, str]:
-    """Resolve ORM/migration strategy deterministically from a database tech string."""
-    return _match_db_mapping(database_tech) or dict(_DEFAULT_ORM)
-
-
 class PersistenceContract(BaseModel):
     """How generated code persists data — derived from the tech stack, never by an LLM."""
+    database:          str             # canonical name, a DB_ORM_MAP key
     orm:               str
+    sql_dialect:       Optional[str]   # sqlglot dialect name; None for non-SQL databases
+    model_dir:         str             # ORM model directory, relative to the backend Layer root
+    migration_dir:     str             # always empty: no migration files are planned
     migrations_tool:   Optional[str]   # always None: the ORM creates the schema (create_all-style)
     db_url_env_var:    str             # canonical env var every artifact reads the DB URL from
     connection_module: str             # path relative to the backend root
@@ -326,8 +322,8 @@ def build_persistence_contract(database_tech: str) -> PersistenceContract:
     Raises UnknownDatabaseError for an unrecognised database instead of
     silently falling back to the SQLite-style mapping.
     """
-    mapping = _match_db_mapping(database_tech)
-    if mapping is None:
+    name = _match_db_name(database_tech)
+    if name is None:
         raise UnknownDatabaseError(
             f"No persistence contract for database {database_tech!r}; "
             f"known databases: {', '.join(DB_ORM_MAP)}"
@@ -338,8 +334,13 @@ def build_persistence_contract(database_tech: str) -> PersistenceContract:
     module = CONNECTION_MODULE.removesuffix(".py").replace("/", ".")
     init_command = f"python -m {module}"
 
+    mapping = DB_ORM_MAP[name]
     return PersistenceContract(
+        database=name,
         orm=mapping["orm"],
+        sql_dialect=mapping["dialect"],
+        model_dir=mapping["model_dir"],
+        migration_dir=mapping["migration_dir"],
         migrations_tool=None,
         db_url_env_var=DB_URL_ENV_VAR,
         connection_module=CONNECTION_MODULE,
@@ -347,29 +348,17 @@ def build_persistence_contract(database_tech: str) -> PersistenceContract:
     )
 
 
-#: Example DB URL per DB_ORM_MAP key, written into `.env.example` (placeholder
-#: credentials only — never real secrets).
-_EXAMPLE_DB_URLS: dict[str, str] = {
-    "PostgreSQL": "postgresql://app:change-me@localhost:5432/app",
-    "SQLite":     "sqlite:///./app.db",
-    "MongoDB":    "mongodb://localhost:27017/app",
-    "MySQL":      "mysql+pymysql://app:change-me@localhost:3306/app",
-}
+def build_env_example(contract: PersistenceContract) -> str:
+    """Deterministic `.env.example` content rendered from the persistence contract.
 
-
-def build_env_example(database_tech: str) -> str:
-    """Deterministic `.env.example` content built from the persistence contract.
-
-    For a known database, declares the contract's canonical DB URL variable
-    with an example value. With no database (or an unknown one, which has no
-    contract), declares no DB URL variable.
+    Declares the contract's canonical DB URL variable with the example URL of
+    the contract's database.
     """
-    lines = ["# Copy to .env and fill in real values. Never commit real secrets."]
-    name = _match_db_name(database_tech)
-    if name is not None:
-        contract = build_persistence_contract(database_tech)
-        lines.append(f"{contract.db_url_env_var}={_EXAMPLE_DB_URLS[name]}")
-    return "\n".join(lines) + "\n"
+    example_url = DB_ORM_MAP[contract.database]["example_url"]
+    return (
+        "# Copy to .env and fill in real values. Never commit real secrets.\n"
+        f"{contract.db_url_env_var}={example_url}\n"
+    )
 
 
 def _build_motor_connection_module(contract: PersistenceContract) -> str:

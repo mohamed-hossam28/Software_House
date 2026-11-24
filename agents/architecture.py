@@ -23,7 +23,7 @@ from typing import Any, NamedTuple
 
 from .base import BaseAgent
 from agents.utils import _as_list
-from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, persistence_mandate, DEFAULT_DATABASE, is_supported_database
+from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, build_persistence_contract, persistence_mandate, DEFAULT_DATABASE, is_supported_database
 
 logger = logging.getLogger(__name__)
 

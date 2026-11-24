@@ -23,7 +23,7 @@ from core.workspace import (
 )
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
-    CONNECTION_MODULE_EXPORTS, DEFAULT_DATABASE, build_env_example, persistence_mandate,
+    CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
     render_persistence_contract,
 )
 import re
@@ -300,11 +300,6 @@ def _build_manifest(
         if isinstance(item, dict) and item.get("id"):
             raw_by_id[str(item["id"]).strip()] = item
 
-    db_model_dir = "app/models/"
-    if arch is not None and getattr(arch, "tech_stack", None):
-        from core.state import resolve_db_tooling
-        db_model_dir = resolve_db_tooling(arch.tech_stack.get("database", "")).get("model_dir", "app/models/")
-
     manifest_files: dict[str, FileManifest] = {}
     placed_paths: dict[str, str] = {}   # skeleton path (workspace form) → re-rooted path
     for task in tasks:
@@ -315,7 +310,7 @@ def _build_manifest(
             # Fallback file path if LLM omitted 'file' field
             sanitized_title = re.sub(r'[^a-zA-Z0-9_]', '_', task.title.lower()).strip('_') or f"task_{task.id}"
             if task.agent == "database":
-                folder, ext = db_model_dir, ".py"
+                folder, ext = arch.persistence_contract.model_dir, ".py"
             elif task.agent == "backend":
                 folder, ext = "app/api", ".py"
             else:
@@ -706,8 +701,6 @@ def _inject_project_files(
     `.env.example` carries deterministic content built from the persistence
     contract (canonical DB URL variable), so no LLM writes it.
     """
-    database_tech = arch.tech_stack.get("database") or DEFAULT_DATABASE
-
     existing_ids = {t.id for t in tasks}
     next_tasks = list(tasks)
     next_manifest = dict(manifest_files)
@@ -733,7 +726,7 @@ def _inject_project_files(
             "Environment template (.env.example)",
             "Example environment variables (canonical DB URL) — never real secrets.",
             ["env_example"],
-            build_env_example(database_tech),
+            build_env_example(arch.persistence_contract),
         ),
     ]
     for path, title, purpose, exports, planned_content in specs:

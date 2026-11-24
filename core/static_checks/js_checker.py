@@ -26,8 +26,8 @@ anything to match against — API contracts or implemented backend routes
 (see core.static_checks.route_checker); when both are empty it is skipped,
 because flagging every frontend call would be noise.
 
-The manifest and dialect parameters are part of the uniform checker signature
-and are unused by the JavaScript checks.
+The manifest parameter is part of the uniform checker signature and is unused
+by the JavaScript checks.
 """
 import re
 from typing import Any
@@ -54,12 +54,11 @@ def check_javascript(
     files: dict[str, str],
     manifest: Any,
     architecture: Any = None,
-    dialect: str = "",
 ) -> list[StaticFinding]:
     """Run all JavaScript checks over *files* and return the findings.
 
-    manifest and dialect are part of the uniform checker signature; they are
-    unused by the JavaScript checks.
+    manifest is part of the uniform checker signature; it is unused by the
+    JavaScript checks.
     """
     findings: list[StaticFinding] = []
     js_files = {

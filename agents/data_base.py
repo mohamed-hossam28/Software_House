@@ -73,41 +73,33 @@ MAX_PARALLEL_CALLS = 3
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
-def _resolve_db_tech(arch: Any) -> str:
-    """Resolve DB tooling string deterministically from the tech stack (no LLM override)."""
-    from core.state import resolve_db_tooling
-    tech = (arch.tech_stack or {}).get("database", "") if arch and arch.tech_stack else ""
-    mapping = resolve_db_tooling(tech)
-    base = tech or "SQLite"
-    migrations = mapping.get("migrations", "None")
-    return f"{base} ({mapping.get('orm', 'SQLAlchemy')} / migrations: {migrations})"
+def _db_tech(contract: PersistenceContract) -> str:
+    """The contract's database and ORM, as named in prompts."""
+    return f"{contract.database} ({contract.orm})"
 
 
-def _orm_constraint_block(arch: Any) -> str:
-    """Instruction forcing a single ORM paradigm — matching the resolved DB mapping."""
-    from core.state import resolve_db_tooling
-    tech = (arch.tech_stack or {}).get("database", "") if arch and arch.tech_stack else ""
-    mapping = resolve_db_tooling(tech)
-    orm = mapping.get("orm", "SQLAlchemy")
+def _orm_constraint_block(contract: PersistenceContract) -> str:
+    """Instruction forcing the contract's single ORM paradigm."""
+    orm = contract.orm
     return (
-        f"## ORM / Migration Strategy: {orm} using {mapping.get('migrations', 'None')}\n"
+        f"## ORM: {orm}\n"
         f"IMPORTANT: Use {orm} as the single data-access layer. "
         "Do NOT use Prisma, Drizzle, TypeORM, raw DDL in parallel, or any other ORM. "
-        "All models/migrations must use the same paradigm as the backend models."
+        "All models must use the same paradigm as the backend models."
     )
 
 
 def _system_prompt_for(arch: Any) -> str:
-    """System prompt for this project: DB tooling, ORM constraint and persistence contract."""
-    return _build_system_prompt(_resolve_db_tech(arch), _orm_constraint_block(arch), arch.persistence_contract)
+    """System prompt for this project, rendered from its Persistence Contract."""
+    return _build_system_prompt(arch.persistence_contract)
 
 
-def _build_system_prompt(db_tech: str, orm_block: str, contract: PersistenceContract) -> str:
+def _build_system_prompt(contract: PersistenceContract) -> str:
     return f"""\
-You are an expert database engineer specialising in {db_tech}.
+You are an expert database engineer specialising in {_db_tech(contract)}.
 Generate a complete, runnable database migration file AND a structured manifest block.
 
-{orm_block}
+{_orm_constraint_block(contract)}
 
 {render_persistence_contract(contract)}
 
@@ -142,15 +134,15 @@ No prose outside the JSON object.
 
 # ── Priority-based stage resolver ──────────────────────────────────────────────
 
-def is_connection_module(fm: FileManifest | None, contract: PersistenceContract | None) -> bool:
+def is_connection_module(fm: FileManifest | None, contract: PersistenceContract) -> bool:
     """True for the planner-pinned DB connection module (at the contract's workspace path)."""
     return (
-        fm is not None and contract is not None and fm.agent == "database"
+        fm is not None and fm.agent == "database"
         and fm.filepath == connection_module_path(contract)
     )
 
 
-def _deterministic_kind(fm: FileManifest | None, contract: PersistenceContract | None) -> str | None:
+def _deterministic_kind(fm: FileManifest | None, contract: PersistenceContract) -> str | None:
     """'connection module' / 'barrel' for files written without the LLM, else None."""
     if fm is None:
         return None
@@ -196,10 +188,9 @@ def _build_file_prompt(
     task: Task,
     manifest: CodeManifest,
     arch: Any,
-    db_tech: str,
-    orm_block: str = "",
 ) -> str:
     fm = manifest.files.get(filepath)
+    orm_block = _orm_constraint_block(arch.persistence_contract)
     purpose = fm.purpose if fm else task.description
     exports = ", ".join(fm.exports) if fm and fm.exports else "(none)"
 
@@ -324,8 +315,7 @@ class DatabaseAgent(BaseAgent):
         with lock:
             manifest = state.code_manifest
             arch = state.architecture
-            db_tech = _resolve_db_tech(arch)
-            orm_block = _orm_constraint_block(arch)
+            db_tech = _db_tech(arch.persistence_contract)
             sys_prompt  = _system_prompt_for(arch)
             user_prompt = self._build_batch_prompt(tasks, manifest, arch, db_tech)
 
@@ -416,12 +406,8 @@ class DatabaseAgent(BaseAgent):
         # Build prompts while holding the lock (read-only snapshot of shared state)
         with lock:
             arch = state.architecture
-            db_tech = _resolve_db_tech(arch)
-            orm_block = _orm_constraint_block(arch)
             sys_prompt = _system_prompt_for(arch)
-            user_prompt = _build_file_prompt(
-                filepath, task, state.code_manifest, arch, db_tech, orm_block
-            )
+            user_prompt = _build_file_prompt(filepath, task, state.code_manifest, arch)
 
         # LLM call (outside lock — blocking I/O)
         try:

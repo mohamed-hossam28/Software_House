@@ -25,13 +25,31 @@ from core.state import DB_ORM_MAP, PersistenceContract, UnknownDatabaseError, bu
 def test_every_supported_database_creates_its_schema_by_running_the_connection_module(database_tech, orm):
     contract = build_persistence_contract(database_tech)
 
-    assert contract == PersistenceContract(
-        orm=orm,
-        migrations_tool=None,
-        db_url_env_var="DATABASE_URL",
-        connection_module="db/session.py",
-        init_command="python -m db.session",
-    )
+    assert contract.orm == orm
+    assert contract.migrations_tool is None
+    assert contract.db_url_env_var == "DATABASE_URL"
+    assert contract.connection_module == "db/session.py"
+    assert contract.init_command == "python -m db.session"
+
+
+@pytest.mark.parametrize(
+    ("database_tech", "database", "orm", "sql_dialect"),
+    [
+        ("PostgreSQL 16", "PostgreSQL", "SQLAlchemy", "postgres"),
+        ("Supabase (PostgreSQL)", "PostgreSQL", "SQLAlchemy", "postgres"),
+        ("MySQL 8", "MySQL", "SQLAlchemy", "mysql"),
+        ("sqlite", "SQLite", "SQLAlchemy", "sqlite"),
+        ("MongoDB 7", "MongoDB", "Beanie", None),
+    ],
+)
+def test_contract_carries_the_database_tooling_for_each_supported_database(database_tech, database, orm, sql_dialect):
+    contract = build_persistence_contract(database_tech)
+
+    assert contract.database == database
+    assert contract.orm == orm
+    assert contract.sql_dialect == sql_dialect
+    assert contract.model_dir == "app/models/"
+    assert contract.migration_dir == ""   # Alembic is gone: no migration files are planned
 
 
 @pytest.mark.parametrize("database_tech", list(DB_ORM_MAP))
@@ -45,11 +63,15 @@ def test_unknown_database_raises_instead_of_falling_back_to_sqlite(database_tech
         build_persistence_contract(database_tech)
 
 
-def test_contract_has_exactly_the_five_fields():
+def test_contract_has_exactly_the_nine_fields():
     contract = build_persistence_contract("PostgreSQL 16")
 
     assert set(contract.model_dump()) == {
+        "database",
         "orm",
+        "sql_dialect",
+        "model_dir",
+        "migration_dir",
         "migrations_tool",
         "db_url_env_var",
         "connection_module",
@@ -60,27 +82,31 @@ def test_contract_has_exactly_the_five_fields():
 def test_env_example_declares_the_canonical_db_url_variable():
     from core.state import build_env_example
 
-    env = build_env_example("PostgreSQL 16")
+    env = build_env_example(build_persistence_contract("PostgreSQL 16"))
 
     assignments = [line for line in env.splitlines() if line and not line.startswith("#")]
     assert assignments == ["DATABASE_URL=postgresql://app:change-me@localhost:5432/app"]
 
 
-@pytest.mark.parametrize("database_tech", ["PostgreSQL", "SQLite", "MongoDB", "MySQL"])
-def test_env_example_gives_every_known_database_a_non_empty_example_url(database_tech):
+@pytest.mark.parametrize(
+    ("database_tech", "url_scheme"),
+    [
+        ("PostgreSQL 16", "postgresql://"),
+        ("SQLite 3", "sqlite:///"),
+        ("MongoDB 7", "mongodb://"),
+        ("MySQL 8", "mysql+pymysql://"),
+    ],
+)
+def test_env_example_matches_the_contracts_database(database_tech, url_scheme):
     from core.state import build_env_example
 
-    url_lines = [l for l in build_env_example(database_tech).splitlines() if l.startswith("DATABASE_URL=")]
+    env = build_env_example(build_persistence_contract(database_tech))
 
-    assert len(url_lines) == 1
-    assert url_lines[0] != "DATABASE_URL="
-
-
-@pytest.mark.parametrize("database_tech", ["", "Apache Cassandra"])
-def test_env_example_without_a_known_database_has_no_url_variable(database_tech):
-    from core.state import build_env_example
-
-    assert "DATABASE_URL" not in build_env_example(database_tech)
+    assignments = [line for line in env.splitlines() if line and not line.startswith("#")]
+    assert len(assignments) == 1
+    variable, url = assignments[0].split("=", 1)
+    assert variable == "DATABASE_URL"
+    assert url.startswith(url_scheme)
 
 
 # ── Connection module synthesizer (ticket #14) ────────────────────────────────

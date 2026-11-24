@@ -389,7 +389,7 @@ def test_in_memory_backend_is_caught_by_the_integration_checks(workspace):
     BackendAgent(provider=InMemoryBackendProvider(), retries=1, workspace=workspace).run(state)
 
     files = {**state.generated_code.backend, **state.generated_code.database}
-    findings = run_all_checks(files, state.code_manifest, state.architecture, "sqlite")
+    findings = run_all_checks(files, state.code_manifest, state.architecture)
 
     flagged = {f.file for f in findings if f.check == "in_memory_state"}
     assert "output/backend/app/services/todo.py" in flagged

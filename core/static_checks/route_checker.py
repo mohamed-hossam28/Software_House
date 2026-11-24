@@ -24,9 +24,6 @@ Known limitations (dynamic registration cannot be judged statically):
 inside routers collect none of their parents' prefixes — routes registered
 through either are indexed under their bare decorator path, which can only
 produce a false-positive warn (never a missed error or missed frontend match).
-
-The dialect parameter is part of the uniform checker signature and is unused
-by these checks.
 """
 import ast
 from typing import Any
@@ -49,7 +46,6 @@ def check_backend_routes(
     files: dict[str, str],
     manifest: Any,
     architecture: Any = None,
-    dialect: str = "",
 ) -> list[StaticFinding]:
     """Error for every API contract no extracted backend route implements.
 

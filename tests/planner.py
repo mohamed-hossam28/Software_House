@@ -29,7 +29,6 @@ from core.state import (
     FileManifest,
     TaskList,
     CodeManifest,
-    resolve_db_tooling,
     classify_complexity,
     build_persistence_contract,
 )
@@ -257,7 +256,7 @@ def test_scaffold_injection():
 
 
 def test_build_manifest_db_model_dir():
-    """Database fallback paths honour the ORM map (SQLite → app/models/)."""
+    """Database fallback paths use the Persistence Contract's model directory (app/models/)."""
     tasks = [
         Task(id="db-001", agent="database", title="Todo model", description="", depends_on=[], priority=1),
         Task(id="be-001", agent="backend", title="Routes", description="", depends_on=["db-001"], priority=2),
@@ -266,7 +265,10 @@ def test_build_manifest_db_model_dir():
         {"id": "db-001", "exports": ["TodoItem"], "description": "m"},
         {"id": "be-001", "exports": ["router"], "description": "r"},
     ]
-    arch = ArchData(tech_stack={"database": "SQLite 3"})
+    arch = ArchData(
+        tech_stack={"database": "SQLite 3"},
+        persistence_contract=build_persistence_contract("SQLite 3"),
+    )
     mf = _build_manifest(tasks, raw, arch)
 
     db_paths = [p for p in mf if "models" in p]

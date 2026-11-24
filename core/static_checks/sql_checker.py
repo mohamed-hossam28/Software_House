@@ -1,17 +1,13 @@
 """
 SQL static checks: dialect-aware parsing and schema cross-check.
 
-Dialect — the architecture tech stack's database entry (passed through the
-uniform `dialect` parameter by the Integration Agent as the raw tech string)
-is mapped to a sqlglot dialect: PostgreSQL → postgres, MySQL/MariaDB →
-mysql, SQLite → sqlite, SQL Server → tsql. Non-SQL or unknown database
-technologies (e.g. MongoDB) skip the SQL checks entirely: parsing them as
-SQL could only produce noise. The raw tech string also resolves the ORM
-map's migration directory (core.state.resolve_db_tooling).
+Dialect — read from the architecture's Persistence Contract (its sqlglot
+dialect name). A contract with no SQL dialect (MongoDB) skips the SQL checks
+entirely: parsing its code as SQL could only produce noise.
 
 SQL sources — .sql files are parsed statement by statement (whole content,
-line-tracked); the ORM map's migration directory marks migration files the
-same way. Every other Python file — migration files included — contributes
+line-tracked); the contract's migration directory, when it names one, marks
+migration files the same way. Every other Python file contributes
 its SQL strings: string literals that start with a SQL statement keyword and
 the first string argument of `text(...)` calls (extracted with ast, so
 findings carry the Python source line). .sql files outside the migration
@@ -39,8 +35,9 @@ CTE aliases are treated as known tables within their statement. An
 un-prefixed column in a multi-table statement is matched against the union
 of that statement's tables — flagging it only when it exists in none.
 
-The architecture parameter is part of the uniform checker signature; the
-dialect used by the checks comes from it, so it is read but not passed on.
+The checker takes the uniform (files, Code Manifest, architecture) inputs;
+the dialect and migration directory come from the architecture's
+Persistence Contract.
 """
 import ast
 import re
@@ -50,18 +47,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
-from core.state import FindingSeverity, StaticFinding, resolve_db_tooling
-
-#: sqlglot dialect name for a database tech entry; None = not SQL-checkable.
-_DIALECT_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("postgres", "postgres"),
-    ("postgresql", "postgres"),
-    ("mysql", "mysql"),
-    ("mariadb", "mysql"),
-    ("sqlite", "sqlite"),
-    ("mssql", "tsql"),
-    ("sqlserver", "tsql"),
-)
+from core.state import FindingSeverity, StaticFinding
 
 #: Python string literals starting with one of these are treated as SQL.
 _SQL_STATEMENT_RE = re.compile(
@@ -83,24 +69,21 @@ _COLUMNS = "sql_columns"
 def check_sql(
     files: dict[str, str],
     manifest: Any,
-    architecture: Any = None,
-    dialect: str = "",
+    architecture: Any,
 ) -> list[StaticFinding]:
     """Parse SQL in generated files and cross-check it against the extracted schema.
 
-    manifest is part of the uniform checker signature and is used only as the
-    schema fallback (database field contracts). `dialect` carries the raw
-    tech-stack database entry (e.g. "PostgreSQL"): it selects the sqlglot
-    dialect for parsing and the ORM map's migration directory; architecture
-    is read only when `dialect` is empty.
+    manifest is used only as the schema fallback (database field contracts).
+    The architecture's Persistence Contract gives the sqlglot dialect and the
+    migration directory; a contract with no SQL dialect skips every check.
     """
-    database_tech = _database_tech(architecture, dialect)
-    sql_dialect = resolve_sql_dialect(None, database_tech)
+    contract = architecture.persistence_contract
+    sql_dialect = contract.sql_dialect
     if not sql_dialect:
         return []
 
     findings: list[StaticFinding] = []
-    statements = _sql_statements(files, database_tech)
+    statements = _sql_statements(files, contract.migration_dir)
     schema, contract_tables = _build_schema(files, manifest, sql_dialect)
 
     parsed: list[tuple[str, int, Any]] = []
@@ -123,39 +106,16 @@ def check_sql(
     return _dedupe(findings)
 
 
-def resolve_sql_dialect(architecture: Any, dialect: str = "") -> str | None:
-    """sqlglot dialect name for the tech stack's database entry; None when not SQL.
-
-    The tech string may carry driver suffixes ("postgresql+asyncpg") or
-    versions ("MySQL 8"), so matching is substring-based on the known
-    families. Unknown or non-SQL entries (MongoDB, blank) return None.
-    """
-    tech = _database_tech(architecture, dialect)
-    for pattern, name in _DIALECT_PATTERNS:
-        if pattern in tech:
-            return name
-    return None
-
-
-def _database_tech(architecture: Any, dialect: str = "") -> str:
-    """Raw tech-stack database string: the `dialect` param, else architecture."""
-    tech = str(dialect or "").lower()
-    if not tech and architecture is not None:
-        tech = str((getattr(architecture, "tech_stack", None) or {}).get("database", "") or "").lower()
-    return tech
-
-
 # ── SQL statement sources ────────────────────────────────────────────────────
 
 
-def _sql_statements(files: dict[str, str], database_tech: str) -> list[tuple[str, int, str]]:
+def _sql_statements(files: dict[str, str], migration_dir: str) -> list[tuple[str, int, str]]:
     """(file, line, SQL text) for every SQL source in *files*.
 
-    .sql files and files under the ORM map's migration directory are SQL
+    .sql files and files under the contract's migration directory are SQL
     sources in full (split into statements, line-tracked); every other Python
     file contributes its SQL-looking string literals and text(...) arguments.
     """
-    migration_dir = _migration_dir(database_tech)
     return_statements: list[tuple[str, int, str]] = []
     for filepath, code in sorted(files.items()):
         if filepath.endswith(".py") and code:
@@ -166,13 +126,8 @@ def _sql_statements(files: dict[str, str], database_tech: str) -> list[tuple[str
     return return_statements
 
 
-def _migration_dir(database_tech: str) -> str:
-    """Migration directory fragment from the ORM map, e.g. 'alembic/versions/'."""
-    return str(resolve_db_tooling(database_tech or "").get("migration_dir", "") or "")
-
-
 def _is_sql_source(filepath: str, migration_dir: str) -> bool:
-    """.sql file, or a file living in the ORM map's migration directory."""
+    """.sql file, or a file living in the contract's migration directory."""
     if filepath.endswith(".sql"):
         return True
     return bool(migration_dir) and migration_dir in filepath
@@ -273,16 +228,19 @@ def _python_sql_strings(filepath: str, code: str) -> list[tuple[str, int, str]]:
 # ── Schema extraction ────────────────────────────────────────────────────────
 
 
-def extract_sql_schema(files: dict[str, str], manifest: Any = None, dialect: str = "") -> dict[str, set[str]]:
+def extract_sql_schema(files: dict[str, str], manifest: Any, architecture: Any) -> dict[str, set[str]]:
     """Known tables → column names, from migration DDL (and manifest contracts).
 
     Every .sql file is parsed for CREATE TABLE statements; every Python file
     is AST-scanned for op.create_table / op.add_column / sa.Table calls and
     for model classes declaring __tablename__ with Column attributes. The
     manifest's database field contracts fill in tables no DDL defines.
-    `dialect` is the database tech string or sqlglot dialect name.
+    The dialect comes from the architecture's Persistence Contract; a
+    contract with no SQL dialect has no SQL schema.
     """
-    sql_dialect = resolve_sql_dialect(None, dialect) or "postgres"
+    sql_dialect = architecture.persistence_contract.sql_dialect
+    if not sql_dialect:
+        return {}
     schema, _ = _build_schema(files, manifest, sql_dialect)
     return schema
 
@@ -612,4 +570,4 @@ def _dedupe(findings: list[StaticFinding]) -> list[StaticFinding]:
     return unique
 
 
-__all__ = ["check_sql", "extract_sql_schema", "resolve_sql_dialect"]
+__all__ = ["check_sql", "extract_sql_schema"]

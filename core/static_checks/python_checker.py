@@ -23,12 +23,11 @@ def check_python(
     files: dict[str, str],
     manifest: Any,
     architecture: Any = None,
-    dialect: str = "",
 ) -> list[StaticFinding]:
     """Run all Python checks over *files* and return the findings.
 
-    architecture and dialect are part of the uniform checker signature;
-    they are unused by the Python checks.
+    architecture is part of the uniform checker signature; it is unused by
+    the Python checks.
     """
     findings: list[StaticFinding] = []
     findings.extend(_check_manifest_written(files, manifest))

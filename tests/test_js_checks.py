@@ -27,7 +27,7 @@ class TestJsSyntax:
     def test_syntax_error_is_error_finding_with_line(self):
         files = dict(APP)
         files["output/frontend/app.js"] = "function broken( {}\nconst ok = 2;\n"
-        findings = check_javascript(files, None, make_architecture([]), "")
+        findings = check_javascript(files, None, make_architecture([]))
         assert len(findings) == 1
         f = findings[0]
         assert f.severity == FindingSeverity.ERROR
@@ -39,15 +39,15 @@ class TestJsSyntax:
 
     def test_valid_module_file_is_clean(self):
         files = {"output/frontend/app.js": 'import x from "./y.js";\nexport const v = 1;\n'}
-        assert check_javascript(files, None, make_architecture([]), "") == []
+        assert check_javascript(files, None, make_architecture([])) == []
 
     def test_valid_script_file_is_clean(self):
         files = {"output/frontend/app.js": "const v = 1;\n"}
-        assert check_javascript(files, None, make_architecture([]), "") == []
+        assert check_javascript(files, None, make_architecture([])) == []
 
     def test_non_js_files_skipped(self):
         files = {"output/frontend/app.css": ".a { color: red }"}
-        assert check_javascript(files, None, make_architecture([]), "") == []
+        assert check_javascript(files, None, make_architecture([])) == []
 
 
 class TestUrlExtraction:
@@ -57,7 +57,7 @@ class TestUrlExtraction:
                 'fetch("/api/v1/todos").then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_axios_verb_matching_contract_is_clean(self):
         files = {
@@ -65,7 +65,7 @@ class TestUrlExtraction:
                 'axios.post("/api/v1/todos", { text: "x" });\n'
         }
         arch = make_architecture([("POST", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_axios_config_object_matching_contract_is_clean(self):
         files = {
@@ -73,7 +73,7 @@ class TestUrlExtraction:
                 'axios({ url: "/api/v1/todos/3", method: "DELETE" });\n'
         }
         arch = make_architecture([("DELETE", "/api/v1/todos/{id}")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_unknown_endpoint_is_error(self):
         files = {
@@ -81,7 +81,7 @@ class TestUrlExtraction:
                 'fetch("/api/v1/ghosts").then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        findings = check_javascript(files, None, arch, "")
+        findings = check_javascript(files, None, arch)
         assert len(findings) == 1
         f = findings[0]
         assert f.severity == FindingSeverity.ERROR
@@ -94,7 +94,7 @@ class TestUrlExtraction:
                 'axios.post("/api/v1/todos", {});\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        findings = check_javascript(files, None, arch, "")
+        findings = check_javascript(files, None, arch)
         assert len(findings) == 1
         assert findings[0].severity == FindingSeverity.ERROR
         assert findings[0].check == "js_urls"
@@ -107,7 +107,7 @@ class TestNoFalsePositives:
                 'fetch(`/api/v1/todos/${id}/items/${itemId}`).then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos/{id}/items/{item_id}")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_trailing_slash_and_query_stripped(self):
         files = {
@@ -115,7 +115,7 @@ class TestNoFalsePositives:
                 'fetch("/api/v1/todos/?full=1").then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_base_url_concatenation_resolves(self):
         files = {
@@ -124,7 +124,7 @@ class TestNoFalsePositives:
                 'fetch(BASE + "/api/v1/todos").then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_env_prefix_template_resolves(self):
         files = {
@@ -132,7 +132,7 @@ class TestNoFalsePositives:
                 'fetch(`${import.meta.env.VITE_API_URL}/api/v1/todos/${id}`).then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos/{id}")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_full_url_literal_resolves_to_path(self):
         files = {
@@ -140,7 +140,7 @@ class TestNoFalsePositives:
                 'fetch("https://api.example.com/api/v1/todos").then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_leading_path_param_template_not_mistaken_for_base_url(self):
         files = {
@@ -148,7 +148,7 @@ class TestNoFalsePositives:
                 'fetch(`/${userId}/todos`).then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/{user_id}/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
     def test_ambiguous_leading_interpolation_still_flags_unknown_endpoint(self):
         files = {
@@ -156,7 +156,7 @@ class TestNoFalsePositives:
                 'fetch(`${base}/ghosts`).then(r => r.json());\n'
         }
         arch = make_architecture([("GET", "/{id}/todos")])
-        findings = check_javascript(files, None, arch, "")
+        findings = check_javascript(files, None, arch)
         assert len(findings) == 1
         assert findings[0].severity == FindingSeverity.ERROR
         assert findings[0].check == "js_urls"
@@ -166,8 +166,8 @@ class TestNoFalsePositives:
             "output/frontend/app.js":
                 'fetch("/api/v1/anything").then(r => r.json());\n'
         }
-        assert check_javascript(files, None, make_architecture([]), "") == []
-        assert check_javascript(files, None, None, "") == []
+        assert check_javascript(files, None, make_architecture([])) == []
+        assert check_javascript(files, None, None) == []
 
     def test_unresolvable_url_skipped_without_finding(self):
         files = {
@@ -175,7 +175,7 @@ class TestNoFalsePositives:
                 'function go(url) { fetch(url).then(r => r.json()); }\n'
         }
         arch = make_architecture([("GET", "/api/v1/todos")])
-        assert check_javascript(files, None, arch, "") == []
+        assert check_javascript(files, None, arch) == []
 
 
 class TestPipelineVerdict:
@@ -213,7 +213,7 @@ class TestRunAllChecksIntegration:
             "output/frontend/app.js": "function broken( {}\n",
             "output/backend/api/todo.py": "x = 1\n",
         }
-        findings = run_all_checks(files, None, architecture=make_architecture([]), dialect="")
+        findings = run_all_checks(files, None, architecture=make_architecture([]))
         assert any(f.check == "js_syntax" for f in findings)
 
     def test_clean_js_and_backend_zero_findings(self):
@@ -226,6 +226,5 @@ class TestRunAllChecksIntegration:
         findings = run_all_checks(
             files, None,
             architecture=make_architecture([("GET", "/api/v1/todos")]),
-            dialect="",
         )
         assert findings == []

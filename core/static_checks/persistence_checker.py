@@ -29,8 +29,6 @@ defaults and constructor-injected sessions look identical to stores statically.
 
 Every finding is an ERROR so the integration repair loop regenerates the file;
 the repair prompt carries the persistence contract excerpt.
-
-The dialect parameter is part of the uniform checker signature and is unused.
 """
 import ast
 from typing import Any
@@ -68,8 +66,7 @@ _SESSION_OPS = {"query", "execute", "commit", "rollback", "flush", "refresh", "s
 def check_persistence(
     files: dict[str, str],
     manifest: Any,
-    architecture: Any = None,
-    dialect: str = "",
+    architecture: Any,
 ) -> list[StaticFinding]:
     """Error findings for in-memory storage in backend files (every run has a database)."""
     contract = architecture.persistence_contract

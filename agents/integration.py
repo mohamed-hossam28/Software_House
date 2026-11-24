@@ -86,10 +86,8 @@ class IntegrationAgent(BaseAgent):
         for layer in ("backend", "frontend", "database"):
             files.update(getattr(ps.generated_code, layer, {}) or {})
 
-        dialect = str((ps.architecture.tech_stack or {}).get("database", "") or "")
-
         try:
-            findings = run_all_checks(files, ps.code_manifest, ps.architecture, dialect)
+            findings = run_all_checks(files, ps.code_manifest, ps.architecture)
         except Exception as exc:
             logger.exception("[IntegrationAgent] static checks crashed")
             findings = [StaticFinding(
@@ -110,7 +108,7 @@ class IntegrationAgent(BaseAgent):
                 len(errors),
             )
             _, rounds, repaired_files, survivors_by_file = self._repair_loop(
-                ps, files, errors, dialect
+                ps, files, errors
             )
             # Individual rounds re-check only the repaired file's findings while
             # retaining the full project as dependency/schema context. After all
@@ -118,7 +116,7 @@ class IntegrationAgent(BaseAgent):
             # cross-file errors and warnings before deriving the final verdict.
             try:
                 final_findings = run_all_checks(
-                    files, ps.code_manifest, ps.architecture, dialect
+                    files, ps.code_manifest, ps.architecture
                 )
             except Exception as exc:
                 logger.exception("[IntegrationAgent] final static checks crashed")
@@ -185,7 +183,6 @@ class IntegrationAgent(BaseAgent):
         ps: ProjectState,
         files: dict[str, str],
         errors: list[StaticFinding],
-        dialect: str,
     ) -> tuple[StaticVerdict, int, list[str], dict[str, list[StaticFinding]]]:
         """Repair error findings file by file, bounded rounds per file.
 
@@ -219,7 +216,7 @@ class IntegrationAgent(BaseAgent):
                 for _ in range(MAX_REPAIR_ROUNDS):
                     rounds += 1
                     file_errors = self._repair_round(
-                        ps, files, filepath, file_errors, dialect, refuse
+                        ps, files, filepath, file_errors, refuse
                     )
                     if not file_errors:
                         repaired.append(filepath)
@@ -240,7 +237,6 @@ class IntegrationAgent(BaseAgent):
         files: dict[str, str],
         filepath: str,
         file_errors: list[StaticFinding],
-        dialect: str,
         refuse: Any,
     ) -> list[StaticFinding]:
         """One repair attempt for *filepath*: prompt → LLM → safe-write → re-check.
@@ -288,7 +284,7 @@ class IntegrationAgent(BaseAgent):
         files[filepath] = written
 
         try:
-            rechecked = run_all_checks(files, ps.code_manifest, ps.architecture, dialect)
+            rechecked = run_all_checks(files, ps.code_manifest, ps.architecture)
         except Exception as exc:
             logger.error("[IntegrationAgent] re-check crashed for %s: %s", filepath, exc)
             return file_errors          # keep the pre-repair findings as survivors
