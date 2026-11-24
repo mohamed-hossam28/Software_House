@@ -13,20 +13,11 @@ Execution model:
   - Tasks are sorted by priority (lower number = higher priority).
   - Tasks sharing the same priority level run in parallel via ThreadPoolExecutor.
   - A single Lock guards all writes to ProjectState.
-  - Each task produces one migration file + a <manifest> block.
+  - Each task produces one ORM model file + a <manifest> block.
 
-Rules enforced (see system prompt):
-  1.  Table/column names match Architecture schema exactly (snake_case).
-  2.  FKs only reference tables in the same migration set; dependency order via priority.
-  3.  PK type is UUID unless Architecture specifies otherwise.
-  4.  Every table gets created_at / updated_at unless the task says otherwise.
-  5.  No invented tables or columns — flag suggestions in manifest summary.
-  6.  All nullable/non-nullable constraints must be explicit.
-  7.  No DROP TABLE or destructive DDL unless task explicitly requests rollback.
-  8.  Index on every FK column.
-  9.  No hardcoded environment values (DB name, host, credentials).
-  10. Each migration is self-contained given its declared depends_on.
-  11. Manifest export lists exact table name, column names, and types.
+The system prompt is rendered from the Persistence Contract: it names the
+contract's database and ORM, the model directory and the connection module's
+import line, and describes only ORM model files (the ORM creates the schema).
 """
 
 import os
@@ -60,6 +51,7 @@ from core.state import (
     ClassName,
     FunctionName,
     PersistenceContract,
+    connection_import_line,
     render_persistence_contract,
 )
 
@@ -92,39 +84,38 @@ def _system_prompt_for(arch: Any) -> str:
 
 
 def _build_system_prompt(contract: PersistenceContract) -> str:
+    """System prompt rendered from the Persistence Contract: ORM model files only."""
+    orm = contract.orm
     return f"""\
 You are an expert database engineer specialising in {_db_tech(contract)}.
-Generate a complete, runnable database migration file AND a structured manifest block.
+Generate one complete {orm} ORM model file AND a structured manifest block.
+Model files live under `{contract.model_dir}` (relative to the backend Layer root).
+{orm} creates the schema from these models when the init command runs, so model
+files are the only database files you write.
 
 {_orm_constraint_block(contract)}
 
 {render_persistence_contract(contract)}
 
-## Strict Rules
-1.  Table and column names MUST match the Architecture database_schema_overview EXACTLY
+## Model Rules
+1.  Model and field names MUST match the Architecture database_schema_overview EXACTLY
     (snake_case throughout, no renaming, no pluralisation changes, no casing changes).
-2.  Every foreign key must reference a table that exists in the same migration set.
-    Never reference a table not defined in the manifest. Respect priority/depends_on ordering.
-3.  Primary keys use UUID type by default unless Architecture explicitly specifies otherwise.
-    This must be consistent across ALL tables so backend models match everywhere.
-4.  Every table must include `created_at` and `updated_at` TIMESTAMP columns
-    unless the task explicitly says otherwise.
-5.  Never invent additional tables or columns not present in the task or schema overview.
-    Any suggested additions must appear in the manifest `suggested_additions` field only —
-    never silently added to the migration.
-6.  All nullable vs non-nullable constraints must be explicit (NOT NULL or NULL keyword).
-    Never leave a column's nullability ambiguous.
-7.  Never write DROP TABLE or any destructive operation unless the task explicitly requests
-    a rollback/down migration.
-8.  Include an index on every foreign key column.
-9.  Never hardcode environment-specific values (database name, host, credentials).
-    Migrations must be portable across environments.
-10. Each migration file must be self-contained and runnable in isolation given its
-    declared dependencies — no implicit ordering assumptions beyond depends_on.
-11. The manifest export section must list the exact table name and exact column names
-    + types — this is what the Backend model-writing step reads to build SQLAlchemy models.
+2.  Relationships reference only models planned in the Code Manifest.
+    Respect priority/depends_on ordering.
+3.  Primary keys use UUIDs by default unless the Architecture explicitly specifies otherwise,
+    consistently across ALL models.
+4.  Every model has `created_at` and `updated_at` timestamp fields unless the task
+    explicitly says otherwise.
+5.  Never invent models or fields not present in the task or schema overview.
+    Suggested additions go in the manifest `suggested_additions` field only.
+6.  Make every field's optionality explicit.
+7.  Model files only declare models: they never create engines, sessions or clients and
+    never read the database URL. Code that needs the database imports it with
+    `{connection_import_line(contract)}`.
+8.  The manifest lists the exact model name and exact field names + types — the backend
+    reads it to use these models.
 
-Return JSON: {{"migration_code":"<full script>","manifest":{{"table_name":"<tbl>","columns":[{{"name":"<col>","type":"<type>","nullable":true|false,"primary_key":true|false,"foreign_key":"<table.col or null>"}}],"indexes":["<col>"],"exports":["<tbl>"],"suggested_additions":[]}},"functions":[{{"name":"<func>","arguments":[{{"name":"<p>","type":"<t>","default":""}}],"return_type":"<t>","docstring":"<desc>"}}]}}
+Return JSON: {{"migration_code":"<full source of the {orm} model file>","manifest":{{"table_name":"<tbl>","columns":[{{"name":"<col>","type":"<type>","nullable":true|false,"primary_key":true|false,"foreign_key":"<table.col or null>"}}],"indexes":["<col>"],"exports":["<tbl>"],"suggested_additions":[]}},"functions":[{{"name":"<func>","arguments":[{{"name":"<p>","type":"<t>","default":""}}],"return_type":"<t>","docstring":"<desc>"}}]}}
 No prose outside the JSON object.
 """
 
@@ -190,7 +181,7 @@ def _build_file_prompt(
     import_contract = build_import_contract(manifest, filepath)
 
     return f"""\
-## Migration File to Generate
+## Model File to Generate
 - **File Path** : `{filepath}`
 - **Purpose**   : {purpose}
 - **Exports**   : {exports}
@@ -218,7 +209,7 @@ def _build_file_prompt(
 {manifest_ctx}
 
 ---
-Generate the complete migration for `{filepath}`.
+Generate the complete {arch.persistence_contract.orm} model file `{filepath}`.
 Follow ALL rules in the system prompt.
 Return a single JSON object with keys: migration_code, manifest, functions.
 ```json
@@ -239,7 +230,7 @@ def _render_manifest_xml(manifest_data: dict) -> str:
 
 class DatabaseAgent(BaseAgent):
     """
-    Priority-staged, parallel database migration generator.
+    Priority-staged, parallel ORM model file generator.
 
     Execution order:
       - Tasks are sorted by priority (ascending).
@@ -258,7 +249,7 @@ class DatabaseAgent(BaseAgent):
     # ── Trivial batch worker ──────────────────────────────────────────────────
 
     def _build_batch_prompt(self, tasks: list[Task], manifest: Any, arch: Any, db_tech: str) -> str:
-        """Compact batch prompt for 2-3 trivial DB migration files — returns a JSON array."""
+        """Compact batch prompt for 2-3 trivial ORM model files — returns a JSON array."""
         entries: list[str] = []
         for task in tasks:
             fm = manifest.by_task(task.id)
@@ -272,15 +263,15 @@ class DatabaseAgent(BaseAgent):
             )
         batch_desc = "\n\n".join(entries)
         return (
-            f"Generate the following {len(tasks)} trivial/boilerplate {db_tech} migration files.\n\n"
+            f"Generate the following {len(tasks)} trivial/boilerplate {db_tech} model files.\n\n"
             f"{batch_desc}\n\n"
             "Return a JSON ARRAY (not object) — one element per file in the same order:\n"
-            '[{"filepath":"<path>","migration_code":"<full SQL/migration>","manifest":{},"functions":[]}, ...]\n'
+            '[{"filepath":"<path>","migration_code":"<full source of the model file>","manifest":{},"functions":[]}, ...]\n'
             "```json\n"
         )
 
     def _process_batch(self, tasks: list[Task], state: ProjectState, lock: Lock) -> None:
-        """Single LLM call for a batch of trivial DB migration files."""
+        """Single LLM call for a batch of trivial ORM model files."""
         with lock:
             manifest = state.code_manifest
             arch = state.architecture
