@@ -22,7 +22,7 @@ from threading import Lock
 from typing import Any, NamedTuple
 
 from .base import BaseAgent
-from agents.utils import _as_list
+from agents.utils import as_list
 from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, build_persistence_contract, persistence_mandate, DEFAULT_DATABASE, is_supported_database
 
 logger = logging.getLogger(__name__)
@@ -513,10 +513,10 @@ class ArchitectureAgent(BaseAgent):
 
         ps.architecture = ArchData(
             tech_stack               = merged_stack,
-            system_components        = _as_list(results.get("system_components", [])),
+            system_components        = as_list(results.get("system_components", [])),
             api_contracts            = _validated_contracts(results.get("api_contracts", [])),
             database_schema_overview = str(results.get("database_schema_overview", "")).strip(),
-            security_requirements    = _as_list(results.get("security_requirements", [])),
+            security_requirements    = as_list(results.get("security_requirements", [])),
             deployment_strategy      = "",
             diagrams                 = [],
             complexity_tier          = str(results.get("complexity_tier", "STANDARD")),

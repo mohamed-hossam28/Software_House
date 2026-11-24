@@ -33,15 +33,10 @@ returns only the changed fields as a diff dict.
 """
 import logging
 import os
-import threading
 from typing import Any
 
-from agents.base import (
-    BaseAgent,
-    agent_refuse_corrupt,
-    build_import_contract,
-    filter_api_contracts_by_relevance,
-)
+from agents.base import BaseAgent
+from agents.coding_loop import build_import_contract, filter_api_contracts_by_relevance
 from core.state import (
     FindingSeverity,
     ProjectState,
@@ -55,6 +50,11 @@ from core.static_checks import run_all_checks
 from core.static_checks.persistence_checker import PERSISTENCE_CHECKS
 
 logger = logging.getLogger(__name__)
+
+
+def _log_refused_write(filepath: str, conflict: dict) -> None:
+    """Log a refused safe-write so the corruption is visible in the run logs."""
+    logger.warning("[safe-write] REFUSED corrupted content for %s: %s", filepath, conflict.get("reason"))
 
 #: Maximum repair rounds per file. An unrepairable file stops after this many.
 MAX_REPAIR_ROUNDS = 2
@@ -204,7 +204,7 @@ class IntegrationAgent(BaseAgent):
         for finding in errors:
             if not finding.file:
                 survivors.setdefault("", []).append(finding)
-        refuse = agent_refuse_corrupt(ps, threading.Lock())
+        refuse = _log_refused_write
 
         for owner, owned_files in by_owner.items():
             logger.info(

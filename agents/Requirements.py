@@ -1,6 +1,6 @@
 import logging
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
-from agents.utils import _as_list
+from agents.utils import as_list
 from providers.llm.base import BaseLLMProvider
 from core.state import ProjectState, SRSData
 
@@ -130,7 +130,7 @@ class RequirementsAgent(BaseAgent):
             state.log_error(self.name, f"JSON parse/validation error: {exc}")
             return state
         
-        clarifying_questions = _as_list(data.get("clarifying_questions", []))
+        clarifying_questions = as_list(data.get("clarifying_questions", []))
  
         # ── Check for missing structural keys ──────────────────────────
         structural_keys = {
@@ -180,11 +180,11 @@ class RequirementsAgent(BaseAgent):
         # assumptions AND still want to confirm something with the human.
         state.requirements = SRSData(
             raw_prompt                   = state.requirements.raw_prompt,
-            functional_requirements      = _as_list(data["functional_requirements"]),
-            non_functional_requirements  = _as_list(data["non_functional_requirements"]),
-            constraints                  = _as_list(data["constraints"]),
-            assumptions                  = _as_list(data["assumptions"]),
-            out_of_scope                 = _as_list(data["out_of_scope"]),
+            functional_requirements      = as_list(data["functional_requirements"]),
+            non_functional_requirements  = as_list(data["non_functional_requirements"]),
+            constraints                  = as_list(data["constraints"]),
+            assumptions                  = as_list(data["assumptions"]),
+            out_of_scope                 = as_list(data["out_of_scope"]),
             clarifying_questions         = clarifying_questions,
             is_complete                  = len(clarifying_questions) == 0,
         )
@@ -244,12 +244,12 @@ if __name__ == "__main__":
 
     from core.state import ProjectState, SRSData
 
-    # ── _as_list helper ─────────────────────────────────────────────────────────
-    assert _as_list(None)          == [],           "FAIL: None should give []"
-    assert _as_list([])            == [],           "FAIL: empty list should give []"
-    assert _as_list(["a", "b"])    == ["a", "b"],   "FAIL: list passthrough"
-    assert _as_list("single")      == ["single"],   "FAIL: scalar wrap"
-    print("[PASS] _as_list — None, empty list, list, scalar")
+    # ── as_list helper ─────────────────────────────────────────────────────────
+    assert as_list(None)          == [],           "FAIL: None should give []"
+    assert as_list([])            == [],           "FAIL: empty list should give []"
+    assert as_list(["a", "b"])    == ["a", "b"],   "FAIL: list passthrough"
+    assert as_list("single")      == ["single"],   "FAIL: scalar wrap"
+    print("[PASS] as_list — None, empty list, list, scalar")
 
     # ── _parse_response: happy path ─────────────────────────────────────────────
     good_json = json.dumps({

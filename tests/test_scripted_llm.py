@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from agents.coding_request import request_header
+from agents.coding_loop import request_header
 from providers.llm.llmFactory import LLMFactory
 from providers.llm.scripted import ScriptedLLMProvider, UnscriptedRequestError
 

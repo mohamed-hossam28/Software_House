@@ -16,16 +16,18 @@ import logging
 from threading import Lock
 from typing import Any
 
-from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF, build_barrel_content, is_barrel_file
+from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 from providers.llm.base import BaseLLMProvider
 from core.workspace import (
-    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, dotted_import, reroot, workspace_path,
+    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, dotted_import, relative_import, reroot,
+    workspace_path,
 )
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
     CONNECTION_MODULE_EXPORTS, build_connection_module, build_env_example,
     persistence_mandate, render_persistence_contract,
 )
+import os
 import re
 
 logger = logging.getLogger(__name__)
@@ -817,6 +819,68 @@ def _inject_persistence_seam(
                 t.depends_on = t.depends_on + [tid]
 
     return next_tasks, next_manifest
+
+
+_BARREL_NAMES = frozenset({
+    "__init__.py",
+    "index.ts", "index.tsx", "index.js", "index.jsx",  # barrel / re-export files
+})
+
+
+def is_barrel_file(filepath: str | None) -> bool:
+    """True for package/barrel re-export files (`__init__.py`, `index.ts|js|tsx|jsx`)."""
+    return os.path.basename(filepath or "").lower() in _BARREL_NAMES
+
+
+def build_barrel_content(filepath: str, manifest: Any) -> str:
+    """
+    Re-export content for a barrel file (`__init__.py` / `index.*`), planned as
+    its Planned Content so wiring-critical files are never guessed by the LLM.
+
+    Re-exports come from the Planner's import graph first; when the planner gave
+    no graph, falls back to re-exporting same-directory sibling exports.
+    """
+    if not hasattr(manifest, "files"):
+        return ""
+    fm = manifest.files.get(filepath)
+    if fm is None:
+        return ""
+    imports_from = getattr(fm, "imports_from", {}) or {}
+
+    sources: list[tuple[str, list[str]]] = []
+    for src_raw, names in imports_from.items():
+        src = workspace_path(src_raw)
+        if src not in manifest.files or src == filepath:
+            continue
+        sources.append((src, [str(n) for n in names if str(n).strip()]))
+
+    if not sources:
+        sibling_dir = os.path.dirname(filepath)
+        for src, sfm in sorted(manifest.files.items()):
+            if src == filepath or os.path.dirname(src) != sibling_dir:
+                continue
+            ex = [e for e in (getattr(sfm, "exports", None) or []) if str(e).strip()]
+            if ex:
+                sources.append((src, list(ex)))
+
+    if not sources:
+        return ""
+
+    if filepath.endswith("__init__.py"):
+        lines: list[str] = []
+        for src, names in sources:
+            if names:
+                lines.append(f"from {dotted_import(src)} import {', '.join(names)}")
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    lines = []
+    for src, names in sources:
+        rel = relative_import(filepath, src)
+        if names:
+            lines.append(f"export {{ {', '.join(names)} }} from '{rel}'")
+        else:
+            lines.append(f"export * from '{rel}'")
+    return "\n".join(lines) + "\n"
 
 
 def _model_modules(manifest_files: dict[str, FileManifest]) -> list[str]:

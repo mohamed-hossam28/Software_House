@@ -1,118 +1,90 @@
-import json
-
+"""
+Coding-loop replies are validated against the profile's response schema: a
+valid reply is written as is, an invalid one goes through the repair pipeline,
+and one that cannot be repaired is an error that writes nothing.
+"""
 import pytest
 
-from agents.backend import BackendAgent
-from agents.frontend import FrontendAgent
-from core.state import ArchData, CodeManifest, FileManifest, ProjectState, Task, TaskList
-from providers.llm.base import BaseLLMProvider, LLMResponse
+from agents.backend import BACKEND_PROFILE
+from agents.coding_loop import CodingAgent
+from agents.data_base import DATABASE_PROFILE
+from agents.frontend import FRONTEND_PROFILE
+from core.state import ArchData, CodeManifest, FileManifest, ProjectState, Task, TaskList, build_persistence_contract
+from providers.llm.scripted import ScriptedLLMProvider
+
+#: Per profile: a file it generates in a single call and a valid reply for it.
+CASES = {
+    "backend": (BACKEND_PROFILE, "output/backend/app/services/todo.py",
+                {"code": "generated_code = 1", "classes": [], "functions": []}),
+    "frontend": (FRONTEND_PROFILE, "output/frontend/src/components/Todo.tsx",
+                 {"code": "export const generated = 1;", "classes": [], "functions": []}),
+    "database": (DATABASE_PROFILE, "output/backend/app/models/todo.py",
+                 {"migration_code": "generated_code = 1", "functions": []}),
+}
+#: Valid JSON, but missing every profile's code key.
+INVALID_REPLY = {"classes": [], "functions": []}
 
 
-class QueuedProvider(BaseLLMProvider):
-    def __init__(self, responses: list[dict]) -> None:
-        self.responses = [json.dumps(response) for response in responses]
-        self.calls: list[tuple[str, str]] = []
-
-    @property
-    def provider_name(self) -> str:
-        return "queued"
-
-    def complete(
-        self,
-        system_prompt: str,
-        user_message: str,
-        model: str = "",
-        max_tokens: int = 8192,
-        temperature: float = 0.2,
-        stream: bool = False,
-        chunk_callback=None,
-    ) -> LLMResponse:
-        self.calls.append((system_prompt, user_message))
-        return LLMResponse(
-            text=self.responses.pop(0),
-            input_tokens=1,
-            output_tokens=1,
-        )
-
-
-def make_state(agent_name: str) -> tuple[ProjectState, str]:
-    task_id = "be-001" if agent_name == "backend" else "fe-001"
-    filepath = (
-        "output/backend/services/todo.py"
-        if agent_name == "backend"
-        else "output/frontend/components/Todo.tsx"
-    )
+def _state(agent: str, filepath: str) -> ProjectState:
     state = ProjectState(project_id="schema-test", project_name="Schema Test")
     state.architecture = ArchData(
-        tech_stack={"backend": "FastAPI", "frontend": "React + TypeScript"}
+        tech_stack={"backend": "FastAPI", "frontend": "React + TypeScript", "database": "SQLite 3"},
+        persistence_contract=build_persistence_contract("SQLite 3"),
     )
-    state.tasks = TaskList(
-        tasks=[
-            Task(
-                id=task_id,
-                agent=agent_name,
-                title="Generate todo implementation",
-                description="Generate one non-trivial file",
-                depends_on=[],
-                priority=1,
-            )
-        ]
-    )
-    state.code_manifest = CodeManifest(
-        files={
-            filepath: FileManifest(
-                agent=agent_name,
-                task_id=task_id,
-                filepath=filepath,
-                purpose="Todo implementation",
-                # Three exports keep this at the per-file seam rather than the
-                # trivial-file batch path.
-                exports=["Todo", "createTodo", "listTodos"],
-            )
-        }
-    )
-    return state, filepath
+    state.tasks = TaskList(tasks=[
+        Task(id="t-001", agent=agent, title="Generate todo implementation", description="", priority=1),
+    ])
+    state.code_manifest = CodeManifest(files={
+        filepath: FileManifest(agent=agent, task_id="t-001", filepath=filepath, purpose="Todo implementation",
+                               exports=["Todo", "createTodo", "listTodos"]),
+    })
+    return state
 
 
-@pytest.mark.parametrize(
-    ("agent_cls", "agent_name", "module_name"),
-    [
-        (BackendAgent, "backend", "agents.backend"),
-        (FrontendAgent, "frontend", "agents.frontend"),
-    ],
-)
-def test_valid_per_file_output_passes_without_repair(
-    workspace, agent_cls, agent_name, module_name
-):
-    provider = QueuedProvider([{"code": "generated_code = 1", "classes": [], "functions": []}])
-    state, filepath = make_state(agent_name)
-    agent_cls(provider=provider, workspace=workspace).run(state)
-
-    assert state.generated_code.model_dump()[agent_name][filepath] == "generated_code = 1"
-    assert len(provider.calls) == 1
+def _code(profile, reply: dict) -> str:
+    return reply[profile.code_key]
 
 
-@pytest.mark.parametrize(
-    ("agent_cls", "agent_name", "module_name"),
-    [
-        (BackendAgent, "backend", "agents.backend"),
-        (FrontendAgent, "frontend", "agents.frontend"),
-    ],
-)
-def test_schema_invalid_per_file_output_uses_repair_pipeline(
-    workspace, agent_cls, agent_name, module_name
-):
-    provider = QueuedProvider(
-        [
-            {"classes": [], "functions": []},  # valid JSON, invalid file schema
-            {"code": "repaired_code = 1", "classes": [], "functions": []},
-        ]
-    )
-    state, filepath = make_state(agent_name)
-    agent_cls(provider=provider, workspace=workspace).run(state)
+@pytest.mark.parametrize("agent", sorted(CASES))
+def test_a_valid_reply_is_written_without_repair(agent, workspace):
+    profile, filepath, reply = CASES[agent]
+    state = _state(agent, filepath)
+    fake = ScriptedLLMProvider(agent, files={filepath: reply})
 
-    assert state.generated_code.model_dump()[agent_name][filepath] == "repaired_code = 1"
-    assert len(provider.calls) == 2
-    repair_system, repair_prompt = provider.calls[1]
-    assert "repairs JSON syntax" in repair_system
-    assert "Expected JSON schema" in repair_prompt
+    CodingAgent(profile, provider=fake, retries=1, workspace=workspace).run(state)
+
+    assert [r.files for r in fake.requests] == [[filepath]]
+    assert workspace.abs_path(filepath).read_text(encoding="utf-8") == _code(profile, reply)
+    assert getattr(state.generated_code, agent)[filepath] == _code(profile, reply)
+    assert state.code_manifest.files[filepath].written
+
+
+@pytest.mark.parametrize("agent", sorted(CASES))
+def test_a_schema_invalid_reply_goes_through_the_repair_pipeline(agent, workspace):
+    profile, filepath, reply = CASES[agent]
+    state = _state(agent, filepath)
+    fake = ScriptedLLMProvider(agent, files={filepath: INVALID_REPLY}, calls=[reply])
+
+    CodingAgent(profile, provider=fake, retries=1, workspace=workspace).run(state)
+
+    file_request, repair_request = fake.requests
+    assert file_request.files == [filepath]
+    assert repair_request.files == []
+    assert "repairs JSON syntax" in repair_request.system_prompt
+    assert "Expected JSON schema" in repair_request.user_message
+    assert workspace.abs_path(filepath).read_text(encoding="utf-8") == _code(profile, reply)
+    assert state.code_manifest.files[filepath].written
+
+
+@pytest.mark.parametrize("agent", sorted(CASES))
+def test_an_unrepairable_reply_is_an_error_and_writes_nothing(agent, workspace):
+    profile, filepath, _ = CASES[agent]
+    state = _state(agent, filepath)
+    fake = ScriptedLLMProvider(agent, files={filepath: INVALID_REPLY}, calls=[INVALID_REPLY])
+
+    CodingAgent(profile, provider=fake, retries=1, workspace=workspace).run(state)
+
+    assert not workspace.abs_path(filepath).exists()
+    assert not state.code_manifest.files[filepath].written
+    assert filepath not in getattr(state.generated_code, agent)
+    assert any(filepath in e["message"] for e in state.errors), state.errors

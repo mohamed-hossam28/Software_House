@@ -5,7 +5,7 @@ agent sends, naming the file (or, for a batch, each file) it asks for.
 import pytest
 
 from agents.backend import BackendAgent
-from agents.coding_request import parse_request_header, request_header
+from agents.coding_loop import parse_request_header, request_header
 from agents.data_base import DatabaseAgent
 from agents.frontend import FrontendAgent
 from core.state import ArchData, FileManifest, ProjectState, Task

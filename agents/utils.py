@@ -3,12 +3,9 @@ Utility functions for agents.
 """
 import hashlib
 import os
-import re
 from typing import Any
 
 from core.workspace import Workspace
-
-_ESCAPED_CHAR_RE = re.compile(r"\\(?:[\"\\/bfnrt]|u[0-9a-fA-F]{4})")
 
 
 def as_list(value: Any) -> list[str]:
@@ -289,7 +286,3 @@ def resolve_stages(tasks: list[Any], use_priority: bool = False) -> list[list[An
 
     return stages
 
-
-# Aliases for backward compatibility across agents
-_as_list = as_list
-_parse_metadata = parse_metadata

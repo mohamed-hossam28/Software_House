@@ -775,6 +775,18 @@ class ProjectState(BaseModel):
             "ts": datetime.utcnow().isoformat(),
         })
  
+    def record_written(
+        self,
+        agent: str,
+        filepath: str,
+        code: str,
+        classes: list[ClassName] | None = None,
+        functions: list[FunctionName] | None = None,
+    ) -> None:
+        """Record a Coding agent's written file: its code in the agent's bucket, its File Manifest Written."""
+        getattr(self.generated_code, agent)[filepath] = code
+        self.code_manifest.mark_written(filepath, classes, functions)
+
     def mark_agent_start(self, agent: str) -> None:
         self.current_agent = agent
         self.metrics.agent_durations.setdefault(agent, 0.0)

@@ -7,7 +7,7 @@ per agent, and the instance's agent name is how errors identify the agent.
 
 Scripting:
   - Coding agents by file path: ``files={path: reply}``. The file(s) a request
-    asks for are read from its coding request header (agents/coding_request.py).
+    asks for are read from its coding request header (agents/coding_loop.py).
     A single-file request gets that file's reply; a batch gets a JSON array of
     the files' replies in header order, each carrying its ``filepath``.
   - Single-call agents (requirements, architecture, planner, repair) by call:
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from agents.coding_request import parse_request_header
+from agents.coding_loop import parse_request_header
 from providers.llm.base import BaseLLMProvider, LLMResponse
 
 Reply = Any  # dict | list | str

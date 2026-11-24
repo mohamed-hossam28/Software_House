@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest
 
-from agents.base import build_import_contract
+from agents.coding_loop import build_import_contract
 from agents.planner import PlannerAgent
 from core.state import ArchData, ProjectState, build_persistence_contract, connection_import_line
 from core.workspace import connection_module_path
