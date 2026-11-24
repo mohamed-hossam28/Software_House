@@ -13,7 +13,6 @@ PASS 2 — Deterministic task generation (no LLM).
 """
 
 import logging
-import time
 from threading import Lock
 from typing import Any
 
@@ -21,7 +20,6 @@ from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES,
 from providers.llm.base import BaseLLMProvider
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
-    diff_state,
     CONNECTION_MODULE_EXPORTS, build_env_example, persistence_mandate,
     render_persistence_contract,
 )
@@ -956,11 +954,7 @@ class PlannerAgent(BaseAgent):
 
 
     # ── Main execution ───────────────────────────────────────────────────────
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
+    def _work(self, ps: ProjectState) -> None:
         arch = ps.architecture
         lock = Lock()
 
@@ -986,8 +980,7 @@ class PlannerAgent(BaseAgent):
         except Exception as exc:
             logger.error("[PlannerAgent] skeleton call failed: %s", exc)
             ps.log_error(self.name, f"skeleton call failed: {exc}")
-            ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return diff_state(before, ps)
+            return
 
         skeleton = data.get("skeleton", []) if isinstance(data, dict) else []
         logger.info("[PlannerAgent] ✓ skeleton produced (%d files)", len(skeleton))
@@ -995,8 +988,7 @@ class PlannerAgent(BaseAgent):
             msg = "No skeleton produced — check LLM response."
             logger.error("[PlannerAgent] %s", msg)
             ps.log_error(self.name, msg)
-            ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return diff_state(before, ps)
+            return
 
         # ── PASS 2: deterministic task generation (no LLM) ─────────────────
         warnings: list[str] = []
@@ -1009,8 +1001,7 @@ class PlannerAgent(BaseAgent):
             msg = "No valid tasks produced — check LLM response."
             logger.error("[PlannerAgent] %s", msg)
             ps.log_error(self.name, msg)
-            ps.metrics.agent_durations[self.name] = round(time.perf_counter() - t0, 3)
-            return diff_state(before, ps)
+            return
 
         manifest_files = _build_manifest(tasks, skeleton, arch)
 
@@ -1034,16 +1025,13 @@ class PlannerAgent(BaseAgent):
         ps.tasks = TaskList(tasks=synced_tasks)
         ps.code_manifest = CodeManifest(files=manifest_files)
 
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
         counts = {a: len(ps.tasks.by_agent(a)) for a in VALID_AGENTS}
         logger.info(
-            "[PlannerAgent] %d tasks in %.2fs — db:%d be:%d fe:%d | manifest:%d",
-            len(tasks), duration,
+            "[PlannerAgent] %d tasks — db:%d be:%d fe:%d | manifest:%d",
+            len(tasks),
             counts["database"], counts["backend"], counts["frontend"],
             len(manifest_files),
         )
-        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗

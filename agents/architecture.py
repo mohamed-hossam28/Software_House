@@ -17,14 +17,12 @@ overrides a resolved layer (merge_tech_stack).
 """
 
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
 from typing import Any
 
 from .base import BaseAgent
 from agents.utils import _as_list
-from core.state import diff_state
 from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, resolve_db_tooling, build_persistence_contract, UnknownDatabaseError, persistence_mandate
 
 logger = logging.getLogger(__name__)
@@ -445,13 +443,7 @@ class ArchitectureAgent(BaseAgent):
                 state.log_error(self.name, f"api_contracts sub-call failed: {exc}")
 
     # ── Main execution ───────────────────────────────────────────────────────
-    def run(self, state: dict | ProjectState) -> dict[str, Any]:  # type: ignore[override]
-        ps = state if isinstance(state, ProjectState) else ProjectState(**state)
-        before = ps.model_copy(deep=True)
-
-        ps.mark_agent_start(self.name)
-        t0 = time.perf_counter()
-
+    def _work(self, ps: ProjectState) -> None:
         # Resolve tech stack deterministically (no LLM needed)
         authoritative_stack = TechStackResolver.resolve(ps)
         stack_table = _tech_stack_table(authoritative_stack)
@@ -518,16 +510,12 @@ class ArchitectureAgent(BaseAgent):
             persistence_contract     = persistence_contract,
         )
 
-        duration = time.perf_counter() - t0
-        ps.metrics.agent_durations[self.name] = round(duration, 3)
         logger.info(
-            "[ArchitectureAgent] architecture complete in %.2fs — "
+            "[ArchitectureAgent] architecture complete — "
             "%d components, %d endpoints.",
-            duration,
             len(ps.architecture.system_components),
             len(ps.architecture.api_contracts),
         )
-        return diff_state(before, ps)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
