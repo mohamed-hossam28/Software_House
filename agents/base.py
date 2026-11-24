@@ -626,7 +626,6 @@ class BaseAgent(ABC):
         with lock:
             getattr(state.generated_code, self.code_bucket)[filepath] = written_code
             state.code_manifest.mark_written(filepath, [], [])
-            state.completed_task_ids.add(task_id)
         logger.info("[%s] ✓ %s (deterministic): %s", self.name, kind, filepath)
 
     @property
@@ -799,14 +798,6 @@ class BaseAgent(ABC):
             if key == "current_agent":
                 if after_dict["current_agent"] != before_dict["current_agent"]:
                     diff["current_agent"] = after_dict["current_agent"]
-                continue
-
-            if key == "completed_task_ids":
-                b_ids = set(before_dict.get("completed_task_ids") or [])
-                a_ids = set(after_dict.get("completed_task_ids") or [])
-                new_ids = a_ids - b_ids
-                if new_ids:
-                    diff["completed_task_ids"] = list(new_ids)
                 continue
 
             if before_dict[key] != after_dict[key]:

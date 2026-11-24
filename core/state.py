@@ -69,13 +69,6 @@ def pick_latest_agent(current: str, update: str) -> str:
     return update if update else current
 
 
-def merge_completed_task_ids(a: Any, b: Any) -> set[str]:
-    """Merge set of completed task IDs across parallel node updates."""
-    set_a = set(a) if isinstance(a, (set, list, tuple)) else set()
-    set_b = set(b) if isinstance(b, (set, list, tuple)) else set()
-    return set_a | set_b
-
-
 def merge_code_manifest(current: Any, update: Any) -> Any:
     """Merge CodeManifest entries across parallel node updates."""
     def _get_files(obj: Any) -> dict:
@@ -109,15 +102,6 @@ def merge_code_map(current: Any, update: Any) -> Any:
     if isinstance(current, dict) or isinstance(update, dict):
         return res.model_dump(mode="json")
     return res
-
-
-def merge_tasks(current: Any, update: Any) -> Any:
-    """Merge TaskList across parallel node updates."""
-    if not update:
-        return current
-    if not current:
-        return update
-    return update
 
 
 
@@ -454,7 +438,7 @@ class Task(BaseModel):
     title: str
     description: str
     depends_on: list[str] = Field(default_factory=list)             # task IDs
-    status: str = "pending"                                         # pending | in_progress | done
+    status: str = "pending"                                         # set by the Planner only; Written is the done signal
     priority: int = 1
  
  
@@ -588,7 +572,12 @@ class StaticFinding(BaseModel):
 
 
 class StaticVerdict(str, Enum):
-    """Outcome of the integration node's check/repair cycle."""
+    """Outcome of the integration node's check/repair cycle.
+
+    NOT_RUN is the default, so a run that never reached Integration can't be
+    mistaken for a passing one.
+    """
+    NOT_RUN  = "not_run"
     PASS     = "pass"
     REPAIRED = "repaired"
     FAILED   = "failed"
@@ -596,7 +585,7 @@ class StaticVerdict(str, Enum):
 
 class StaticChecks(BaseModel):
     """Accumulated result of the Integration Agent's static-check + repair cycle."""
-    verdict:        StaticVerdict = StaticVerdict.PASS
+    verdict:        StaticVerdict = StaticVerdict.NOT_RUN
     findings:       list[StaticFinding] = Field(default_factory=list)
     rounds:         int = 0                                          # repair rounds performed
     repaired_files: list[str] = Field(default_factory=list)
@@ -643,7 +632,7 @@ class ProjectState(BaseModel):
 
     requirements:    SRSData       = Field(default_factory=SRSData)
     architecture:    ArchData      = Field(default_factory=ArchData)
-    tasks:           Annotated[TaskList, merge_tasks] = Field(default_factory=TaskList)
+    tasks:           TaskList      = Field(default_factory=TaskList)       # Planner writes; coding agents only read
     code_manifest:   Annotated[CodeManifest, merge_code_manifest] = Field(default_factory=CodeManifest)   # ← file-level contracts
     generated_code:  Annotated[CodeMap, merge_code_map] = Field(default_factory=CodeMap)
     static_checks:   StaticChecks  = Field(default_factory=StaticChecks)
@@ -654,8 +643,7 @@ class ProjectState(BaseModel):
     # ── Supporting layers (parallel-safe via reducers) ──────────────────────
     metrics: Annotated[PerformanceMetrics, merge_performance_metrics] = Field(default_factory=PerformanceMetrics)
 
-    # ── Error tracking & completed tasks (parallel-safe via reducers) ───────
-    completed_task_ids: Annotated[set[str], merge_completed_task_ids] = Field(default_factory=set)
+    # ── Error tracking (parallel-safe via reducers) ─────────────────────────
     errors: Annotated[list[dict[str, str]], merge_errors] = Field(default_factory=list)     # [{agent, message, ts}]
     current_agent: Annotated[str, pick_latest_agent] = ""
 

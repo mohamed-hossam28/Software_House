@@ -384,7 +384,6 @@ class DatabaseAgent(BaseAgent):
                 code_bucket = getattr(state.generated_code, self.code_bucket)
                 code_bucket[fm.filepath] = code
                 state.code_manifest.mark_written(fm.filepath, classes, functions)
-                state.completed_task_ids.add(task.id)
             logger.info("[DBAgent] ✓ batch trivial: %s", fm.filepath)
 
     def _process_task(self, task: Task, state: ProjectState, lock: Lock) -> None:
@@ -475,7 +474,6 @@ class DatabaseAgent(BaseAgent):
         with lock:
             state.generated_code.database[filepath] = migration_code
             state.code_manifest.mark_written(filepath, classes=classes, functions=functions)
-            state.completed_task_ids.add(task.id)
 
         logger.info("[DBAgent] ✓ %s", filepath)
 
@@ -522,11 +520,8 @@ class DatabaseAgent(BaseAgent):
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
                 futures: list[Future] = []
                 for batch in batches:
-                    for t in batch:
-                        t.status = "in_progress"
                     futures.append(pool.submit(self._process_batch, batch, ps, state_lock))
                 for task in non_trivial:
-                    task.status = "in_progress"
                     futures.append(pool.submit(self._process_task, task, ps, state_lock))
 
                 for future in futures:

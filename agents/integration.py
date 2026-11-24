@@ -186,11 +186,7 @@ class IntegrationAgent(BaseAgent):
             len(repaired_files),
             len(files),
         )
-        # Always emit the verdict — a clean pass equals the default StaticChecks,
-        # so _compute_diff alone would drop it from the returned diff.
-        diff = self._compute_diff(before, ps)
-        diff["static_checks"] = ps.static_checks.model_dump(mode="json")
-        return diff
+        return self._compute_diff(before, ps)
 
     # ── Repair loop ────────────────────────────────────────────────────
 
