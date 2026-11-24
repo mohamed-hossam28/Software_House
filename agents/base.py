@@ -609,8 +609,8 @@ class BaseAgent(ABC):
     def _write_deterministic(
         self, task_id: str, filepath: str, content: str, kind: str, state: ProjectState, lock: Lock,
     ) -> None:
-        """Write non-LLM content (barrel, planned content, connection module) through
-        the workspace's write guard and mark the manifest entry written."""
+        """Write a File Manifest's Planned Content verbatim through the workspace's
+        write guard, record it and mark the File Manifest Written."""
         try:
             written_code = self.workspace.write(filepath, content, on_corrupt=agent_refuse_corrupt(state, lock))
         except Exception as exc:

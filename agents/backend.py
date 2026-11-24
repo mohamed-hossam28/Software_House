@@ -33,10 +33,10 @@ if _root_dir not in sys.path:
     sys.path.insert(0, _root_dir)
 
 try:
-    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
+    from .base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_import_contract, align_batch_items, build_pending_contracts
 except ImportError:
     # Fallback for direct execution
-    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, is_barrel_file, build_import_contract, build_barrel_content, align_batch_items, build_pending_contracts
+    from base import BaseAgent, agent_refuse_corrupt, filter_manifest_by_dependencies, filter_api_contracts_by_relevance, is_trivial_file, TRIVIAL_BATCH_SIZE, MAX_TREE_ENTRIES, MAX_MANIFEST_ENTRIES, build_project_file_tree, build_scaffold_context, is_scaffold_file, build_import_contract, align_batch_items, build_pending_contracts
 from agents.schemas.backend import BackendSchema
 from agents.utils import parse_metadata, resolve_stages
 
@@ -383,15 +383,9 @@ class BackendAgent(BaseAgent):
         filepath = file_manifest.filepath
         logger.info("[BackendAgent] Generating code for %s (task: %s) ...", filepath, task.id)
 
-        # Planner-synthesized content (e.g. `.env.example` from the persistence
-        # contract) and barrel files (`__init__.py`, `index.ts`, pure re-exports)
-        # are written deterministically. No LLM call, no guessing.
+        # Planned Content (barrels, `.env.example`) is written verbatim.
         if file_manifest.planned_content is not None:
             self._write_deterministic(task.id, filepath, file_manifest.planned_content, "planned content", state, lock)
-            return
-        if is_barrel_file(filepath):
-            content = build_barrel_content(filepath, manifest)
-            self._write_deterministic(task.id, filepath, content, "barrel", state, lock)
             return
 
         # Build prompt using current thread-safe snapshot of manifest and architecture stack
@@ -468,7 +462,6 @@ class BackendAgent(BaseAgent):
                 return (
                     is_trivial_file(t, ps.code_manifest)
                     and not is_scaffold_file(getattr(fm, "filepath", ""))
-                    and not is_barrel_file(getattr(fm, "filepath", ""))
                     and getattr(fm, "planned_content", None) is None
                 )
 

@@ -16,15 +16,15 @@ import logging
 from threading import Lock
 from typing import Any
 
-from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
+from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF, build_barrel_content, is_barrel_file
 from providers.llm.base import BaseLLMProvider
 from core.workspace import (
-    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, reroot, workspace_path,
+    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, dotted_import, reroot, workspace_path,
 )
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
-    CONNECTION_MODULE_EXPORTS, DEFAULT_DATABASE, build_env_example, persistence_mandate,
-    render_persistence_contract,
+    CONNECTION_MODULE_EXPORTS, DEFAULT_DATABASE, build_connection_module, build_env_example,
+    persistence_mandate, render_persistence_contract,
 )
 import re
 
@@ -826,6 +826,37 @@ def _inject_persistence_seam(
     return next_tasks, next_manifest
 
 
+def _model_modules(manifest_files: dict[str, FileManifest]) -> list[str]:
+    """Dotted modules of the database agent's ORM model files (under a models/ package) for create-all."""
+    return sorted(
+        dotted_import(path) for path, fm in manifest_files.items()
+        if fm.agent == "database" and "/models/" in path
+        and path.endswith(".py") and not is_barrel_file(path)
+    )
+
+
+def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> dict[str, FileManifest]:
+    """
+    Fix the Planned Content of every file whose content needs only planning data,
+    so no coding agent sends it to the LLM:
+      - barrel files (`__init__.py`, `index.*`): re-exports from the Code Manifest
+      - the connection module: synthesized from the Persistence Contract, with
+        create-all importing every planned ORM model module
+
+    Runs after every injection step, so it sees the complete Code Manifest.
+    """
+    manifest = CodeManifest(files=manifest_files)
+    for path, fm in manifest_files.items():
+        if fm.planned_content is None and is_barrel_file(path):
+            fm.planned_content = build_barrel_content(path, manifest)
+
+    contract = arch.persistence_contract
+    session = manifest_files.get(connection_module_path(contract))
+    if session is not None:
+        session.planned_content = build_connection_module(contract, _model_modules(manifest_files))
+    return manifest_files
+
+
 def _generate_tasks_from_skeleton(nodes: list[Any], warnings: list[str]) -> list[Task]:
     """
     Pass 2 — deterministic task generation from the skeleton (no LLM).
@@ -1003,6 +1034,9 @@ class PlannerAgent(BaseAgent):
 
         # Inject the committed project-scaffolding file set (Phase C3).
         tasks, manifest_files = _inject_project_files(tasks, manifest_files, arch)
+
+        # Barrels and the connection module are Planned Content (never the LLM).
+        manifest_files = _plan_content(manifest_files, arch)
 
         manifest_task_ids = {fm.task_id for fm in manifest_files.values()}
         synced_tasks = [t for t in tasks if t.id in manifest_task_ids]
