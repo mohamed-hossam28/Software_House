@@ -352,11 +352,11 @@ def test_full_two_pass_run_makes_one_call_and_plans_every_file():
     assert len(fake.requests) == 1
     tasks = state.tasks.tasks
     manifest = state.code_manifest.files
-    # 6 skeleton files + 2 scaffolds + 3 pinned project files + the connection module.
-    assert len(tasks) == 12
-    assert len(manifest) == 12
+    # 6 skeleton files + 2 scaffolds + 2 pinned project files + the connection module.
+    assert len(tasks) == 11
+    assert len(manifest) == 11
     for path in ("output/backend/main.py", "output/frontend/index.html",
-                 "output/backend/requirements.txt", "output/README.md", "output/backend/.env.example"):
+                 "output/backend/requirements.txt", "output/backend/.env.example"):
         assert path in manifest
 
     by_id = {t.id: t for t in tasks}
@@ -377,6 +377,29 @@ def test_full_two_pass_run_makes_one_call_and_plans_every_file():
     assert not [e for e in state.errors if "phantom import" not in e["message"]], state.errors
 
 
+# ── The README belongs to the docs node, not the plan ─────────────────────────
+
+def test_planner_output_has_no_readme_task():
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner()).run(state)
+
+    assert not [p for p in state.code_manifest.files if p.lower().endswith("readme.md")]
+    assert not [t for t in state.tasks.tasks if "readme" in t.title.lower()]
+
+
+def test_a_readme_in_the_skeleton_is_dropped_from_the_plan():
+    skeleton = {"skeleton": TODO_SKELETON["skeleton"] + [{
+        "id": "be-009", "agent": "backend", "title": "Project README",
+        "description": "Run instructions.", "file": "README.md",
+        "exports": [], "imports_from": {},
+    }]}
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner(skeleton)).run(state)
+
+    assert not [p for p in state.code_manifest.files if p.lower().endswith("readme.md")]
+    assert "be-009" not in {t.id for t in state.tasks.tasks}
+
+
 # ── Frontend serving convention ───────────────────────────────────────────────
 
 def test_skeleton_prompt_carries_the_frontend_serving_convention():
@@ -390,15 +413,11 @@ def test_skeleton_prompt_carries_the_frontend_serving_convention():
     assert "uvicorn" in system
 
 
-def test_readme_and_entrypoint_purposes_follow_the_serving_convention():
+def test_entrypoint_purpose_follows_the_serving_convention():
     state = _make_state()
     PlannerAgent(provider=scripted_planner()).run(state)
     manifest = state.code_manifest.files
 
-    readme = manifest["output/README.md"].purpose
-    assert "uvicorn" in readme
-    assert "http.server" in readme  # named only as the forbidden instruction
-    assert "open the frontend" not in readme
     tasks = {t.id: t for t in state.tasks.tasks}
     main = manifest["output/backend/main.py"]
     assert "StaticFiles(html=True)" in main.purpose + tasks[main.task_id].description
