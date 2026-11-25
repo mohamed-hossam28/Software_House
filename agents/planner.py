@@ -69,6 +69,14 @@ Layer roots (fixed — every path MUST start with one of them):
 - frontend/ — every frontend file, including package manifest and bundler config. The entrypoint
   is frontend/index.html.
 - README.md is the only file outside a Layer root.
+
+Frontend serving (fixed convention):
+- backend/main.py serves the frontend directory at `/` with StaticFiles(html=True)
+  (`app.mount("/", StaticFiles(directory=<frontend dir>, html=True))`), mounted AFTER every API route
+  is registered. No hand-written routes for frontend files, no `/static` mount.
+- HTML links its assets RELATIVELY (href="style.css", src="app.js"), never `/static/...`.
+- README.md run instructions: start the backend with `uvicorn main:app` (from backend/) and browse
+  to the served URL — uvicorn only, no `python -m http.server`, no opening index.html directly.
 """
 
 SKELETON_USER_TEMPLATE = """\
@@ -586,6 +594,13 @@ def _adopt_skeleton_anchors(
     return manifest_files
 
 
+#: How the backend entrypoint serves the frontend (the frontend serving convention).
+_SERVE_FRONTEND = (
+    "serves the frontend directory at / with StaticFiles(html=True), mounted after every API "
+    "route — no /static mount and no hand-written routes for frontend files."
+)
+
+
 def _next_task_id(prefix: str, existing_ids: set[str]) -> str:
     """Reserve and return the first free injected-task id ('<prefix>-900' upward)."""
     n = 900
@@ -622,12 +637,15 @@ def _inject_scaffold_tasks(
         next_tasks.append(Task(
             id=tid, agent="backend",
             title="Backend entrypoint (main.py)",
-            description="FastAPI application entry point that registers all routers, adds CORS, and serves static files.",
+            description=(
+                "FastAPI application entry point that registers all routers, adds CORS, and "
+                f"{_SERVE_FRONTEND}"
+            ),
             depends_on=list(backend_task_ids), priority=AGENT_PRIORITY["backend"], status="pending",
         ))
         next_manifest[be_main] = FileManifest(
             agent="backend", task_id=tid, filepath=be_main,
-            purpose="FastAPI application entry point — registers all routers and middleware.",
+            purpose=f"FastAPI application entry point — registers all routers and middleware, then {_SERVE_FRONTEND}",
             exports=["app"],
             imports_from={
                 p: ["router"] for p, fm in manifest_files.items()
@@ -641,12 +659,15 @@ def _inject_scaffold_tasks(
         next_tasks.append(Task(
             id=tid, agent="frontend",
             title="Frontend entrypoint (index.html)",
-            description="HTML entry point that loads every stylesheet and script in the correct order.",
+            description=(
+                "HTML entry point that loads every stylesheet and script in the correct order, "
+                "with relative links (href=\"style.css\", src=\"app.js\")."
+            ),
             depends_on=list(frontend_task_ids), priority=AGENT_PRIORITY["frontend"], status="pending",
         ))
         next_manifest[fe_index] = FileManifest(
             agent="frontend", task_id=tid, filepath=fe_index,
-            purpose="HTML entry point loading all stylesheets and scripts.",
+            purpose="HTML entry point loading all stylesheets and scripts by relative links (never /static/...).",
             exports=["index"],
         )
 
@@ -782,7 +803,12 @@ def _inject_project_files(
         (
             "output/README.md",
             "Project README (README.md)",
-            "Run instructions: install dependencies, start the backend, and open the frontend.",
+            (
+                "Run instructions: install dependencies, start the backend with "
+                "`uvicorn main:app` from backend/, and browse to the URL it serves (the backend "
+                "serves the frontend at /). uvicorn only: no `python -m http.server`, no "
+                "opening index.html directly."
+            ),
             ["readme"],
             None,
         ),
