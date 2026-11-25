@@ -134,8 +134,12 @@ def test_graph_runs_end_to_end_on_scripted_fakes_inside_the_temporary_workspace(
     assert _real_output_snapshot() == before
 
 
-#: Routes the backend writes broken; Integration repairs them before the docs node runs.
-BROKEN_ROUTES = "from fastapi import APIRouter\n\nrouter = APIRouter(\n"
+#: Routes the backend writes (valid Python, so the write guard keeps them) without the
+#: contract's GET /api/todos; Integration repairs them before the docs node runs.
+BROKEN_ROUTES = (
+    "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n"
+    "@router.get(\"/todos\")\ndef list_todos():\n    return {\"items\": []}\n"
+)
 REPAIRED_ROUTES = (
     "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n"
     "@router.get(\"/api/todos\")\ndef list_todos():\n    return {\"status\": \"repaired\", \"items\": []}"
