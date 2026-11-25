@@ -181,3 +181,32 @@ def test_single_file_model_module_feeds_create_schema_and_base(tmp_path, monkeyp
     assert db_session.Base is importlib.import_module("db.models").Base
     assert inspect(db_session.engine).get_table_names() == ["todos"]
     db_session.engine.dispose()
+
+
+def test_only_modules_exporting_base_or_an_entity_model_feed_create_schema():
+    """A database module exporting some other CamelCase name (an enum) is not a model module."""
+    from core.entity_contract import Entity, EntityField
+
+    skel = {"skeleton": [
+        {"id": "db-001", "agent": "database", "title": "Base", "description": "",
+         "file": "backend/db/base.py", "exports": ["Base"], "imports_from": {}},
+        {"id": "db-002", "agent": "database", "title": "Todo model", "description": "",
+         "file": "backend/db/todo.py", "exports": ["Todo"], "imports_from": {}},
+        {"id": "db-003", "agent": "database", "title": "Enums", "description": "",
+         "file": "backend/db/enums.py", "exports": ["TodoStatus"], "imports_from": {}},
+    ]}
+    state = ProjectState(project_id="layer-roots", project_name="Todo")
+    state.requirements.raw_prompt = "Build a very simple todo app."
+    state.architecture = ArchData(
+        tech_stack={"backend": "FastAPI (Python 3.12)", "database": "SQLite 3"},
+        persistence_contract=build_persistence_contract("SQLite 3"),
+        entities=[Entity(name="Todo", table="todos", fields=[
+            EntityField(name="id", type="int", primary_key=True),
+        ])],
+    )
+    PlannerAgent(provider=scripted_planner(skel)).run(state)
+    session = state.code_manifest.files["output/backend/db/session.py"].planned_content
+
+    assert "db.base" in session
+    assert "db.todo" in session
+    assert "db.enums" not in session

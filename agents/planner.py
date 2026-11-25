@@ -923,24 +923,31 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _is_model_module(path: str, fm: FileManifest, connection_path: str) -> bool:
+def _is_model_module(
+    path: str, fm: FileManifest, connection_path: str, entity_names: set[str]
+) -> bool:
     """A database-owned, non-barrel `.py` file, in any directory, whose exports
-    include `Base` or an ORM model (a CamelCase class). Never the connection module."""
+    include `Base` or an ORM model: an Entity Contract entity, or an export
+    carrying a field contract. Without an Entity Contract, a file in a `models/`
+    package (or `models.py`) also counts. Never the connection module."""
     if fm.agent != "database" or path == connection_path:
         return False
     if not path.endswith(".py") or is_barrel_file(path):
         return False
-    return any(str(e)[:1].isupper() and not str(e).isupper() for e in fm.exports or [])
+    exports = {str(e) for e in fm.exports or []}
+    if exports & ({"Base"} | entity_names | set(fm.contract or {})):
+        return True
+    return not entity_names and ("/models/" in path or path.endswith("/models.py"))
 
 
 def _model_modules(
-    manifest_files: dict[str, FileManifest], connection_path: str
+    manifest_files: dict[str, FileManifest], connection_path: str, entity_names: set[str]
 ) -> tuple[list[str], str | None]:
     """Dotted model modules for create-all, and the first one exporting `Base`
     (which the connection module re-exports), or None."""
     models = sorted(
         (dotted_import(path), fm) for path, fm in manifest_files.items()
-        if _is_model_module(path, fm, connection_path)
+        if _is_model_module(path, fm, connection_path, entity_names)
     )
     base_module = next((module for module, fm in models if "Base" in fm.exports), None)
     return [module for module, _ in models], base_module
@@ -965,7 +972,8 @@ def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> di
     session_path = connection_module_path(contract)
     session = manifest_files.get(session_path)
     if session is not None:
-        model_modules, base_module = _model_modules(manifest_files, session_path)
+        entity_names = {e.name for e in arch.entities}
+        model_modules, base_module = _model_modules(manifest_files, session_path, entity_names)
         session.planned_content = build_connection_module(contract, model_modules, base_module)
     return manifest_files
 
