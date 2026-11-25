@@ -75,8 +75,6 @@ def test_every_skeleton_layout_lands_under_the_fixed_layer_roots(backend_prefix,
 
     assert EXPECTED_SKELETON_PATHS <= set(manifest)
     for path, fm in manifest.items():
-        if path == "output/README.md":
-            continue
         root = "output/frontend/" if fm.agent == "frontend" else "output/backend/"
         assert path.startswith(root), (path, fm.agent)
     assert manifest["output/backend/app/services/todo.py"].imports_from == {
@@ -112,7 +110,6 @@ def test_entrypoints_project_files_and_connection_module_sit_at_fixed_places():
     assert manifest["output/frontend/index.html"].agent == "frontend"
     assert manifest["output/backend/requirements.txt"].agent == "backend"
     assert manifest["output/backend/.env.example"].agent == "backend"
-    assert manifest["output/README.md"].agent == "backend"
     assert manifest["output/backend/db/session.py"].agent == "database"
 
 

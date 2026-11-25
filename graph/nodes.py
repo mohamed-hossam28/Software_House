@@ -19,6 +19,7 @@ from agents.data_base import DatabaseAgent
 from agents.backend import BackendAgent
 from agents.frontend import FrontendAgent
 from agents.integration import IntegrationAgent
+from agents.docs import DocsAgent
 
 # Import core state and statuses
 from core.state import ProjectState, ProjectStatus, diff_state
@@ -235,6 +236,14 @@ def make_integration_node(provider: BaseLLMProvider | str, workspace: Workspace)
         return agent.run(state)
 
     return integration_node
+
+
+def make_docs_node(provider: BaseLLMProvider | str, workspace: Workspace) -> Callable[[dict], dict]:
+    """
+    Docs node: runs the DocsAgent after Integration, writing the README from
+    the final, repaired files through *workspace* with the backend coding prompt.
+    """
+    return _make_coding_node(DocsAgent, provider, settings.be_max_tokens, workspace)
 
 
 def make_finalize_node(workspace: Workspace) -> Callable[[dict], dict]:

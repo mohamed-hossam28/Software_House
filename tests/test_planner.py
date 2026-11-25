@@ -323,11 +323,11 @@ def test_full_two_pass_run_makes_one_call_and_plans_every_file():
     assert len(fake.requests) == 1
     tasks = state.tasks.tasks
     manifest = state.code_manifest.files
-    # 6 skeleton files + 2 scaffolds + 3 pinned project files + the connection module.
-    assert len(tasks) == 12
-    assert len(manifest) == 12
+    # 6 skeleton files + 2 scaffolds + 2 pinned project files + the connection module.
+    assert len(tasks) == 11
+    assert len(manifest) == 11
     for path in ("output/backend/main.py", "output/frontend/index.html",
-                 "output/backend/requirements.txt", "output/README.md", "output/backend/.env.example"):
+                 "output/backend/requirements.txt", "output/backend/.env.example"):
         assert path in manifest
 
     by_id = {t.id: t for t in tasks}
@@ -346,3 +346,26 @@ def test_full_two_pass_run_makes_one_call_and_plans_every_file():
     # The only recorded error is the skeleton's intentional phantom import.
     assert [e for e in state.errors if "phantom import" in e["message"]]
     assert not [e for e in state.errors if "phantom import" not in e["message"]], state.errors
+
+
+# ── The README belongs to the docs node, not the plan ─────────────────────────
+
+def test_planner_output_has_no_readme_task():
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner()).run(state)
+
+    assert not [p for p in state.code_manifest.files if p.lower().endswith("readme.md")]
+    assert not [t for t in state.tasks.tasks if "readme" in t.title.lower()]
+
+
+def test_a_readme_in_the_skeleton_is_dropped_from_the_plan():
+    skeleton = {"skeleton": TODO_SKELETON["skeleton"] + [{
+        "id": "be-009", "agent": "backend", "title": "Project README",
+        "description": "Run instructions.", "file": "README.md",
+        "exports": [], "imports_from": {},
+    }]}
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner(skeleton)).run(state)
+
+    assert not [p for p in state.code_manifest.files if p.lower().endswith("readme.md")]
+    assert "be-009" not in {t.id for t in state.tasks.tasks}

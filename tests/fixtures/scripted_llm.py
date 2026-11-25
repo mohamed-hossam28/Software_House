@@ -66,7 +66,6 @@ TODO_SKELETON: dict[str, Any] = {
 TODO_LLM_FILES: dict[str, list[str]] = {
     "database": ["output/backend/app/models/todo.py"],
     "backend": [
-        "output/README.md",
         "output/backend/app/api/routes/todo.py",
         "output/backend/app/schemas/todo.py",
         "output/backend/app/services/todo.py",
