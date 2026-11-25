@@ -2,6 +2,7 @@
 Pipeline graph builder: the real pipeline graph, run end to end with a scripted
 fake LLM for every agent and a temporary workspace. The main end-to-end test seam.
 """
+import json
 import os
 import sys
 
@@ -43,6 +44,10 @@ ARCHITECTURE = {
 
 ROUTES = "output/backend/app/api/routes/todo.py"
 REQUIREMENTS_TXT = "output/backend/requirements.txt"
+README = "output/README.md"
+
+#: The docs node's reply: the README, written after integration.
+README_REPLY = {**STUB_REPLIES["backend"], "code": "# TodoGraph\n\nRun: uvicorn main:app\n"}
 
 #: Backend replies that pass the Integration checks, so Integration needs no repair call.
 BACKEND_REPLIES = {
@@ -60,9 +65,9 @@ DATABASE_REPLIES = {
 }
 
 
-def scripted_providers() -> AgentProviders:
+def scripted_providers(backend_replies: dict | None = None, integration_calls: list | None = None) -> AgentProviders:
     backend = scripted_coding_agent("backend", TODO_LLM_FILES["backend"])
-    backend.files.update(BACKEND_REPLIES)
+    backend.files.update(BACKEND_REPLIES if backend_replies is None else backend_replies)
     database = scripted_coding_agent("database", TODO_LLM_FILES["database"])
     database.files.update(DATABASE_REPLIES)
     return AgentProviders(
@@ -72,7 +77,8 @@ def scripted_providers() -> AgentProviders:
         database=database,
         backend=backend,
         frontend=scripted_coding_agent("frontend", TODO_LLM_FILES["frontend"]),
-        integration=ScriptedLLMProvider("integration"),
+        integration=ScriptedLLMProvider("integration", calls=integration_calls or []),
+        docs=ScriptedLLMProvider("docs", files={README: README_REPLY}),
     )
 
 
@@ -101,9 +107,9 @@ def test_graph_runs_end_to_end_on_scripted_fakes_inside_the_temporary_workspace(
     visited, final = run_pipeline(graph, state)
 
     assert "human" not in visited
-    assert visited[-1] == "finalize"
+    assert visited[-3:] == ["integration", "docs", "finalize"]
     assert {"requirements", "architecture", "planner", "database", "backend",
-            "frontend", "integration"} <= set(visited)
+            "frontend"} <= set(visited)
     assert not [e for e in final.errors if "scripted fake" in e["message"]], final.errors
 
     manifest = final.code_manifest.files
@@ -112,7 +118,7 @@ def test_graph_runs_end_to_end_on_scripted_fakes_inside_the_temporary_workspace(
     assert not unwritten, unwritten
     for path, fm in manifest.items():
         assert (tmp_path / path).is_file(), path
-        if path != "output/README.md":  # the one project-level file
+        if path != README:  # the one project-level file, written by the docs node
             assert path.startswith(layer_root(fm.agent)), (fm.agent, path)
 
     # Every Coding agent was asked for exactly its scripted files, nothing else.
@@ -120,7 +126,45 @@ def test_graph_runs_end_to_end_on_scripted_fakes_inside_the_temporary_workspace(
         asked = {p for request in getattr(providers, agent).requests for p in request.files}
         assert asked == set(TODO_LLM_FILES[agent]), agent
     assert providers.integration.requests == []
+    assert [r.files for r in providers.docs.requests] == [[README]]
+    assert manifest[README].written
 
     assert (tmp_path / "output" / "backend" / "db" / "session.py").is_file()
     assert (tmp_path / "output" / "run_summary.json").is_file()
     assert _real_output_snapshot() == before
+
+
+#: Routes the backend writes broken; Integration repairs them before the docs node runs.
+BROKEN_ROUTES = "from fastapi import APIRouter\n\nrouter = APIRouter(\n"
+REPAIRED_ROUTES = (
+    "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n"
+    "@router.get(\"/api/todos\")\ndef list_todos():\n    return {\"status\": \"repaired\", \"items\": []}"
+)
+
+
+def test_readme_is_written_after_integration_from_the_repaired_files(workspace, tmp_path):
+    providers = scripted_providers(
+        backend_replies={
+            **BACKEND_REPLIES,
+            ROUTES: {**STUB_REPLIES["backend"], "code": BROKEN_ROUTES},
+        },
+        integration_calls=[json.dumps({"filepath": ROUTES, "code": REPAIRED_ROUTES})],
+    )
+    graph = build_graph(providers, workspace)
+    state = ProjectState(project_id="graph-docs", project_name="TodoGraph")
+    state.requirements.raw_prompt = "Build a todo app that stores todos in SQLite."
+
+    visited, final = run_pipeline(graph, state)
+
+    assert visited[-3:] == ["integration", "docs", "finalize"]
+    assert len(providers.integration.requests) == 1, "Integration must have repaired the routes"
+    [request] = providers.docs.requests
+    assert request.files == [README]
+    assert REPAIRED_ROUTES in request.user_message
+    assert BROKEN_ROUTES not in request.user_message
+    # The run convention: uvicorn serves the frontend; never http.server or opening index.html.
+    assert "uvicorn main:app" in request.user_message
+    assert "http.server" in request.user_message
+    assert (tmp_path / README).read_text(encoding="utf-8") == README_REPLY["code"].strip()
+    # The coding agents ran before integration: none of them asked for the README.
+    assert not [r for r in providers.backend.requests if README in r.files]

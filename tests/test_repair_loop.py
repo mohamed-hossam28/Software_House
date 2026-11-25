@@ -489,6 +489,7 @@ class TestRepairPromptAndTargets:
         ps = make_state(files={
             path: "QUERY = 'SELECT id FROM todos'\n",
             "output/database/schema.sql": "CREATE TABLE users (id INTEGER, name TEXT);\n",
+            "output/database/models.py": "class User:\n    id: int\n    name: str\n",
         })
         ps.architecture = ArchData(tech_stack={"database": "PostgreSQL"})
         add_manifest(ps, path, exports=["QUERY"])
@@ -517,7 +518,10 @@ class TestRepairPromptAndTargets:
         add_manifest(
             ps, path, exports=["TodoItem"], written=True, agent="database"
         )
-        provider = FakeRepairProvider([repair_reply(path, "class TodoItem:\n    name: str\n")])
+        # regenerated with the owner's coding prompt, so the reply is the owner's schema
+        provider = FakeRepairProvider([
+            json.dumps({"migration_code": "class TodoItem:\n    name: str\n"})
+        ])
         diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
 
         checks = diff["static_checks"]
@@ -573,3 +577,70 @@ class TestPersistenceRepair:
         assert [(f["file"], f["check"], f["severity"]) for f in checks["findings"]] == [
             (self.PATH, "in_memory_state", "error")
         ]
+
+
+class TestMissingFileRecovery:
+    """Planned files that were never written are regenerated with the owner's coding prompt (#39)."""
+
+    MODELS = "output/backend/db/models.py"
+    ROUTER = "output/backend/routers/todos.py"
+    ROUTER_CODE = "from db.models import TodoItem\n\n\ndef new_item(name: str) -> TodoItem:\n    return TodoItem(name)\n"
+    TRUNCATED = "class TodoItem(:\n    name: str\n"
+    GOOD = "class TodoItem:\n    name: str\n"
+
+    def _state(self) -> ProjectState:
+        ps = make_state(files={self.ROUTER: self.ROUTER_CODE})
+        add_manifest(ps, self.MODELS, exports=["TodoItem"])
+        add_manifest(ps, self.ROUTER, exports=["new_item"], written=True)
+        ps.code_manifest.files[self.ROUTER].imports_from = {self.MODELS: ["TodoItem"]}
+        return ps
+
+    @staticmethod
+    def coding_reply(code: str) -> str:
+        return json.dumps({"code": code, "classes": [], "functions": []})
+
+    def test_refused_file_is_regenerated_and_run_ends_repaired(self, workspace):
+        ps = self._state()
+        provider = FakeRepairProvider([
+            self.coding_reply(self.TRUNCATED),   # refused by the safe-write guard
+            self.coding_reply(self.GOOD),
+        ])
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.REPAIRED.value
+        assert checks["rounds"] == 2
+        assert self.MODELS in checks["repaired_files"]
+        assert not any(f["severity"] == "error" for f in checks["findings"])
+        assert provider.calls == 2
+        # the file is on disk, and the importer was never edited
+        on_disk = workspace.abs_path(self.MODELS).read_text(encoding="utf-8")
+        assert on_disk.strip() == self.GOOD.strip()
+        assert ps.generated_code.backend[self.ROUTER] == self.ROUTER_CODE
+        assert ps.code_manifest.files[self.MODELS].written
+        # both attempts used the owner's coding prompt; the retry carries the refusal reason
+        first, second = (user for _, user in provider.prompts)
+        assert first.startswith("<<<coding-request>>>\nfile: " + self.MODELS)
+        assert "Integration Agent's static checks" not in first
+        assert "does not parse as Python" in second
+        # the refusal is cleared once written
+        assert ps.write_refusals == {}
+
+    def test_file_refused_twice_fails_naming_file_and_owner(self, workspace):
+        ps = self._state()
+        provider = FakeRepairProvider([
+            self.coding_reply(self.TRUNCATED),
+            self.coding_reply(self.TRUNCATED),
+        ])
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.FAILED.value
+        assert checks["rounds"] == 2
+        assert provider.calls == 2, "the importer must not be repaired around the missing file"
+        assert ps.generated_code.backend[self.ROUTER] == self.ROUTER_CODE
+        assert any(
+            self.MODELS in e["message"] and "backend" in e["message"]
+            for e in diff["errors"]
+        )
+        assert self.MODELS in ps.write_refusals

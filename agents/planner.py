@@ -19,7 +19,7 @@ from typing import Any
 from .base import BaseAgent, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_RETRIES, DEFAULT_BACKOFF
 from providers.llm.base import BaseLLMProvider
 from core.workspace import (
-    BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, dotted_import, relative_import, reroot,
+    BACKEND_ROOT, FRONTEND_ROOT, connection_module_path, dotted_import, relative_import, reroot,
     workspace_path,
 )
 from core.entity_contract import render_entity_contract
@@ -69,15 +69,14 @@ Layer roots (fixed — every path MUST start with one of them):
   relative to backend/ (backend/db/session.py is imported as `db.session`).
 - frontend/ — every frontend file, including package manifest and bundler config. The entrypoint
   is frontend/index.html.
-- README.md is the only file outside a Layer root.
+- Do NOT plan a README: it is written after integration from the final files.
 
 Frontend serving (fixed convention):
 - backend/main.py serves the frontend directory at `/` with StaticFiles(html=True)
   (`app.mount("/", StaticFiles(directory=<frontend dir>, html=True))`), mounted AFTER every API route
   is registered. No hand-written routes for frontend files, no `/static` mount.
 - HTML links its assets RELATIVELY (href="style.css", src="app.js"), never `/static/...`.
-- README.md run instructions: start the backend with `uvicorn main:app` (from backend/) and browse
-  to the served URL — uvicorn only, no `python -m http.server`, no opening index.html directly.
+- The app runs with `uvicorn main:app` (from backend/), browsing to the served URL.
 """
 
 SKELETON_USER_TEMPLATE = """\
@@ -276,8 +275,22 @@ def _validate_tasks(raw_list: list[Any]) -> tuple[list[Task], list[str]]:
     return tasks, warnings
 
 
-#: Project-level file that stays at the top of `output/`, outside any Layer root.
-_TOP_LEVEL_FILES = frozenset({"README.md"})
+def _is_readme(path: str) -> bool:
+    """True for a README file — the docs node writes it after integration, never the plan."""
+    return os.path.basename(path or "").lower().startswith("readme")
+
+
+def _drop_readmes(
+    tasks: list[Task], manifest_files: dict[str, FileManifest],
+) -> tuple[list[Task], dict[str, FileManifest]]:
+    """Remove any README the skeleton planned, with its task and the dependencies on it."""
+    dropped = {fm.task_id for path, fm in manifest_files.items() if _is_readme(path)}
+    if not dropped:
+        return tasks, manifest_files
+    kept = {p: fm for p, fm in manifest_files.items() if fm.task_id not in dropped}
+    for t in tasks:
+        t.depends_on = [d for d in t.depends_on if d not in dropped]
+    return [t for t in tasks if t.id not in dropped], kept
 
 
 def _place(path: str, agent: str, errors: list[str] | None = None) -> str:
@@ -285,9 +298,6 @@ def _place(path: str, agent: str, errors: list[str] | None = None) -> str:
     Workspace path of a skeleton path under its owning coding agent's Layer root.
     A path that names the other layer's directory is re-rooted and logged.
     """
-    rel = workspace_path(path)[len(OUTPUT_DIR) + 1:]
-    if rel in _TOP_LEVEL_FILES:
-        return f"{OUTPUT_DIR}/{rel}"
     placed, misplaced = reroot(path, agent)
     if misplaced and errors is not None:
         errors.append(
@@ -795,7 +805,6 @@ def _inject_project_files(
     Commit to the deliverable's project-scaffolding file set (Phase C3).
     These files are REQUIRED for a runnable deliverable:
       - output/backend/requirements.txt  (Python dependency manifest)
-      - output/README.md                 (run instructions)
       - output/backend/.env.example      (environment template — no real secrets)
 
     `.env.example` carries deterministic content built from the persistence
@@ -812,18 +821,6 @@ def _inject_project_files(
             "Python dependencies (requirements.txt)",
             "Locked Python dependency manifest covering every third-party import used by the backend.",
             ["requirements"],
-            None,
-        ),
-        (
-            "output/README.md",
-            "Project README (README.md)",
-            (
-                "Run instructions: install dependencies, start the backend with "
-                "`uvicorn main:app` from backend/, and browse to the URL it serves (the backend "
-                "serves the frontend at /). uvicorn only: no `python -m http.server`, no "
-                "opening index.html directly."
-            ),
-            ["readme"],
             None,
         ),
         (
@@ -1197,6 +1194,9 @@ class PlannerAgent(BaseAgent):
         for e in layout_errors:
             logger.error("[PlannerAgent] %s", e)
             ps.log_error(self.name, e)
+
+        # The README is the docs node's job, written from the final files.
+        tasks, manifest_files = _drop_readmes(tasks, manifest_files)
 
         # The skeleton's own entrypoint/connection module (e.g. under app/) take
         # the fixed paths, so the steps below never plan a second one.

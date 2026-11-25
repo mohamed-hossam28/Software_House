@@ -207,14 +207,16 @@ class TestIntegrationNode:
 
 
 class TestGraphWiring:
-    def test_coding_agents_converge_on_integration_then_finalize(self):
+    def test_coding_agents_converge_on_integration_then_docs_then_finalize(self):
         from graph.graph import graph
 
         pairs = {(e.source, e.target) for e in graph.get_graph().edges}
         assert ("backend", "integration") in pairs
         assert ("frontend", "integration") in pairs
         assert ("database", "integration") in pairs
-        assert ("integration", "finalize") in pairs
+        assert ("integration", "docs") in pairs
+        assert ("docs", "finalize") in pairs
+        assert ("integration", "finalize") not in pairs
         assert ("finalize", "__end__") in pairs
         assert ("backend", "finalize") not in pairs
 

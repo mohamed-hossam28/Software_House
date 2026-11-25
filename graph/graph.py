@@ -22,6 +22,7 @@ from graph.nodes import (
     make_backend_node,
     make_frontend_node,
     make_integration_node,
+    make_docs_node,
     make_finalize_node,
 )
 from graph.edges import route_after_requirements
@@ -41,11 +42,12 @@ class AgentProviders:
     backend: BaseLLMProvider | str
     frontend: BaseLLMProvider | str
     integration: BaseLLMProvider | str
+    docs: BaseLLMProvider | str
 
     @classmethod
     def from_settings(cls) -> "AgentProviders":
         """The providers chosen by settings: the default provider for planning
-        agents and Integration, the coding provider for the coding agents."""
+        agents and Integration, the coding provider for the coding agents and Docs."""
         planning, coding = settings.default_provider, settings.coding_provider_name
         return cls(
             requirements=planning,
@@ -55,6 +57,7 @@ class AgentProviders:
             backend=coding,
             frontend=coding,
             integration=planning,
+            docs=coding,
         )
 
 
@@ -85,6 +88,7 @@ def build_graph(
     workflow.add_node("backend", make_backend_node(providers.backend, workspace))
     workflow.add_node("frontend", make_frontend_node(providers.frontend, workspace))
     workflow.add_node("integration", make_integration_node(providers.integration, workspace))
+    workflow.add_node("docs", make_docs_node(providers.docs, workspace))
     workflow.add_node("finalize", make_finalize_node(workspace))
 
     # Add Edges
@@ -112,12 +116,14 @@ def build_graph(
     workflow.add_edge("planner", "database")
 
     # Engineering agents converge into the integration node (static checks),
-    # which then hands off to finalize (persists the run summary next to output/).
+    # which hands off to docs (writes the README from the final, repaired files),
+    # then finalize (persists the run summary next to output/).
     workflow.add_edge("backend", "integration")
     workflow.add_edge("frontend", "integration")
     workflow.add_edge("database", "integration")
 
-    workflow.add_edge("integration", "finalize")
+    workflow.add_edge("integration", "docs")
+    workflow.add_edge("docs", "finalize")
 
     workflow.add_edge("finalize", END)
 
