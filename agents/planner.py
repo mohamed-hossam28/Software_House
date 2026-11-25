@@ -69,6 +69,13 @@ Layer roots (fixed — every path MUST start with one of them):
 - frontend/ — every frontend file, including package manifest and bundler config. The entrypoint
   is frontend/index.html.
 - Do NOT plan a README: it is written after integration from the final files.
+
+Frontend serving (fixed convention):
+- backend/main.py serves the frontend directory at `/` with StaticFiles(html=True)
+  (`app.mount("/", StaticFiles(directory=<frontend dir>, html=True))`), mounted AFTER every API route
+  is registered. No hand-written routes for frontend files, no `/static` mount.
+- HTML links its assets RELATIVELY (href="style.css", src="app.js"), never `/static/...`.
+- The app runs with `uvicorn main:app` (from backend/), browsing to the served URL.
 """
 
 SKELETON_USER_TEMPLATE = """\
@@ -597,6 +604,13 @@ def _adopt_skeleton_anchors(
     return manifest_files
 
 
+#: How the backend entrypoint serves the frontend (the frontend serving convention).
+_SERVE_FRONTEND = (
+    "serves the frontend directory at / with StaticFiles(html=True), mounted after every API "
+    "route — no /static mount and no hand-written routes for frontend files."
+)
+
+
 def _next_task_id(prefix: str, existing_ids: set[str]) -> str:
     """Reserve and return the first free injected-task id ('<prefix>-900' upward)."""
     n = 900
@@ -633,12 +647,15 @@ def _inject_scaffold_tasks(
         next_tasks.append(Task(
             id=tid, agent="backend",
             title="Backend entrypoint (main.py)",
-            description="FastAPI application entry point that registers all routers, adds CORS, and serves static files.",
+            description=(
+                "FastAPI application entry point that registers all routers, adds CORS, and "
+                f"{_SERVE_FRONTEND}"
+            ),
             depends_on=list(backend_task_ids), priority=AGENT_PRIORITY["backend"], status="pending",
         ))
         next_manifest[be_main] = FileManifest(
             agent="backend", task_id=tid, filepath=be_main,
-            purpose="FastAPI application entry point — registers all routers and middleware.",
+            purpose=f"FastAPI application entry point — registers all routers and middleware, then {_SERVE_FRONTEND}",
             exports=["app"],
             imports_from={
                 p: ["router"] for p, fm in manifest_files.items()
@@ -652,12 +669,15 @@ def _inject_scaffold_tasks(
         next_tasks.append(Task(
             id=tid, agent="frontend",
             title="Frontend entrypoint (index.html)",
-            description="HTML entry point that loads every stylesheet and script in the correct order.",
+            description=(
+                "HTML entry point that loads every stylesheet and script in the correct order, "
+                "with relative links (href=\"style.css\", src=\"app.js\")."
+            ),
             depends_on=list(frontend_task_ids), priority=AGENT_PRIORITY["frontend"], status="pending",
         ))
         next_manifest[fe_index] = FileManifest(
             agent="frontend", task_id=tid, filepath=fe_index,
-            purpose="HTML entry point loading all stylesheets and scripts.",
+            purpose="HTML entry point loading all stylesheets and scripts by relative links (never /static/...).",
             exports=["index"],
         )
 
@@ -949,13 +969,27 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _model_modules(manifest_files: dict[str, FileManifest]) -> list[str]:
-    """Dotted modules of the database agent's ORM model files (under a models/ package) for create-all."""
-    return sorted(
-        dotted_import(path) for path, fm in manifest_files.items()
-        if fm.agent == "database" and "/models/" in path
-        and path.endswith(".py") and not is_barrel_file(path)
+def _is_model_module(path: str, fm: FileManifest, connection_path: str) -> bool:
+    """A database-owned, non-barrel `.py` file, in any directory, whose exports
+    include `Base` or an ORM model (a CamelCase class). Never the connection module."""
+    if fm.agent != "database" or path == connection_path:
+        return False
+    if not path.endswith(".py") or is_barrel_file(path):
+        return False
+    return any(str(e)[:1].isupper() and not str(e).isupper() for e in fm.exports or [])
+
+
+def _model_modules(
+    manifest_files: dict[str, FileManifest], connection_path: str
+) -> tuple[list[str], str | None]:
+    """Dotted model modules for create-all, and the first one exporting `Base`
+    (which the connection module re-exports), or None."""
+    models = sorted(
+        (dotted_import(path), fm) for path, fm in manifest_files.items()
+        if _is_model_module(path, fm, connection_path)
     )
+    base_module = next((module for module, fm in models if "Base" in fm.exports), None)
+    return [module for module, _ in models], base_module
 
 
 def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> dict[str, FileManifest]:
@@ -974,9 +1008,11 @@ def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> di
             fm.planned_content = build_barrel_content(path, manifest)
 
     contract = arch.persistence_contract
-    session = manifest_files.get(connection_module_path(contract))
+    session_path = connection_module_path(contract)
+    session = manifest_files.get(session_path)
     if session is not None:
-        session.planned_content = build_connection_module(contract, _model_modules(manifest_files))
+        model_modules, base_module = _model_modules(manifest_files, session_path)
+        session.planned_content = build_connection_module(contract, model_modules, base_module)
     return manifest_files
 
 

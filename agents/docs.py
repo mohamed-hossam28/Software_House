@@ -25,8 +25,10 @@ logger = logging.getLogger(__name__)
 README_PATH = "output/README.md"
 README_TASK_ID = "docs-readme"
 README_PURPOSE = (
-    "Project README: what the project does, how to install dependencies, start the "
-    "backend, and open the frontend, and the API it exposes."
+    "Project README: what the project does, the API it exposes, and run instructions: "
+    "install dependencies, start the backend with `uvicorn main:app` from backend/, and "
+    "browse to the URL it serves (the backend serves the frontend at /). uvicorn only: "
+    "no `python -m http.server`, no opening index.html directly."
 )
 
 

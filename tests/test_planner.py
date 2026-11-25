@@ -369,3 +369,26 @@ def test_a_readme_in_the_skeleton_is_dropped_from_the_plan():
 
     assert not [p for p in state.code_manifest.files if p.lower().endswith("readme.md")]
     assert "be-009" not in {t.id for t in state.tasks.tasks}
+
+
+# ── Frontend serving convention ───────────────────────────────────────────────
+
+def test_skeleton_prompt_carries_the_frontend_serving_convention():
+    fake = scripted_planner()
+    PlannerAgent(provider=fake).run(_make_state())
+
+    system = fake.requests[0].system_prompt
+    assert "StaticFiles(html=True)" in system
+    assert "AFTER every API route" in system
+    assert 'href="style.css"' in system
+    assert "uvicorn" in system
+
+
+def test_entrypoint_purpose_follows_the_serving_convention():
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner()).run(state)
+    manifest = state.code_manifest.files
+
+    tasks = {t.id: t for t in state.tasks.tasks}
+    main = manifest["output/backend/main.py"]
+    assert "StaticFiles(html=True)" in main.purpose + tasks[main.task_id].description
