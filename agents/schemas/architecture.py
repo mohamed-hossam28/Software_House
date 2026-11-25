@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 
+from core.entity_contract import Entity
+
 
 # ── Round 1 schemas ───────────────────────────────────────────────────────────
 class TechStackSchema(BaseModel):
@@ -16,6 +18,7 @@ class SystemComponentsSchema(BaseModel):
 
 class DbSchemaOverviewSchema(BaseModel):
     database_schema_overview: str = ""
+    entities: List[Entity] = Field(default_factory=list)
 
 # ── Round 2 schemas ───────────────────────────────────────────────────────────
 class APIContractSchema(BaseModel):
