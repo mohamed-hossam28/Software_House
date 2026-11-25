@@ -23,6 +23,7 @@ naming the file(s) asked for — is defined here too, with its parser.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -242,56 +243,26 @@ def filter_api_contracts_by_relevance(
 #  Batching (private)
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: Filename patterns that are almost always trivial (< 20 lines, no bespoke logic)
-_TRIVIAL_NAMES = frozenset({
-    "__init__.py",
-    "index.ts", "index.tsx", "index.js", "index.jsx",  # barrel / re-export files
-    "types.ts", "types.tsx",                            # pure type declarations
-    "constants.ts", "constants.js",                     # constant modules
-    "config.py", "config.ts", "config.js",              # app config stubs
-    "settings.py",
-    "exceptions.py", "errors.py", "errors.ts",          # exception/error stubs
-    "utils.py",                                         # small utility stubs
-})
+#: File name stems that are trivial by name: type declarations, constants,
+#: configuration, settings and error/exception modules. Only these are batched;
+#: routers, ORM models and schema modules always get a single call, however
+#: few exports they have.
+_TRIVIAL_STEMS = frozenset({"types", "constants", "config", "settings", "errors", "exceptions"})
 
-_TRIVIAL_PATTERNS = (
-    "/__init__.py",
-    "/index.",          # barrel files under any directory
-    "/types.",
-    "/constants.",
-    "/exceptions.",
-    "/errors.",
-    "/config.",
-    "/settings.",
-)
-
-#: Entrypoint/scaffold files get their wiring context in a single-file request;
-#: they are NEVER batched.
-_SCAFFOLD_NAMES = frozenset({"main.py", "app.py", "server.py", "index.html", "index.htm"})
+#: Barrel / re-export files. Their content is Planned Content, so they never
+#: reach the LLM; the file tree always lists them.
+_BARREL_NAMES = frozenset({"__init__.py", "index.ts", "index.tsx", "index.js", "index.jsx"})
 
 
-def _is_scaffold_file(filepath: str | None) -> bool:
-    return os.path.basename(filepath or "").lower() in _SCAFFOLD_NAMES
-
-
-def _is_trivial_filepath(filepath: str, exports: list | None = None) -> bool:
-    """True if a file is 'trivial' boilerplate (init, barrel, config, types, constants, errors, <3 exports)."""
-    basename = os.path.basename(filepath or "").lower()
-    if basename in _TRIVIAL_NAMES:
-        return True
-    for pattern in _TRIVIAL_PATTERNS:
-        if pattern in (filepath or "").lower():
-            return True
-    if exports is not None and len(exports) < 3:
-        return True
-    return False
+def _is_trivial_by_name(filepath: str) -> bool:
+    """True for a file trivial by its name (e.g. `types.ts`, `app/core/config.py`, `errors.js`)."""
+    stem = os.path.basename(filepath or "").lower().split(".")[0]
+    return stem in _TRIVIAL_STEMS
 
 
 def _is_batchable(fm: FileManifest | None) -> bool:
-    """A File Manifest goes into a batch call: trivial, not a scaffold, no Planned Content."""
-    if fm is None or fm.planned_content is not None:
-        return False
-    return _is_trivial_filepath(fm.filepath, fm.exports or []) and not _is_scaffold_file(fm.filepath)
+    """A File Manifest goes into a batch call: trivial by name and without Planned Content."""
+    return fm is not None and fm.planned_content is None and _is_trivial_by_name(fm.filepath)
 
 
 def _align_batch_items(items: list[dict], fms: list[FileManifest]) -> list[tuple[dict, FileManifest]] | None:
@@ -409,31 +380,35 @@ def _shares_resource(path_a: str, path_b: str) -> bool:
     return bool(a_tokens & b_tokens)
 
 
-def _build_project_file_tree(manifest: Any, highlight_path: str, task: Any, agent: str) -> str:
+def _build_project_file_tree(manifest: Any, ctxs: list[FileContext], agent: str) -> str:
     """
-    A CAPPED project file tree: a file is included iff it is the current file,
-    a declared dependency of *task*, already written, trivial, or a same-agent
-    + same-resource file. The current file is marked with '★'.
+    A CAPPED project file tree for the file(s) being generated: a file is
+    included iff it is being generated, a declared dependency of one of their
+    tasks, already written, trivial by name, a barrel, small (fewer than three
+    exports), or a same-agent + same-resource file. Generated files are marked '★'.
     """
     if not hasattr(manifest, "files") or not manifest.files:
         return "(no files planned yet)"
 
-    dep_ids = set(task.depends_on) if (task and getattr(task, "depends_on", None)) else set()
+    highlights = {c.filepath for c in ctxs}
+    dep_ids = {d for c in ctxs if c.task for d in (c.task.depends_on or [])}
     all_filepaths = sorted(manifest.files.keys(), key=lambda p: (p.rstrip("/").count("/"), p))
     entries: list[str] = []
     for path in all_filepaths:
         fm = manifest.files[path]
         written = getattr(fm, "written", False)
         included = (
-            path == highlight_path
+            path in highlights
             or getattr(fm, "task_id", None) in dep_ids
             or written
-            or _is_trivial_filepath(path, getattr(fm, "exports", []))
-            or (fm.agent == agent and _shares_resource(path, highlight_path))
+            or _is_trivial_by_name(path)
+            or os.path.basename(path).lower() in _BARREL_NAMES
+            or len(getattr(fm, "exports", None) or []) < 3
+            or (fm.agent == agent and any(_shares_resource(path, h) for h in highlights))
         )
         if not included:
             continue
-        marker = " ★ (generating)" if path == highlight_path else ""
+        marker = " ★ (generating)" if path in highlights else ""
         status = "written" if written else "pending"
         exports = ", ".join(getattr(fm, "exports", []) or []) or "(none)"
         depth = path.rstrip("/").count("/")
@@ -516,58 +491,80 @@ def _dependency_manifest(manifest: CodeManifest, filepath: str, task: Task | Non
     return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
-def _file_request(profile: CodingProfile, ctx: FileContext) -> str:
-    """The request for one file: header, its contracts, the profile's sections, the tree."""
-    filepath, fm = ctx.filepath, ctx.fm
-    import_rule = (
-        "**IMPORT RULE**: Import internal modules relative to the layer root (e.g. "
-        "`from db.session import ...`), NEVER with the `output.backend.` / `output.` workspace prefix.\n"
-        if filepath.endswith(".py") else ""
-    )
-    parts = [
+def _file_block(profile: CodingProfile, ctx: FileContext) -> list[str]:
+    """One file's part of a request: its File Manifest, the profile's sections and its contracts."""
+    fm = ctx.fm
+    return [
         "## File to Generate\n"
-        f"- **File Path**: `{filepath}`\n"
+        f"- **File Path**: `{ctx.filepath}`\n"
         f"- **Purpose**: {fm.purpose}\n"
         f"- **Required Exports**: {', '.join(fm.exports) or '(none)'}\n"
         "  *(CRITICAL: The generated code MUST define and export these exact names "
         "with the exact signatures other modules expect.)*",
-        "## Tech Stack\n" + _tech_table(ctx.arch),
         *profile.sections(ctx),
-        _build_scaffold_context(ctx.manifest, filepath),
-        build_import_contract(ctx.manifest, filepath),
-        _build_pending_contracts(ctx.manifest, filepath),
-        "## Project File Tree (capped)\n"
-        "You may ONLY import from files listed here — use the EXACT export names shown.\n"
-        + import_rule
-        + _build_project_file_tree(ctx.manifest, filepath, ctx.task, profile.agent),
+        _build_scaffold_context(ctx.manifest, ctx.filepath),
+        build_import_contract(ctx.manifest, ctx.filepath),
+        _build_pending_contracts(ctx.manifest, ctx.filepath),
         "## Project Code Manifest (Dependencies)\n"
         "**RULE**: Never import from a file path not in this list. Use these exact "
         "signatures when calling other modules.\n\n"
-        + _dependency_manifest(ctx.manifest, filepath, ctx.task),
-        "---\n"
-        f"Write the complete source for `{filepath}`.\n"
-        f"Respond with a single valid JSON object with keys: {', '.join(profile.reply_keys)}. "
-        "No prose outside the JSON.\n```json\n",
+        + _dependency_manifest(ctx.manifest, ctx.filepath, ctx.task),
     ]
-    return request_header([filepath]) + "\n\n".join(p for p in parts if p.strip())
 
 
-def _batch_request(profile: CodingProfile, fms: list[FileManifest], arch: ArchData) -> str:
-    """A compact request for 2-3 trivial files, answered with a JSON array."""
-    entries = [
-        f"### File: {fm.filepath}\nPurpose: {fm.purpose}\nRequired Exports: {', '.join(fm.exports) or '(none)'}"
-        for fm in fms
-    ]
+def _build_request(profile: CodingProfile, ctxs: list[FileContext]) -> str:
+    """
+    The one context builder, for a single file or a batch: the request header,
+    the tech stack, then for EACH file its File Manifest, the profile's
+    sections, its Import Contract, its pending contracts and its dependencies,
+    then the capped file tree and the reply format (an object for a single
+    file, an array with one item per file for a batch).
+    """
+    paths = [c.filepath for c in ctxs]
+    arch, manifest = ctxs[0].arch, ctxs[0].manifest
+    batch = len(ctxs) > 1
     keys = profile.reply_keys
-    item = ",".join([f'"filepath":"<path>"', f'"{profile.code_key}":"<full source>"',
-                     *(f'"{k}":[]' for k in keys[1:])])
-    return request_header([fm.filepath for fm in fms]) + (
-        f"Generate the following {len(fms)} trivial/boilerplate {profile.tech(arch)} files.\n\n"
-        + "\n\n".join(entries) + "\n\n"
-        "Return a JSON ARRAY (not object) — one element per file in the same order:\n"
-        f"[{{{item}}}, ...]\n"
-        "```json\n"
+
+    parts: list[str] = []
+    if batch:
+        parts.append(
+            f"Generate the following {len(ctxs)} {profile.tech(arch)} files. Each file's "
+            "contracts follow its heading and apply to that file only."
+        )
+    parts.append("## Tech Stack\n" + _tech_table(arch))
+    for n, ctx in enumerate(ctxs, start=1):
+        if batch:
+            parts.append(f"# File {n} of {len(ctxs)}: `{ctx.filepath}`")
+        parts.extend(_file_block(profile, ctx))
+
+    import_rule = (
+        "**IMPORT RULE**: Import internal modules relative to the layer root (e.g. "
+        "`from db.session import ...`), NEVER with the `output.backend.` / `output.` workspace prefix.\n"
+        if any(p.endswith(".py") for p in paths) else ""
     )
+    parts.append(
+        "## Project File Tree (capped)\n"
+        "You may ONLY import from files listed here — use the EXACT export names shown.\n"
+        + import_rule
+        + _build_project_file_tree(manifest, ctxs, profile.agent)
+    )
+    if batch:
+        parts.append(
+            "---\n"
+            "Write the complete source for each file above.\n"
+            "Return a JSON ARRAY (not object) — one element per file, in the order above:\n"
+            f'[{{"filepath":"<path>","{keys[0]}":"<full source>", ...the other keys of the single-file '
+            f"JSON object ({', '.join(keys[1:]) or 'none'})}}, ...]\n"
+            "No prose outside the JSON.\n```json\n"
+        )
+    else:
+        parts.append(
+            "---\n"
+            f"Write the complete source for `{paths[0]}`.\n"
+            f"Respond with a single valid JSON object with keys: {', '.join(keys)}. "
+            "No prose outside the JSON.\n```json\n"
+        )
+    return request_header(paths) + "\n\n".join(p for p in parts if p.strip())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -608,15 +605,14 @@ class CodingAgent(BaseAgent):
 
         for idx, stage in enumerate(stages):
             batched = [t for t in stage if _is_batchable(ps.code_manifest.by_task(t.id))]
-            singles = [t for t in stage if t not in batched]
+            singles = [[t] for t in stage if t not in batched]
             batches = [batched[i:i + TRIVIAL_BATCH_SIZE] for i in range(0, len(batched), TRIVIAL_BATCH_SIZE)]
             logger.info(
                 "[%s] Stage %d/%d — %d batched (→ %d call(s)) + %d single",
                 self.name, idx + 1, len(stages), len(batched), len(batches), len(singles),
             )
             with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
-                futures: list[Future] = [pool.submit(self._code_batch, b, ps, lock) for b in batches]
-                futures += [pool.submit(self._code_file, t, ps, lock) for t in singles]
+                futures: list[Future] = [pool.submit(self._code, group, ps, lock) for group in batches + singles]
                 for future in futures:
                     try:
                         future.result()
@@ -629,70 +625,59 @@ class CodingAgent(BaseAgent):
         logger.info("[%s] Done. Written: %d  Unwritten: %d.",
                     self.name, len(tasks) - len(unwritten), len(unwritten))
 
-    # ── one file ──────────────────────────────────────────────────────────
-    def _code_file(self, task: Task, ps: ProjectState, lock: Lock) -> None:
+    # ── one call: a single file, or a batch of files trivial by name ──────
+    def _code(self, tasks: list[Task], ps: ProjectState, lock: Lock) -> None:
+        """Code *tasks*' files in one LLM call (Planned Content is written verbatim instead)."""
+        ctxs: list[FileContext] = []
+        planned: list[FileManifest] = []
         with lock:
-            fm = ps.code_manifest.by_task(task.id)
-        if fm is None:
-            logger.error("[%s] Task %s has no manifest entry", self.name, task.id)
-            with lock:
-                ps.log_error(self.name, f"Task {task.id} has no manifest entry")
-            return
+            for task in tasks:
+                fm = ps.code_manifest.by_task(task.id)
+                if fm is None:
+                    logger.error("[%s] Task %s has no manifest entry", self.name, task.id)
+                    ps.log_error(self.name, f"Task {task.id} has no manifest entry")
+                elif fm.planned_content is not None:
+                    planned.append(fm)
+                else:
+                    ctxs.append(FileContext(fm.filepath, fm, task, ps.code_manifest, ps.architecture))
 
-        if fm.planned_content is not None:
+        for fm in planned:
             self._commit(ps, lock, fm.filepath, fm.planned_content, {})
+        if not ctxs:
             return
 
         with lock:
-            arch = ps.architecture
-            ctx = FileContext(fm.filepath, fm, task, ps.code_manifest, arch)
-            system = self.profile.system_prompt(arch)
-            request = _file_request(self.profile, ctx)
-
-        raw = self._ask(system, request, fm.filepath, ps, lock)
-        if raw is None:
-            return
-        self._accept(raw, fm.filepath, ps, lock)
-
-    # ── a batch of trivial files ──────────────────────────────────────────
-    def _code_batch(self, tasks: list[Task], ps: ProjectState, lock: Lock) -> None:
-        with lock:
-            fms = [fm for fm in (ps.code_manifest.by_task(t.id) for t in tasks) if fm is not None]
-            arch = ps.architecture
-            system = self.profile.system_prompt(arch)
-            request = _batch_request(self.profile, fms, arch)
-        if not fms:
-            return
-        paths = [fm.filepath for fm in fms]
-        logger.info("[%s] Batch call: %s", self.name, paths)
-
+            system = self.profile.system_prompt(ctxs[0].arch)
+            request = _build_request(self.profile, ctxs)
+        paths = [c.filepath for c in ctxs]
         raw = self._ask(system, request, ", ".join(paths), ps, lock)
         if raw is None:
             return
+        if len(ctxs) == 1:
+            self._accept(raw, paths[0], ps, lock)
+            return
+
         try:
             items = self._parse_batch_response(raw)
         except Exception as exc:
             logger.error("[%s] Batch JSON parse failed: %s — raw: %s", self.name, exc, raw[:300])
             with lock:
-                ps.log_error(self.name, f"Batch JSON parse failed: {exc}")
+                ps.log_error(self.name, f"Batch JSON parse failed for {', '.join(paths)}: {exc}")
             return
 
-        aligned = _align_batch_items(items, fms)
+        aligned = _align_batch_items(items, [c.fm for c in ctxs])
         if aligned is None:
             logger.warning(
                 "[%s] Batch reply count mismatch (%d items for %d files) — falling back to per-file calls",
-                self.name, len(items), len(fms),
+                self.name, len(items), len(ctxs),
             )
-            for t in tasks:
-                self._code_file(t, ps, lock)
+            for ctx in ctxs:
+                self._code([ctx.task], ps, lock)
             return
 
+        # Every item is validated against the profile's schema, exactly like a single reply.
         for item, fm in aligned:
-            code = str(item.get(self.profile.code_key, "") or "").strip()
-            if not code:
-                logger.warning("[%s] Batch: empty %s for %s — skipping", self.name, self.profile.code_key, fm.filepath)
-                continue
-            self._commit(ps, lock, fm.filepath, code, item)
+            self._accept(json.dumps(item), fm.filepath, ps, lock)
 
     # ── LLM call, validation, write + record ──────────────────────────────
     def _ask(self, system: str, request: str, what: str, ps: ProjectState, lock: Lock) -> str | None:
