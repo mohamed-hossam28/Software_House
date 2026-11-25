@@ -523,6 +523,69 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
                     fm.contract[export] = fields
 
 
+def _move_file(manifest_files: dict[str, FileManifest], old: str, new: str) -> None:
+    """Move a File Manifest from *old* to *new*, repointing every import of it."""
+    fm = manifest_files.pop(old)
+    fm.filepath = new
+    manifest_files[new] = fm
+    for other in manifest_files.values():
+        if old in other.imports_from:
+            names = other.imports_from.pop(old)
+            merged = other.imports_from.get(new, [])
+            other.imports_from[new] = merged + [n for n in names if n not in merged]
+
+
+def _shallowest(paths: list[str]) -> str:
+    return min(paths, key=lambda p: (p.count("/"), p))
+
+
+def _adopt_skeleton_anchors(
+    manifest_files: dict[str, FileManifest],
+    arch: ArchData,
+) -> dict[str, FileManifest]:
+    """
+    Move the skeleton's own backend entrypoint and connection module to their
+    fixed paths, so the scaffold and persistence-seam steps take them over
+    instead of planning a second one beside them.
+
+    A skeleton using an `app/` package plans e.g. `output/backend/app/main.py`
+    and `output/backend/app/db/database.py`; without this the backend would get
+    two entrypoints and two connection modules.
+
+      - entrypoint: a backend `main.py` anywhere under the backend Layer root
+        → `output/backend/main.py`
+      - connection module: a backend/database `.py` exporting `engine` or
+        `SessionLocal` → the Persistence Contract's connection module path
+        (a dependency module exporting only `get_db` is left alone)
+
+    Nothing moves when the fixed path is already planned; among several
+    candidates the shallowest wins.
+    """
+    def backend_owned(fm: FileManifest) -> bool:
+        return fm.agent in ("backend", "database") and fm.filepath.startswith(BACKEND_ROOT)
+
+    be_main = f"{BACKEND_ROOT}main.py"
+    if be_main not in manifest_files:
+        mains = [p for p, fm in manifest_files.items()
+                 if backend_owned(fm) and os.path.basename(p) == "main.py"]
+        if mains:
+            old = _shallowest(mains)
+            logger.warning("[PlannerAgent] skeleton entrypoint '%s' moved to '%s'", old, be_main)
+            _move_file(manifest_files, old, be_main)
+
+    session_path = connection_module_path(arch.persistence_contract)
+    if session_path not in manifest_files:
+        defining = {"engine", "SessionLocal"}
+        modules = [p for p, fm in manifest_files.items()
+                   if backend_owned(fm) and p.endswith(".py") and defining & set(fm.exports or [])]
+        if modules:
+            old = _shallowest(modules)
+            logger.warning("[PlannerAgent] skeleton connection module '%s' moved to '%s'", old, session_path)
+            _move_file(manifest_files, old, session_path)
+
+    return manifest_files
+
+
 def _next_task_id(prefix: str, existing_ids: set[str]) -> str:
     """Reserve and return the first free injected-task id ('<prefix>-900' upward)."""
     n = 900
@@ -1077,6 +1140,10 @@ class PlannerAgent(BaseAgent):
         for e in layout_errors:
             logger.error("[PlannerAgent] %s", e)
             ps.log_error(self.name, e)
+
+        # The skeleton's own entrypoint/connection module (e.g. under app/) take
+        # the fixed paths, so the steps below never plan a second one.
+        manifest_files = _adopt_skeleton_anchors(manifest_files, arch)
 
         # Inject mandatory wiring/scaffold tasks (Problem 2) — run last per agent.
         tasks, manifest_files = _inject_scaffold_tasks(tasks, manifest_files)

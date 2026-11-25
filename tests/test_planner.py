@@ -233,6 +233,62 @@ def test_files_importing_a_taken_over_connection_module_get_the_fixed_exports():
     assert repo.imports_from[SESSION_MODULE] == ["engine", "SessionLocal", "get_db"]
 
 
+def _plan_skeleton_extra(*extra: dict) -> ProjectState:
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner({"skeleton": TODO_SKELETON["skeleton"] + list(extra)})).run(state)
+    return state
+
+
+def _backend_files_named(manifest: dict, name: str) -> list[str]:
+    return sorted(p for p in manifest if p.startswith("output/backend/") and p.endswith("/" + name))
+
+
+def test_skeleton_entrypoint_under_app_becomes_the_one_backend_entrypoint():
+    state = _plan_skeleton_extra({
+        "id": "be-009", "agent": "backend", "title": "App", "description": "FastAPI app.",
+        "file": "app/main.py", "exports": ["app"],
+        "imports_from": {"app/api/routes/todo.py": ["router"]},
+    })
+    manifest = state.code_manifest.files
+
+    assert _backend_files_named(manifest, "main.py") == ["output/backend/main.py"]
+    main = manifest["output/backend/main.py"]
+    assert main.task_id == "be-009"
+    assert main.imports_from["output/backend/app/api/routes/todo.py"] == ["router"]
+    assert main.imports_from[SESSION_MODULE] == ["engine", "SessionLocal", "get_db"]
+    assert not any(t.title == "Backend entrypoint (main.py)" for t in state.tasks.tasks)
+
+
+def test_skeleton_connection_module_under_app_becomes_the_one_connection_module():
+    state = _plan_skeleton_extra(
+        {"id": "db-009", "agent": "database", "title": "DB", "description": "",
+         "file": "app/db/database.py", "exports": ["engine", "SessionLocal", "Base"],
+         "imports_from": {}},
+        {"id": "be-010", "agent": "backend", "title": "Repo", "description": "",
+         "file": "app/repo.py", "exports": ["Repo"],
+         "imports_from": {"app/db/database.py": ["SessionLocal"]}},
+    )
+    manifest = state.code_manifest.files
+
+    assert "output/backend/app/db/database.py" not in manifest
+    session = manifest[SESSION_MODULE]
+    assert (session.agent, session.task_id) == ("database", "db-009")
+    repo = manifest["output/backend/app/repo.py"]
+    assert repo.imports_from == {SESSION_MODULE: ["engine", "SessionLocal", "get_db"]}
+    assert session.planned_content is not None
+
+
+def test_a_dependency_module_exporting_only_get_db_is_not_taken_as_the_connection_module():
+    state = _plan_skeleton_extra({
+        "id": "be-009", "agent": "backend", "title": "Deps", "description": "",
+        "file": "app/api/deps.py", "exports": ["get_db", "get_current_user"], "imports_from": {},
+    })
+    manifest = state.code_manifest.files
+
+    assert manifest["output/backend/app/api/deps.py"].exports == ["get_db", "get_current_user"]
+    assert manifest[SESSION_MODULE].task_id != "be-009"
+
+
 def test_backend_entrypoint_depends_on_the_connection_module_task():
     state = _plan_with_database()
     manifest = state.code_manifest.files
