@@ -388,7 +388,9 @@ async def get_db():
 '''
 
 
-def build_connection_module(contract: PersistenceContract, model_modules: list[str]) -> str:
+def build_connection_module(
+    contract: PersistenceContract, model_modules: list[str], base_module: str | None = None
+) -> str:
     """Deterministic source of the DB connection module (contract.connection_module).
 
     Defines CONNECTION_MODULE_EXPORTS — engine, session factory, session
@@ -419,6 +421,10 @@ def create_schema():
 if __name__ == "__main__":
     create_schema()
 '''
+    # Re-export the declarative Base so callers reach it via the connection
+    # module; imported last so a model module importing `engine` is not circular.
+    if base_module:
+        create_schema = f"\n\nfrom {base_module} import Base  # noqa: E402\n{create_schema}"
     return f'''"""
 DB connection module - synthesized from the persistence contract ({contract.orm}).
 Generated deterministically; do not hand-edit. Reads the URL from ${env_var}.

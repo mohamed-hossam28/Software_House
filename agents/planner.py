@@ -946,13 +946,27 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _model_modules(manifest_files: dict[str, FileManifest]) -> list[str]:
-    """Dotted modules of the database agent's ORM model files (under a models/ package) for create-all."""
-    return sorted(
-        dotted_import(path) for path, fm in manifest_files.items()
-        if fm.agent == "database" and "/models/" in path
-        and path.endswith(".py") and not is_barrel_file(path)
+def _is_model_module(path: str, fm: FileManifest, connection_path: str) -> bool:
+    """A database-owned, non-barrel `.py` file, in any directory, whose exports
+    include `Base` or an ORM model (a CamelCase class). Never the connection module."""
+    if fm.agent != "database" or path == connection_path:
+        return False
+    if not path.endswith(".py") or is_barrel_file(path):
+        return False
+    return any(str(e)[:1].isupper() and not str(e).isupper() for e in fm.exports or [])
+
+
+def _model_modules(
+    manifest_files: dict[str, FileManifest], connection_path: str
+) -> tuple[list[str], str | None]:
+    """Dotted model modules for create-all, and the first one exporting `Base`
+    (which the connection module re-exports), or None."""
+    models = sorted(
+        (dotted_import(path), fm) for path, fm in manifest_files.items()
+        if _is_model_module(path, fm, connection_path)
     )
+    base_module = next((module for module, fm in models if "Base" in fm.exports), None)
+    return [module for module, _ in models], base_module
 
 
 def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> dict[str, FileManifest]:
@@ -971,9 +985,11 @@ def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> di
             fm.planned_content = build_barrel_content(path, manifest)
 
     contract = arch.persistence_contract
-    session = manifest_files.get(connection_module_path(contract))
+    session_path = connection_module_path(contract)
+    session = manifest_files.get(session_path)
     if session is not None:
-        session.planned_content = build_connection_module(contract, _model_modules(manifest_files))
+        model_modules, base_module = _model_modules(manifest_files, session_path)
+        session.planned_content = build_connection_module(contract, model_modules, base_module)
     return manifest_files
 
 
