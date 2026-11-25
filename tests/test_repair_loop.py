@@ -644,3 +644,35 @@ class TestMissingFileRecovery:
             for e in diff["errors"]
         )
         assert self.MODELS in ps.write_refusals
+
+    def test_importer_of_a_missing_file_still_gets_its_other_errors_repaired(self, workspace):
+        ps = self._state()
+        broken = "from db.models import TodoItem\nfrom db.ghost import Phantom\n"
+        fixed = "from db.models import TodoItem\n"
+        ps.generated_code.backend[self.ROUTER] = broken
+        provider = FakeRepairProvider([
+            self.coding_reply(self.TRUNCATED),
+            self.coding_reply(self.TRUNCATED),
+            repair_reply(self.ROUTER, fixed),
+        ])
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
+
+        assert provider.calls == 3, "the importer's own error is repaired"
+        repair_prompt = provider.prompts[2][1]
+        assert "db.ghost" in repair_prompt
+        # the missing module's import finding is never sent: repair must keep the dependency
+        assert "'db.models'" not in repair_prompt.split("## Current file content")[0]
+        assert ps.generated_code.backend[self.ROUTER] == fixed.strip()
+        assert diff["static_checks"]["rounds"] == 3
+        assert diff["static_checks"]["verdict"] == StaticVerdict.FAILED.value
+
+    def test_missing_file_without_a_coding_profile_says_so(self, workspace):
+        ps = self._state()
+        ps.code_manifest.files[self.MODELS].agent = "mystery"
+        diff = IntegrationAgent(provider=FakeRepairProvider([]), retries=1, workspace=workspace).run(ps)
+
+        messages = [f["message"] for f in diff["static_checks"]["findings"] if f["check"] == "missing_file"]
+        assert len(messages) == 1
+        assert "no coding profile" in messages[0]
+        assert "attempt" not in messages[0]
+        assert diff["static_checks"]["rounds"] == 0

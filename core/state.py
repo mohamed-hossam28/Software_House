@@ -696,13 +696,60 @@ class CodeManifest(BaseModel):
         """Manifests that have not yet been written — useful for progress checks."""
         return [m for m in self.files.values() if not m.written]
 
+    def owner_of(self, file_path: str) -> str:
+        """The owning agent key of *file_path* in the Code Manifest; "" when unplanned."""
+        fm = self.files.get(file_path)
+        return str(fm.agent or "") if fm is not None else ""
+
+
+#: The generated-code buckets, one per Coding agent layer.
+CODE_LAYERS: tuple[str, ...] = ("backend", "frontend", "database")
+
+#: Owning agent key (as the Code Manifest names it, aliases included) → its code layer.
+OWNER_LAYERS: dict[str, str] = {
+    "backend": "backend",
+    "frontend": "frontend",
+    "database": "database",
+    "data_base": "database",
+    "db": "database",
+}
+
+
+def owner_layer(owner: str) -> Optional[str]:
+    """The code layer an owning agent key writes to; None for an unknown owner."""
+    return OWNER_LAYERS.get(str(owner or "").lower())
+
 
 class CodeMap(BaseModel):
     """Accumulated code artifacts from engineering agents."""
     backend: dict[str, str] = Field(default_factory=dict)          # filepath -> code
     frontend: dict[str, str] = Field(default_factory=dict)
     database: dict[str, str] = Field(default_factory=dict)
-  
+
+    def all_files(self) -> dict[str, str]:
+        """Every generated file across the buckets, by path."""
+        files: dict[str, str] = {}
+        for layer in CODE_LAYERS:
+            files.update(getattr(self, layer) or {})
+        return files
+
+    def layer_of(self, filepath: str) -> Optional[str]:
+        """The bucket holding *filepath*, else the layer its path names; None when neither."""
+        for layer in CODE_LAYERS:
+            if filepath in (getattr(self, layer) or {}):
+                return layer
+        norm = "/" + filepath.replace("\\", "/")
+        return next((layer for layer in CODE_LAYERS if f"/{layer}/" in norm), None)
+
+    def replace(self, filepath: str, code: str, layer: str) -> None:
+        """Put *code* for *filepath* in *layer*'s bucket, removing it from every other."""
+        for candidate in CODE_LAYERS:
+            bucket = dict(getattr(self, candidate) or {})
+            bucket.pop(filepath, None)
+            if candidate == layer:
+                bucket[filepath] = code
+            setattr(self, candidate, bucket)
+
   
 class FindingSeverity(str, Enum):
     """Severity of a static-check finding. Only errors trigger repair; warns log only."""
@@ -816,6 +863,19 @@ class ProjectState(BaseModel):
         """Record a Coding agent's written file: its code in the agent's bucket, its File Manifest Written."""
         getattr(self.generated_code, agent)[filepath] = code
         self.code_manifest.mark_written(filepath, classes, functions)
+        self.clear_refusal(filepath)
+
+    def record_repaired(self, filepath: str, code: str) -> None:
+        """Record a repaired file: its code in its owner's bucket (by the Code Manifest,
+        else where it already is), and any write refusal for it cleared."""
+        layer = owner_layer(self.code_manifest.owner_of(filepath)) or self.generated_code.layer_of(filepath)
+        if layer is None:
+            raise ValueError(f"Cannot determine generated-code owner for '{filepath}'")
+        self.generated_code.replace(filepath, code, layer)
+        self.clear_refusal(filepath)
+
+    def clear_refusal(self, filepath: str) -> None:
+        """Forget *filepath*'s write refusal once it is written."""
         self.write_refusals.pop(filepath, None)
 
     def record_refusal(self, filepath: str, reason: str) -> None:

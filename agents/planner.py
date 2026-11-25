@@ -22,7 +22,10 @@ from core.workspace import (
     BACKEND_ROOT, FRONTEND_ROOT, connection_module_path, dotted_import, relative_import, reroot,
     workspace_path,
 )
-from core.entity_contract import render_entity_contract
+from core.entity_contract import (
+    ENTITY_SUFFIXES, is_request_schema, is_response_schema, match_entity, norm_keyword,
+    render_entity_contract,
+)
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
     CONNECTION_MODULE_EXPORTS, build_connection_module, build_env_example,
@@ -391,59 +394,6 @@ def _build_manifest(
 # ║  Phase 2 — deterministic cross-agent field contracts (no LLM)                 ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-#: Class-name suffixes stripped when matching an export to a DB table or API
-#: resource keyword (e.g. 'TodoItem' → 'todo', 'TodoCreate' → 'todo').
-_ENTITY_SUFFIXES: tuple[str, ...] = (
-    "create", "new", "insert", "in", "update", "put", "patch", "request",
-    "payload", "form", "response", "out", "read", "view", "item", "record",
-    "entity", "model", "table", "orm", "dto", "schema", "detail", "result",
-)
-
-_REQUEST_SUFFIXES: tuple[str, ...] = (
-    "create", "new", "insert", "in", "update", "put", "patch", "request", "payload", "form",
-)
-
-_RESPONSE_SUFFIXES: tuple[str, ...] = (
-    "response", "out", "read", "view", "item", "detail", "result",
-)
-
-
-def _norm_keyword(name: str) -> str:
-    """'TodoItem' → 'todoitem' (lowercase, alphanumerics only)."""
-    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
-
-
-def _entity_forms(name: str) -> set[str]:
-    """
-    Normalized matching forms of a name: itself, its singular, and its
-    suffix-stripped stem (e.g. 'TodoItem' → {'todoitem', 'todo'},
-    'users' → {'users', 'user'}). Empty forms are dropped.
-    """
-    kw = _norm_keyword(name)
-    forms = {kw}
-    if kw.endswith("s"):
-        forms.add(kw[:-1])
-    stripped = kw
-    for suf in _ENTITY_SUFFIXES:
-        if stripped.endswith(suf):
-            stripped = stripped[: -len(suf)]
-            break
-    forms.add(stripped)
-    if stripped.endswith("s"):
-        forms.add(stripped[:-1])
-    return {f for f in forms if f}
-
-
-def _match_entity(export: str, candidates: dict[str, Any]) -> str | None:
-    """
-    Match an export/class name to EXACTLY ONE candidate key (table or API resource).
-    Deterministic only-match rule: no match, or >1 candidate → None (never guess).
-    """
-    export_forms = _entity_forms(export)
-    matched = [k for k in candidates if _entity_forms(k) & export_forms]
-    return matched[0] if len(matched) == 1 else None
-
-
 def _parse_schema_overview(overview: str) -> dict[str, dict[str, str]]:
     """
     Parse the architecture agent's schema-overview lines into {table: {column: type}}.
@@ -468,24 +418,14 @@ def _parse_schema_overview(overview: str) -> dict[str, dict[str, str]]:
     return tables
 
 
-def _is_request_schema(export: str) -> bool:
-    kw = _norm_keyword(export)
-    return any(kw.endswith(s) for s in _REQUEST_SUFFIXES)
-
-
-def _is_response_schema(export: str) -> bool:
-    kw = _norm_keyword(export)
-    return any(kw.endswith(s) for s in _RESPONSE_SUFFIXES)
-
-
 def _is_schema_file(fm: FileManifest) -> bool:
     """Backend file defining request/response models (schemas/models module, or schema-style exports)."""
     path = (fm.filepath or "").lower()
     if "/schemas/" in path or "/models/" in path or path.endswith(("schemas.py", "models.py")):
         return True
     for export in fm.exports or []:
-        kw = _norm_keyword(export)
-        if any(kw.endswith(s) for s in _ENTITY_SUFFIXES):
+        kw = norm_keyword(export)
+        if any(kw.endswith(s) for s in ENTITY_SUFFIXES):
             return True
     return False
 
@@ -511,7 +451,7 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
     entities = list(getattr(arch, "entities", None) or [])
     by_name = {e.name: {f.name: f.type for f in e.fields} for e in entities}
     tables = (
-        {e.table: {f.name: f.type for f in e.fields} for e in entities}
+        {e.table: by_name[e.name] for e in entities}
         if entities
         else _parse_schema_overview(getattr(arch, "database_schema_overview", "") or "")
     )
@@ -532,22 +472,22 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
                 if export in by_name:
                     fm.contract[export] = dict(by_name[export])
                     continue
-                table = _match_entity(export, tables)
+                table = match_entity(export, tables)
                 if table is None:
                     continue
                 fm.contract[export] = dict(tables[table])
         elif fm.agent == "backend" and _is_schema_file(fm):
             for export in list(fm.exports or []):
-                key = _match_entity(export, resources)
+                key = match_entity(export, resources)
                 if key is None:
                     continue
                 fields: dict[str, str] = {}
                 for c in resources[key]:
                     req = dict(getattr(c, "request_body", None) or {})
                     res = dict(getattr(c, "response_body", None) or {})
-                    if _is_request_schema(export):
+                    if is_request_schema(export):
                         fields.update(req)
-                    elif _is_response_schema(export):
+                    elif is_response_schema(export):
                         fields.update(res)
                     else:
                         fields.update({**req, **res})
@@ -983,24 +923,31 @@ def build_barrel_content(filepath: str, manifest: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _is_model_module(path: str, fm: FileManifest, connection_path: str) -> bool:
+def _is_model_module(
+    path: str, fm: FileManifest, connection_path: str, entity_names: set[str]
+) -> bool:
     """A database-owned, non-barrel `.py` file, in any directory, whose exports
-    include `Base` or an ORM model (a CamelCase class). Never the connection module."""
+    include `Base` or an ORM model: an Entity Contract entity, or an export
+    carrying a field contract. Without an Entity Contract, a file in a `models/`
+    package (or `models.py`) also counts. Never the connection module."""
     if fm.agent != "database" or path == connection_path:
         return False
     if not path.endswith(".py") or is_barrel_file(path):
         return False
-    return any(str(e)[:1].isupper() and not str(e).isupper() for e in fm.exports or [])
+    exports = {str(e) for e in fm.exports or []}
+    if exports & ({"Base"} | entity_names | set(fm.contract or {})):
+        return True
+    return not entity_names and ("/models/" in path or path.endswith("/models.py"))
 
 
 def _model_modules(
-    manifest_files: dict[str, FileManifest], connection_path: str
+    manifest_files: dict[str, FileManifest], connection_path: str, entity_names: set[str]
 ) -> tuple[list[str], str | None]:
     """Dotted model modules for create-all, and the first one exporting `Base`
     (which the connection module re-exports), or None."""
     models = sorted(
         (dotted_import(path), fm) for path, fm in manifest_files.items()
-        if _is_model_module(path, fm, connection_path)
+        if _is_model_module(path, fm, connection_path, entity_names)
     )
     base_module = next((module for module, fm in models if "Base" in fm.exports), None)
     return [module for module, _ in models], base_module
@@ -1025,7 +972,8 @@ def _plan_content(manifest_files: dict[str, FileManifest], arch: ArchData) -> di
     session_path = connection_module_path(contract)
     session = manifest_files.get(session_path)
     if session is not None:
-        model_modules, base_module = _model_modules(manifest_files, session_path)
+        entity_names = {e.name for e in arch.entities}
+        model_modules, base_module = _model_modules(manifest_files, session_path, entity_names)
         session.planned_content = build_connection_module(contract, model_modules, base_module)
     return manifest_files
 
@@ -1335,7 +1283,7 @@ if __name__ == "__main__":
         "User": {"id": "UUID PK", "email": "VARCHAR UNIQUE"}}
     assert mfc["output/backend/app/schemas/todo.py"].contract["TodoCreate"] == {"title": "str", "description": "str"}
     assert mfc["output/backend/app/schemas/todo.py"].contract["TodoResponse"]["is_completed"] == "bool"
-    assert _match_entity("Workspace", {"todos": {}, "users": {}}) is None
+    assert match_entity("Workspace", {"todos": {}, "users": {}}) is None
     print("[PASS] _populate_contracts — DB model + schema field contracts populated deterministically")
 
     # ── _generate_tasks_from_skeleton (Pass 2) ────────────────────────────────

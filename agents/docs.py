@@ -6,17 +6,17 @@ files (the coding agents' output with every Integration repair applied), so
 the README documents the code that actually ships: its routes, health values
 and run steps.
 
-It is the backend Coding agent run on one file: the backend profile's system
-prompt, the coding request header, the backend reply schema, and the loop's
-write guard + record step. Only the request body differs: instead of planned
+It hands one request to the backend Coding agent's single-file path (the
+backend profile's system prompt, the backend reply schema, and the loop's
+write guard + record step). Only the request body differs: instead of planned
 contracts it carries the content of every final file.
 """
 from __future__ import annotations
 
 import logging
-from threading import Lock
 
 from agents.backend import BACKEND_PROFILE
+from agents.base import BaseAgent
 from agents.coding_loop import CodingAgent, request_header
 from core.state import ArchData, FileManifest, ProjectState
 
@@ -34,9 +34,7 @@ README_PURPOSE = (
 
 def final_files(ps: ProjectState) -> dict[str, str]:
     """Every generated file's final content (Integration repairs applied), README excluded, by path."""
-    files: dict[str, str] = {}
-    for layer in ("database", "backend", "frontend"):
-        files.update(getattr(ps.generated_code, layer, {}) or {})
+    files = ps.generated_code.all_files()
     files.pop(README_PATH, None)
     return dict(sorted(files.items()))
 
@@ -67,19 +65,17 @@ def build_readme_request(arch: ArchData, files: dict[str, str]) -> str:
     return request_header([README_PATH]) + "\n\n".join(parts)
 
 
-class DocsAgent(CodingAgent):
-    """Writes the README from the final, repaired files, through the backend profile."""
+class DocsAgent(BaseAgent):
+    """Writes the README from the final, repaired files, through the backend Coding agent."""
 
-    profile = BACKEND_PROFILE
+    @property
+    def system_prompt(self) -> str:
+        return "You are the Docs agent: you write the project README from the final files."
 
     def _work(self, ps: ProjectState) -> None:
-        lock = Lock()
         ps.code_manifest.files[README_PATH] = FileManifest(
-            agent=self.profile.agent, task_id=README_TASK_ID,
+            agent=BACKEND_PROFILE.agent, task_id=README_TASK_ID,
             filepath=README_PATH, purpose=README_PURPOSE,
         )
-        system = self.profile.system_prompt(ps.architecture)
         request = build_readme_request(ps.architecture, final_files(ps))
-        raw = self._ask(system, request, README_PATH, ps, lock)
-        if raw is not None:
-            self._accept(raw, README_PATH, ps, lock)
+        CodingAgent.sharing(self, BACKEND_PROFILE).code_request(ps, README_PATH, request)

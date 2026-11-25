@@ -115,10 +115,7 @@ def write_run_summary(
 
         files: dict[str, dict] = {}
         code_map = getattr(state, "generated_code", None)
-        buckets = {}
-        if code_map is not None:
-            for layer in ("backend", "frontend", "database"):
-                buckets.update(getattr(code_map, layer, {}) or {})
+        buckets = code_map.all_files() if code_map is not None else {}
 
         manifest = getattr(state, "code_manifest", None)
         for fp, content in buckets.items():
