@@ -118,3 +118,25 @@ class TestWorkspaceWrite:
         assert Workspace().root == PROJECT_DIR
         assert Workspace().output_dir == PROJECT_DIR / "output"
         assert (PROJECT_DIR / "core" / "workspace.py").is_file()
+
+
+class TestTrailingQuoteJunk:
+    """A closing string quote at end of file is code, not leftover JSON."""
+
+    @pytest.mark.parametrize("path,code", [
+        ("backend/cache.py", 'def f():\n    return "down"'),
+        ("backend/db/models.py", 'def r(self):\n    return f"<Todo id={self.id!r}>"'),
+        ("backend/mod.py", 'def f():\n    """Doc."""\n    x = """\nmulti\n"""'),
+        ("frontend/app.js", "const mode = 'x';\nconsole.log(\"done\")"),
+    ])
+    def test_balanced_trailing_quote_is_kept(self, tmp_path, path, code):
+        written = Workspace(tmp_path).write(path, code)
+        assert written == code
+
+    @pytest.mark.parametrize("path,code,expected", [
+        ("frontend/app.js", 'console.log(1);\n"', "console.log(1);\n"),
+        ("frontend/app.js", 'console.log(1);"', "console.log(1);"),
+        ("backend/main.py", 'x = 1\n"', "x = 1\n"),
+    ])
+    def test_unpaired_trailing_quote_is_stripped(self, tmp_path, path, code, expected):
+        assert Workspace(tmp_path).write(path, code) == expected

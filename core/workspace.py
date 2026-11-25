@@ -259,16 +259,41 @@ def detect_corruption(code: str, filepath: str) -> list[dict]:
     return findings
 
 
-def _strip_trailing_junk(code: str) -> tuple[str, bool]:
+def _has_unpaired_trailing_quote(text: str) -> bool:
+    """True when the last line ends in a `"` that closes no string on that line.
+
+    Triple quotes are ignored so a closing docstring is never taken for junk;
+    a balanced last line such as `return "down"` keeps its closing quote.
+    """
+    last_line = text.rsplit("\n", 1)[-1]
+    return last_line.endswith('"') and last_line.replace('"""', "").count('"') % 2 == 1
+
+
+def _parses_as_python(code: str) -> bool:
+    import ast
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _strip_trailing_junk(code: str, filepath: str = "") -> tuple[str, bool]:
     """
     Remove unambiguous trailing JSON artifacts (lone quotes glued to the end of
     otherwise-clean code). Preserves a single trailing newline when present.
+    A quote is only junk when it is unpaired on its line, and a Python file
+    that already parses is never touched.
     Returns (cleaned_code, changed).
     """
+    if filepath.lower().endswith(".py") and _parses_as_python(code):
+        return code, False
     cleaned = code
     changed = False
     while True:
         ws_stripped = cleaned.rstrip(" \t\r\n")
+        if not _has_unpaired_trailing_quote(ws_stripped):
+            break
         if ws_stripped.endswith('"') and len(ws_stripped) < len(cleaned):
             cleaned = ws_stripped[:-1].rstrip(" \t")
             changed = True
@@ -403,7 +428,7 @@ class Workspace:
 
         Returns the cleaned content that was written, or None when refused.
         """
-        code, _ = _strip_trailing_junk(code)
+        code, _ = _strip_trailing_junk(code, filepath)
         abs_path = str(self.abs_path(filepath))
 
         conflicts = detect_corruption(code, filepath)
