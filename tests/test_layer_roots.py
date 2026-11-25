@@ -143,3 +143,44 @@ def test_connection_module_workspace_path_comes_from_the_persistence_contract():
     assert connection_module_path(contract.model_copy(update={"connection_module": "core/db.py"})) == (
         "output/backend/core/db.py"
     )
+
+
+def test_single_file_model_module_feeds_create_schema_and_base(tmp_path, monkeypatch):
+    """A single-module layout (`db/models.py`) is still a model module: the
+    connection module creates its tables and re-exports its Base."""
+    skel = {"skeleton": [
+        {"id": "db-001", "agent": "database", "title": "Models", "description": "",
+         "file": "backend/db/models.py", "exports": ["Base", "Todo"], "imports_from": {}},
+        {"id": "be-001", "agent": "backend", "title": "Todo routes", "description": "",
+         "file": "backend/api/todo.py", "exports": ["router"],
+         "imports_from": {"backend/db/models.py": ["Todo"]}},
+    ]}
+    session = plan(skel).code_manifest.files["output/backend/db/session.py"].planned_content
+
+    db = tmp_path / "db"
+    db.mkdir()
+    (db / "__init__.py").write_text("", encoding="utf-8")
+    (db / "session.py").write_text(session, encoding="utf-8")
+    (db / "models.py").write_text(
+        "from sqlalchemy import Column, Integer\n"
+        "from sqlalchemy.orm import declarative_base\n"
+        "Base = declarative_base()\n"
+        "class Todo(Base):\n"
+        "    __tablename__ = 'todos'\n"
+        "    id = Column(Integer, primary_key=True)\n",
+        encoding="utf-8",
+    )
+    url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [m for m in sys.modules if m == "db" or m.startswith("db.")]:
+        monkeypatch.delitem(sys.modules, name)
+
+    import importlib
+    db_session = importlib.import_module("db.session")
+    db_session.create_schema()
+
+    from sqlalchemy import inspect
+    assert db_session.Base is importlib.import_module("db.models").Base
+    assert inspect(db_session.engine).get_table_names() == ["todos"]
+    db_session.engine.dispose()

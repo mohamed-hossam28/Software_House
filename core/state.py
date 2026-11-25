@@ -18,6 +18,8 @@ from typing import Any, Callable, Optional, Annotated, get_type_hints
 from functools import cache
 from datetime import datetime
 
+from core.entity_contract import Entity
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Reducer functions for parallel-safe state merging
@@ -405,7 +407,9 @@ async def get_db():
 '''
 
 
-def build_connection_module(contract: PersistenceContract, model_modules: list[str]) -> str:
+def build_connection_module(
+    contract: PersistenceContract, model_modules: list[str], base_module: str | None = None
+) -> str:
     """Deterministic source of the DB connection module (contract.connection_module).
 
     Defines CONNECTION_MODULE_EXPORTS — engine, session factory, session
@@ -436,6 +440,10 @@ def create_schema():
 if __name__ == "__main__":
     create_schema()
 '''
+    # Re-export the declarative Base so callers reach it via the connection
+    # module; imported last so a model module importing `engine` is not circular.
+    if base_module:
+        create_schema = f"\n\nfrom {base_module} import Base  # noqa: E402\n{create_schema}"
     return f'''"""
 DB connection module - synthesized from the persistence contract ({contract.orm}).
 Generated deterministically; do not hand-edit. Reads the URL from ${env_var}.
@@ -558,6 +566,9 @@ class ArchData(BaseModel):
     system_components: list[str] = Field(default_factory=list)
     api_contracts: list[APIContract] = Field(default_factory=list)
     database_schema_overview: str = ""
+    #: The Entity Contract (core/entity_contract.py): structured, field-level, LLM-produced;
+    #: shared by the database and backend coding agents. Separate from persistence_contract.
+    entities: list[Entity] = Field(default_factory=list)
     security_requirements: list[str] = Field(default_factory=list)
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths

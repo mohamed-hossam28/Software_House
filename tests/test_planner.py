@@ -3,6 +3,7 @@ The two-pass Planner: one skeleton LLM call (Pass 1), then deterministic task
 generation from the skeleton's import graph (Pass 2). The LLM is the scripted
 fake answering with the todo skeleton fixture.
 """
+from core.entity_contract import render_entity_contract
 from core.state import (
     ArchData,
     FileManifest,
@@ -312,6 +313,34 @@ def test_skeleton_request_carries_the_persistence_contract():
     assert render_persistence_contract(state.architecture.persistence_contract) in fake.requests[0].user_message
 
 
+TODO_ITEM_ENTITY = {
+    "name": "TodoItem", "table": "todo_items",
+    "fields": [
+        {"name": "id", "type": "int", "primary_key": True},
+        {"name": "title", "type": "str", "max_length": 120},
+        {"name": "done", "type": "bool"},
+    ],
+}
+
+
+def test_skeleton_request_carries_the_entity_contract():
+    state = _make_state()
+    state.architecture.entities = ArchData(entities=[TODO_ITEM_ENTITY]).entities
+    fake = scripted_planner()
+    PlannerAgent(provider=fake).run(state)
+
+    assert render_entity_contract(state.architecture.entities) in fake.requests[0].user_message
+
+
+def test_database_model_field_contract_comes_from_the_entity_contract():
+    state = _make_state()
+    state.architecture.entities = ArchData(entities=[TODO_ITEM_ENTITY]).entities
+    PlannerAgent(provider=scripted_planner()).run(state)
+
+    model = state.code_manifest.files["output/backend/app/models/todo.py"]
+    assert model.contract["TodoItem"] == {"id": "int", "title": "str", "done": "bool"}
+
+
 # ── A full two-pass run ───────────────────────────────────────────────────────
 
 def test_full_two_pass_run_makes_one_call_and_plans_every_file():
@@ -346,3 +375,30 @@ def test_full_two_pass_run_makes_one_call_and_plans_every_file():
     # The only recorded error is the skeleton's intentional phantom import.
     assert [e for e in state.errors if "phantom import" in e["message"]]
     assert not [e for e in state.errors if "phantom import" not in e["message"]], state.errors
+
+
+# ── Frontend serving convention ───────────────────────────────────────────────
+
+def test_skeleton_prompt_carries_the_frontend_serving_convention():
+    fake = scripted_planner()
+    PlannerAgent(provider=fake).run(_make_state())
+
+    system = fake.requests[0].system_prompt
+    assert "StaticFiles(html=True)" in system
+    assert "AFTER every API route" in system
+    assert 'href="style.css"' in system
+    assert "uvicorn" in system
+
+
+def test_readme_and_entrypoint_purposes_follow_the_serving_convention():
+    state = _make_state()
+    PlannerAgent(provider=scripted_planner()).run(state)
+    manifest = state.code_manifest.files
+
+    readme = manifest["output/README.md"].purpose
+    assert "uvicorn" in readme
+    assert "http.server" in readme  # named only as the forbidden instruction
+    assert "open the frontend" not in readme
+    tasks = {t.id: t for t in state.tasks.tasks}
+    main = manifest["output/backend/main.py"]
+    assert "StaticFiles(html=True)" in main.purpose + tasks[main.task_id].description

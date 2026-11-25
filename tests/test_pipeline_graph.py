@@ -11,6 +11,7 @@ from core.state import ProjectState
 from core.workspace import PROJECT_DIR, layer_root
 from graph.graph import AgentProviders, build_graph
 from providers.llm.scripted import ScriptedLLMProvider
+from tests.test_persistence_contract import TODO_MODEL_SOURCE
 from tests.fixtures.scripted_llm import (
     STUB_REPLIES,
     TODO_LLM_FILES,
@@ -53,14 +54,22 @@ BACKEND_REPLIES = {
 }
 
 
+#: The database model reply defines the Base and TodoItem the skeleton promises.
+DATABASE_REPLIES = {
+    "output/backend/app/models/todo.py": {"migration_code": TODO_MODEL_SOURCE, "functions": []},
+}
+
+
 def scripted_providers() -> AgentProviders:
     backend = scripted_coding_agent("backend", TODO_LLM_FILES["backend"])
     backend.files.update(BACKEND_REPLIES)
+    database = scripted_coding_agent("database", TODO_LLM_FILES["database"])
+    database.files.update(DATABASE_REPLIES)
     return AgentProviders(
         requirements=ScriptedLLMProvider("requirements", calls=[COMPLETE_SRS]),
         architecture=ScriptedLLMProvider("architecture", calls=[ARCHITECTURE] * 3),
         planner=scripted_planner(),
-        database=scripted_coding_agent("database", TODO_LLM_FILES["database"]),
+        database=database,
         backend=backend,
         frontend=scripted_coding_agent("frontend", TODO_LLM_FILES["frontend"]),
         integration=ScriptedLLMProvider("integration"),
