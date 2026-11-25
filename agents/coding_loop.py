@@ -240,6 +240,22 @@ def filter_api_contracts_by_relevance(
     return filtered[:top_k] if filtered else [c for _, c in scored[:top_k]]
 
 
+def refusal_recorder(ps: ProjectState, lock: Lock | None = None) -> Callable[[str, dict], None]:
+    """
+    The safe-write guard's `on_corrupt` callback: logs the refused write and
+    records its reason in ProjectState as a Write refusal (under *lock*, when given).
+    """
+    def refuse(path: str, conflict: dict) -> None:
+        reason = str(conflict.get("reason") or "")
+        logger.warning("[safe-write] REFUSED corrupted content for %s: %s", path, reason)
+        if lock is None:
+            ps.record_refusal(path, reason)
+        else:
+            with lock:
+                ps.record_refusal(path, reason)
+    return refuse
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Batching (private)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -601,6 +617,20 @@ class CodingAgent(BaseAgent):
         if getattr(self, "profile", None) is None:
             raise TypeError(f"{type(self).__name__} needs a CodingProfile")
 
+    @classmethod
+    def sharing(cls, agent: BaseAgent, profile: CodingProfile) -> "CodingAgent":
+        """A Coding agent for *profile* sharing *agent*'s provider, model settings and workspace."""
+        return cls(
+            profile=profile,
+            model=agent.model,
+            max_tokens=agent.max_tokens,
+            retries=agent.max_retries,
+            backoff=agent.backoff,
+            temperature=agent.temperature,
+            provider=agent.provider,
+            workspace=agent.workspace,
+        )
+
     @property
     def system_prompt(self) -> str:
         return f"You are an expert {self.profile.agent} engineer."
@@ -706,10 +736,10 @@ class CodingAgent(BaseAgent):
         lock = Lock()
         if fm.planned_content is not None:
             self._commit(ps, lock, filepath, fm.planned_content, {})
-        else:
-            task = next((t for t in ps.tasks.tasks if t.id == fm.task_id), None)
-            self._code_single(self._context(fm, task, ps), ps, lock)
-        return filepath in (getattr(ps.generated_code, self.profile.agent) or {})
+            return filepath in (getattr(ps.generated_code, self.profile.agent) or {})
+        task = next((t for t in ps.tasks.tasks if t.id == fm.task_id), None)
+        ctx = self._context(fm, task, ps)
+        return self.code_request(ps, filepath, _build_request(self.profile, [ctx]), lock)
 
     @staticmethod
     def _context(fm: FileManifest, task: Task | None, ps: ProjectState) -> FileContext:
@@ -719,13 +749,24 @@ class CodingAgent(BaseAgent):
         )
 
     def _code_single(self, ctx: FileContext, ps: ProjectState, lock: Lock) -> None:
-        """One file, one LLM call: request → reply → validate → write → record."""
+        """One planned file: its request context, then the single-file path."""
         with lock:
-            system = self.profile.system_prompt(ctx.arch)
             request = _build_request(self.profile, [ctx])
-        raw = self._ask(system, request, ctx.filepath, ps, lock)
+        self.code_request(ps, ctx.filepath, request, lock)
+
+    def code_request(self, ps: ProjectState, filepath: str, request: str, lock: Lock | None = None) -> bool:
+        """
+        The single-file path for a ready coding *request*: the profile's system
+        prompt → LLM → validate → write → record. Returns True once *filepath*
+        is in this agent's generated-code bucket.
+        """
+        lock = lock or Lock()
+        with lock:
+            system = self.profile.system_prompt(ps.architecture)
+        raw = self._ask(system, request, filepath, ps, lock)
         if raw is not None:
-            self._accept(raw, ctx.filepath, ps, lock)
+            self._accept(raw, filepath, ps, lock)
+        return filepath in (getattr(ps.generated_code, self.profile.agent) or {})
 
     # ── LLM call, validation, write + record ──────────────────────────────
     def _ask(self, system: str, request: str, what: str, ps: ProjectState, lock: Lock) -> str | None:
@@ -761,13 +802,8 @@ class CodingAgent(BaseAgent):
         Written: write through the workspace's guard, then record through the
         state-update module.
         """
-        def _refuse(path: str, conflict: dict) -> None:
-            logger.warning("[safe-write] REFUSED corrupted content for %s: %s", path, conflict.get("reason"))
-            with lock:
-                ps.record_refusal(path, str(conflict.get("reason") or ""))
-
         try:
-            written = self.workspace.write(filepath, code, on_corrupt=_refuse)
+            written = self.workspace.write(filepath, code, on_corrupt=refusal_recorder(ps, lock))
         except Exception as exc:
             logger.error("[%s] Disk write failed for %s: %s", self.name, filepath, exc)
             with lock:
