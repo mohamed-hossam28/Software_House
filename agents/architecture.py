@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 
 from .base import BaseAgent
 from agents.utils import as_list
+from core.entity_contract import FIELD_TYPES
 from core.state import ProjectState, ArchData, SRSData, APIContract, classify_complexity, build_persistence_contract, persistence_mandate, DEFAULT_DATABASE, is_supported_database
 
 logger = logging.getLogger(__name__)
@@ -337,9 +338,21 @@ Return JSON:
 """
 
 DB_SCHEMA_SYSTEM = _BASE_SYSTEM + """
-Your task: produce a database schema overview — entity names and their primary
-relationships. NO DDL, NO SQL — just entity names and how they relate.
-Return JSON: {"database_schema_overview": "<multiline string: entity → related entities>"}
+Your task: produce
+1. a database schema overview — entity names and their primary relationships
+   (NO DDL, NO SQL — just entity names and how they relate), and
+2. the Entity Contract — every persisted entity with its model name, table name and
+   every field. The database AND backend code both follow it exactly.
+   Each field's "type" MUST be one of: """ + " | ".join(FIELD_TYPES) + """.
+   Give every entity exactly one primary-key field; use "max_length" only for "str"
+   and "default" (as a string) only when the field has one.
+Return JSON:
+{"database_schema_overview": "<multiline string: entity → related entities>",
+ "entities": [
+   {"name": "<ModelName>", "table": "<table_name>",
+    "fields": [{"name": "<field>", "type": "<type>", "nullable": true|false,
+                "primary_key": true|false, "max_length": <int or null>, "default": "<value or null>"}]}
+ ]}
 """
 
 # ── Round 2 prompt ───────────────────────────────────────────────────────────
@@ -435,6 +448,7 @@ class ArchitectureAgent(BaseAgent):
             data = self.extract_json_and_validate(raw, DbSchemaOverviewSchema, state=state, lock=lock)
             with lock:
                 results["database_schema_overview"] = data.get("database_schema_overview", "")
+                results["entities"] = data.get("entities", [])
             logger.info("[ArchitectureAgent] ✓ db_schema_overview complete")
         except Exception as exc:
             logger.error("[ArchitectureAgent] db_schema_overview failed: %s", exc)
@@ -516,6 +530,7 @@ class ArchitectureAgent(BaseAgent):
             system_components        = as_list(results.get("system_components", [])),
             api_contracts            = _validated_contracts(results.get("api_contracts", [])),
             database_schema_overview = str(results.get("database_schema_overview", "")).strip(),
+            entities                 = results.get("entities", []),
             security_requirements    = as_list(results.get("security_requirements", [])),
             deployment_strategy      = "",
             diagrams                 = [],

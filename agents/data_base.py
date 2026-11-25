@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from agents.coding_loop import CodingAgent, CodingProfile, FileContext
 from agents.schemas.database import DatabaseSchema
+from core.entity_contract import render_entity_contract
 from core.state import ArchData, PersistenceContract, connection_import_line, render_persistence_contract
 
 
@@ -47,12 +48,12 @@ files are the only database files you write.
 {render_persistence_contract(contract)}
 
 ## Model Rules
-1.  Model and field names MUST match the Architecture database_schema_overview EXACTLY
+1.  Model, table and field names and field types MUST match the Entity Contract EXACTLY
     (snake_case throughout, no renaming, no pluralisation changes, no casing changes).
 2.  Relationships reference only models planned in the Code Manifest.
     Respect priority/depends_on ordering.
-3.  Primary keys use UUIDs by default unless the Architecture explicitly specifies otherwise,
-    consistently across ALL models.
+3.  Primary keys use exactly the type the Entity Contract gives them — the backend's
+    schemas and route parameters use the same type.
 4.  Every model has `created_at` and `updated_at` timestamp fields unless the task
     explicitly says otherwise.
 5.  Never invent models or fields not present in the task or schema overview.
@@ -84,6 +85,7 @@ def _sections(ctx: FileContext) -> list[str]:
         _orm_constraint_block(ctx.arch.persistence_contract),
         "## Architecture — Database Schema Overview\n"
         + (getattr(ctx.arch, "database_schema_overview", "") or "No schema overview provided."),
+        render_entity_contract(ctx.arch.entities),
         "## Already Written Database Files (available for FK references)\n"
         + ("\n".join(written) or "None yet."),
     ]

@@ -18,6 +18,8 @@ from typing import Any, Callable, Optional, Annotated, get_type_hints
 from functools import cache
 from datetime import datetime
 
+from core.entity_contract import Entity
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Reducer functions for parallel-safe state merging
@@ -547,6 +549,9 @@ class ArchData(BaseModel):
     system_components: list[str] = Field(default_factory=list)
     api_contracts: list[APIContract] = Field(default_factory=list)
     database_schema_overview: str = ""
+    #: The Entity Contract (core/entity_contract.py): structured, field-level, LLM-produced;
+    #: shared by the database and backend coding agents. Separate from persistence_contract.
+    entities: list[Entity] = Field(default_factory=list)
     security_requirements: list[str] = Field(default_factory=list)
     deployment_strategy: str = ""
     diagrams: list[str] = Field(default_factory=list)               # file paths

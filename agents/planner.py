@@ -22,6 +22,7 @@ from core.workspace import (
     BACKEND_ROOT, FRONTEND_ROOT, OUTPUT_DIR, connection_module_path, dotted_import, relative_import, reroot,
     workspace_path,
 )
+from core.entity_contract import render_entity_contract
 from core.state import (
     ProjectState, Task, TaskList, FileManifest, CodeManifest, APIContract, ArchData,
     CONNECTION_MODULE_EXPORTS, build_connection_module, build_env_example,
@@ -91,6 +92,8 @@ SKELETON_USER_TEMPLATE = """\
 
 ### Database Schema Overview
 {database_schema_overview}
+
+{entity_contract}
 
 {persistence_contract}
 
@@ -481,9 +484,11 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
     """
     Deterministically attach a field contract to each DB-model and schema file:
 
-      - database-agent files → fields from `database_schema_overview` (table → columns),
-                               matched to model exports by normalized name
-                               (e.g. table 'todos' → export 'TodoItem').
+      - database-agent files → fields from the Entity Contract (`arch.entities`,
+                               field → vocabulary type), or failing that from
+                               `database_schema_overview` (table → columns),
+                               matched to model exports by entity name or by
+                               normalized table name (e.g. 'todos' → 'TodoItem').
       - backend schema files → fields from the matching API contract's
                                request/response bodies, matched by path resource
                                (e.g. '/api/todos' → export 'TodoCreate').
@@ -493,7 +498,13 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
     if arch is None:
         return
 
-    tables = _parse_schema_overview(getattr(arch, "database_schema_overview", "") or "")
+    entities = list(getattr(arch, "entities", None) or [])
+    by_name = {e.name: {f.name: f.type for f in e.fields} for e in entities}
+    tables = (
+        {e.table: {f.name: f.type for f in e.fields} for e in entities}
+        if entities
+        else _parse_schema_overview(getattr(arch, "database_schema_overview", "") or "")
+    )
 
     resources: dict[str, list[Any]] = {}
     for c in (getattr(arch, "api_contracts", None) or []):
@@ -508,6 +519,9 @@ def _populate_contracts(manifest_files: dict[str, FileManifest], arch: Any = Non
     for fm in manifest_files.values():
         if fm.agent == "database" and tables:
             for export in list(fm.exports or []):
+                if export in by_name:
+                    fm.contract[export] = dict(by_name[export])
+                    continue
                 table = _match_entity(export, tables)
                 if table is None:
                     continue
@@ -1141,7 +1155,8 @@ class PlannerAgent(BaseAgent):
             tech_stack          = _fmt_tech_stack(arch.tech_stack),
             api_contracts       = _fmt_api_contracts(arch.api_contracts),
             database_schema_overview = arch.database_schema_overview or "(none provided)",
-            persistence_contract     = render_persistence_contract(arch.persistence_contract),
+            entity_contract          = render_entity_contract(arch.entities),
+            persistence_contract    = render_persistence_contract(arch.persistence_contract),
             complexity_constraint    = _complexity_constraint(getattr(arch, "complexity_tier", "STANDARD")),
         )
 

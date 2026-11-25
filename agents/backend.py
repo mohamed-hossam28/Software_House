@@ -13,6 +13,7 @@ from typing import Any
 
 from agents.coding_loop import CodingAgent, CodingProfile, FileContext, filter_api_contracts_by_relevance
 from agents.schemas.backend import BackendSchema
+from core.entity_contract import render_entity_contract
 from core.state import PersistenceContract, backend_persistence_rules, render_persistence_contract
 
 DEFAULT_BACKEND_TECH = "FastAPI (Python 3.12)"
@@ -95,6 +96,7 @@ def _sections(ctx: FileContext) -> list[str]:
     return [
         "## Database Schema Overview\n"
         + (getattr(ctx.arch, "database_schema_overview", "") or "No DB schema provided."),
+        render_entity_contract(ctx.arch.entities),
         "## API Contracts\n" + _api_contracts(ctx),
         "## Layer Architecture Rules (MUST follow)\n" + _layer_rules(ctx),
     ]
