@@ -110,6 +110,7 @@ class FileContext:
     task: Optional[Task]
     manifest: CodeManifest
     arch: ArchData
+    refusal: str = ""   # why the safe-write guard refused this file's previous write
 
 
 @dataclass(frozen=True)
@@ -491,6 +492,18 @@ def _dependency_manifest(manifest: CodeManifest, filepath: str, task: Task | Non
     return "\n\n".join(entries) or "No relevant dependency files in manifest."
 
 
+def _refusal_section(reason: str) -> str:
+    """The previous write's refusal reason, so the retry avoids the same mistake."""
+    if not reason:
+        return ""
+    return (
+        "## PREVIOUS ATTEMPT REFUSED\n"
+        "The last version of this file was refused by the safe-write guard and NOT written:\n"
+        f"- {reason}\n"
+        "Return the complete, valid file this time."
+    )
+
+
 def _file_block(profile: CodingProfile, ctx: FileContext) -> list[str]:
     """One file's part of a request: its File Manifest, the profile's sections and its contracts."""
     fm = ctx.fm
@@ -502,6 +515,7 @@ def _file_block(profile: CodingProfile, ctx: FileContext) -> list[str]:
         "  *(CRITICAL: The generated code MUST define and export these exact names "
         "with the exact signatures other modules expect.)*",
         *profile.sections(ctx),
+        _refusal_section(ctx.refusal),
         _build_scaffold_context(ctx.manifest, ctx.filepath),
         build_import_contract(ctx.manifest, ctx.filepath),
         _build_pending_contracts(ctx.manifest, ctx.filepath),
@@ -639,11 +653,14 @@ class CodingAgent(BaseAgent):
                 elif fm.planned_content is not None:
                     planned.append(fm)
                 else:
-                    ctxs.append(FileContext(fm.filepath, fm, task, ps.code_manifest, ps.architecture))
+                    ctxs.append(self._context(fm, task, ps))
 
         for fm in planned:
             self._commit(ps, lock, fm.filepath, fm.planned_content, {})
         if not ctxs:
+            return
+        if len(ctxs) == 1:
+            self._code_single(ctxs[0], ps, lock)
             return
 
         with lock:
@@ -652,9 +669,6 @@ class CodingAgent(BaseAgent):
         paths = [c.filepath for c in ctxs]
         raw = self._ask(system, request, ", ".join(paths), ps, lock)
         if raw is None:
-            return
-        if len(ctxs) == 1:
-            self._accept(raw, paths[0], ps, lock)
             return
 
         try:
@@ -678,6 +692,40 @@ class CodingAgent(BaseAgent):
         # Every item is validated against the profile's schema, exactly like a single reply.
         for item, fm in aligned:
             self._accept(json.dumps(item), fm.filepath, ps, lock)
+
+    # ── the single-file path ──────────────────────────────────────────────
+    def regenerate(self, ps: ProjectState, filepath: str) -> bool:
+        """
+        Code one of this agent's planned files again through the single-file
+        path (its contracts, task and any previous refusal reason in the
+        request). Returns True once the file is written.
+        """
+        fm = ps.code_manifest.files.get(filepath)
+        if fm is None or fm.agent != self.profile.agent:
+            raise ValueError(f"{filepath!r} is not a planned {self.profile.agent} file")
+        lock = Lock()
+        if fm.planned_content is not None:
+            self._commit(ps, lock, filepath, fm.planned_content, {})
+        else:
+            task = next((t for t in ps.tasks.tasks if t.id == fm.task_id), None)
+            self._code_single(self._context(fm, task, ps), ps, lock)
+        return filepath in (getattr(ps.generated_code, self.profile.agent) or {})
+
+    @staticmethod
+    def _context(fm: FileManifest, task: Task | None, ps: ProjectState) -> FileContext:
+        return FileContext(
+            fm.filepath, fm, task, ps.code_manifest, ps.architecture,
+            refusal=ps.write_refusals.get(fm.filepath, ""),
+        )
+
+    def _code_single(self, ctx: FileContext, ps: ProjectState, lock: Lock) -> None:
+        """One file, one LLM call: request → reply → validate → write → record."""
+        with lock:
+            system = self.profile.system_prompt(ctx.arch)
+            request = _build_request(self.profile, [ctx])
+        raw = self._ask(system, request, ctx.filepath, ps, lock)
+        if raw is not None:
+            self._accept(raw, ctx.filepath, ps, lock)
 
     # ── LLM call, validation, write + record ──────────────────────────────
     def _ask(self, system: str, request: str, what: str, ps: ProjectState, lock: Lock) -> str | None:
@@ -715,6 +763,8 @@ class CodingAgent(BaseAgent):
         """
         def _refuse(path: str, conflict: dict) -> None:
             logger.warning("[safe-write] REFUSED corrupted content for %s: %s", path, conflict.get("reason"))
+            with lock:
+                ps.record_refusal(path, str(conflict.get("reason") or ""))
 
         try:
             written = self.workspace.write(filepath, code, on_corrupt=_refuse)

@@ -1,7 +1,15 @@
 """
 Integration Agent — static checks + bounded LLM repair loop.
 
-Collects every file the coding agents wrote (generated_code buckets), runs the
+First, every planned file that was never written (in the code manifest, no
+Planned Content, absent from generated_code) is regenerated with its owning
+agent's coding prompt through the coding loop's single-file path — at most
+MAX_REGENERATE_ATTEMPTS attempts per file, each counted in `rounds`, the retry
+carrying the last write-refusal reason. A file still missing afterwards is a
+`missing_file` error naming the file and its owner, and neither it nor its
+importers are sent to repair (repair must never drop the dependency).
+
+Then it collects every file the coding agents wrote (generated_code buckets), runs the
 checker seam (core.static_checks.run_all_checks) over them, and repairs:
 
   - error findings are grouped by owning agent through the code manifest,
@@ -36,7 +44,12 @@ import os
 from typing import Any
 
 from agents.base import BaseAgent
-from agents.coding_loop import build_import_contract, filter_api_contracts_by_relevance
+from agents.coding_loop import (
+    CodingAgent,
+    CodingProfile,
+    build_import_contract,
+    filter_api_contracts_by_relevance,
+)
 from core.state import (
     FindingSeverity,
     ProjectState,
@@ -48,8 +61,22 @@ from core.state import (
 )
 from core.static_checks import run_all_checks
 from core.static_checks.persistence_checker import PERSISTENCE_CHECKS
+from core.workspace import workspace_path
 
 logger = logging.getLogger(__name__)
+
+
+def _owner_profiles() -> dict[str, CodingProfile]:
+    """Each owning agent key's CodingProfile (imported lazily: the agents import the loop)."""
+    from agents.backend import BACKEND_PROFILE
+    from agents.data_base import DATABASE_PROFILE
+    from agents.frontend import FRONTEND_PROFILE
+
+    return {
+        "backend": BACKEND_PROFILE,
+        "frontend": FRONTEND_PROFILE,
+        "database": DATABASE_PROFILE,
+    }
 
 
 def _log_refused_write(filepath: str, conflict: dict) -> None:
@@ -58,6 +85,8 @@ def _log_refused_write(filepath: str, conflict: dict) -> None:
 
 #: Maximum repair rounds per file. An unrepairable file stops after this many.
 MAX_REPAIR_ROUNDS = 2
+#: Maximum regeneration attempts per missing planned file, each counted as a round.
+MAX_REGENERATE_ATTEMPTS = 2
 
 #: Checks whose repair prompt gets the API contract excerpt (HTTP surface issues).
 _HTTP_CHECKS = {"js_urls", "backend_routes"}
@@ -82,9 +111,26 @@ class IntegrationAgent(BaseAgent):
         )
 
     def _work(self, ps: ProjectState) -> None:
-        files: dict[str, str] = {}
-        for layer in ("backend", "frontend", "database"):
-            files.update(getattr(ps.generated_code, layer, {}) or {})
+        # Planned files that were never written are regenerated first, with
+        # their owner's coding prompt; the checks then see the recovered files.
+        rounds, regenerated, still_missing = self._regenerate_missing(ps)
+        files = self._collect_files(ps)
+        missing_findings = [
+            StaticFinding(
+                file=filepath,
+                check="missing_file",
+                severity=FindingSeverity.ERROR,
+                message=(
+                    f"Planned file '{filepath}' (owner: {owner}) was never written after "
+                    f"{MAX_REGENERATE_ATTEMPTS} attempt(s)"
+                    + (f" — last refusal: {ps.write_refusals[filepath]}" if filepath in ps.write_refusals else "")
+                ),
+            )
+            for filepath, owner in still_missing.items()
+        ]
+        # Never repair a missing file's importers around it: the repair could
+        # drop the dependency instead of the file being written.
+        protected = set(still_missing) | self._importers_of(ps, set(still_missing))
 
         try:
             findings = run_all_checks(files, ps.code_manifest, ps.architecture)
@@ -96,10 +142,12 @@ class IntegrationAgent(BaseAgent):
                 message=f"Static checks failed: {exc}",
             )]
 
-        errors = [f for f in findings if f.severity == FindingSeverity.ERROR]
-        verdict = StaticVerdict.PASS
-        rounds = 0
-        repaired_files: list[str] = []
+        errors = [
+            f for f in findings
+            if f.severity == FindingSeverity.ERROR and f.file not in protected
+        ]
+        verdict = StaticVerdict.REPAIRED if regenerated else StaticVerdict.PASS
+        repaired_files: list[str] = list(regenerated)
         final_findings = findings
 
         if errors:
@@ -107,9 +155,11 @@ class IntegrationAgent(BaseAgent):
                 "[IntegrationAgent] %d error finding(s) — starting repair loop",
                 len(errors),
             )
-            _, rounds, repaired_files, survivors_by_file = self._repair_loop(
+            _, repair_rounds, repaired, survivors_by_file = self._repair_loop(
                 ps, files, errors
             )
+            rounds += repair_rounds
+            repaired_files += repaired
             # Individual rounds re-check only the repaired file's findings while
             # retaining the full project as dependency/schema context. After all
             # sequential repairs, this authoritative project check refreshes
@@ -148,6 +198,10 @@ class IntegrationAgent(BaseAgent):
                 else StaticVerdict.REPAIRED
             )
 
+        final_findings = final_findings + missing_findings
+        if any(f.severity == FindingSeverity.ERROR for f in final_findings):
+            verdict = StaticVerdict.FAILED
+
         survivors = [
             f for f in final_findings if f.severity == FindingSeverity.ERROR
         ]
@@ -175,6 +229,85 @@ class IntegrationAgent(BaseAgent):
             len(repaired_files),
             len(files),
         )
+
+    # ── Missing-file recovery ──────────────────────────────────────────
+
+    @staticmethod
+    def _collect_files(ps: ProjectState) -> dict[str, str]:
+        files: dict[str, str] = {}
+        for layer in ("backend", "frontend", "database"):
+            files.update(getattr(ps.generated_code, layer, {}) or {})
+        return files
+
+    def _regenerate_missing(
+        self, ps: ProjectState
+    ) -> tuple[int, list[str], dict[str, str]]:
+        """Regenerate every missing planned file with its owner's coding prompt.
+
+        A file is missing when the code manifest plans it, it has no Planned
+        Content, and no generated-code bucket holds it. Each gets up to
+        MAX_REGENERATE_ATTEMPTS attempts, each counted as a round.
+
+        Returns (rounds, regenerated files, still-missing file -> owner).
+        """
+        files = self._collect_files(ps)
+        missing = [
+            fm for fm in (getattr(ps.code_manifest, "files", {}) or {}).values()
+            if fm.planned_content is None and fm.filepath not in files
+        ]
+        rounds = 0
+        regenerated: list[str] = []
+        still_missing: dict[str, str] = {}
+        for fm in missing:
+            owner = str(fm.agent or "unowned")
+            coder = self._coder_for(owner)
+            written = False
+            for attempt in range(1, MAX_REGENERATE_ATTEMPTS + 1):
+                if coder is None:
+                    break
+                rounds += 1
+                logger.info(
+                    "[IntegrationAgent] regenerating missing %s (owner %s), attempt %d/%d",
+                    fm.filepath, owner, attempt, MAX_REGENERATE_ATTEMPTS,
+                )
+                try:
+                    written = coder.regenerate(ps, fm.filepath)
+                except Exception as exc:
+                    logger.error("[IntegrationAgent] regenerating %s failed: %s", fm.filepath, exc)
+                if written:
+                    break
+            if written:
+                regenerated.append(fm.filepath)
+            else:
+                still_missing[fm.filepath] = owner
+        return rounds, regenerated, still_missing
+
+    def _coder_for(self, owner: str) -> CodingAgent | None:
+        """The owning Coding agent, sharing this agent's provider and workspace."""
+        profile = _owner_profiles().get(owner.lower())
+        if profile is None:
+            return None
+        return CodingAgent(
+            profile=profile,
+            model=self.model,
+            max_tokens=self.max_tokens,
+            retries=self.max_retries,
+            backoff=self.backoff,
+            temperature=self.temperature,
+            provider=self.provider,
+            workspace=self.workspace,
+        )
+
+    @staticmethod
+    def _importers_of(ps: ProjectState, targets: set[str]) -> set[str]:
+        """Planned files whose manifest import graph names any of *targets*."""
+        if not targets:
+            return set()
+        return {
+            path
+            for path, fm in (getattr(ps.code_manifest, "files", {}) or {}).items()
+            if any(workspace_path(src) in targets for src in (fm.imports_from or {}))
+        }
 
     # ── Repair loop ────────────────────────────────────────────────────
 
@@ -204,7 +337,9 @@ class IntegrationAgent(BaseAgent):
         for finding in errors:
             if not finding.file:
                 survivors.setdefault("", []).append(finding)
-        refuse = _log_refused_write
+        def refuse(filepath: str, conflict: dict) -> None:
+            _log_refused_write(filepath, conflict)
+            ps.record_refusal(filepath, str(conflict.get("reason") or ""))
 
         for owner, owned_files in by_owner.items():
             logger.info(
@@ -281,6 +416,7 @@ class IntegrationAgent(BaseAgent):
             return file_errors
 
         self._replace_bucket_entry(ps, filepath, written)
+        ps.write_refusals.pop(filepath, None)
         files[filepath] = written
 
         try:

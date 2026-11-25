@@ -186,6 +186,21 @@ def _errors_delta(before: list, after: list) -> Optional[list]:
     return after[len(before):] or None
 
 
+def _write_refusals_delta(before: dict, after: dict) -> Optional[dict]:
+    """New or changed refusals by path; a cleared refusal travels as None."""
+    changed: dict[str, Optional[str]] = {
+        path: reason for path, reason in after.items() if before.get(path) != reason
+    }
+    changed.update({path: None for path in before if path not in after})
+    return changed or None
+
+
+def merge_write_refusals(current: dict, update: dict) -> dict:
+    """Fold refusals per path; a None value clears that path's refusal."""
+    merged = {**(current or {}), **(update or {})}
+    return {path: reason for path, reason in merged.items() if reason is not None}
+
+
 def _current_agent_delta(before: str, after: str) -> Optional[str]:
     return after if after != before else None
 
@@ -200,6 +215,8 @@ METRICS_POLICY        = StatePolicy(_metrics_delta, merge_performance_metrics)
 ERRORS_POLICY         = StatePolicy(_errors_delta, merge_errors)
 #: Current agent: the latest wins.
 CURRENT_AGENT_POLICY  = StatePolicy(_current_agent_delta, pick_latest_agent)
+#: Write refusals: per-path deltas (None clears), merged per path.
+WRITE_REFUSALS_POLICY = StatePolicy(_write_refusals_delta, merge_write_refusals)
 
 
 @cache
@@ -756,6 +773,8 @@ class ProjectState(BaseModel):
     code_manifest:   Annotated[CodeManifest, CODE_MANIFEST_POLICY.merge] = Field(default_factory=CodeManifest)   # ← file-level contracts
     generated_code:  Annotated[CodeMap, GENERATED_CODE_POLICY.merge] = Field(default_factory=CodeMap)
     static_checks:   StaticChecks  = Field(default_factory=StaticChecks)
+    # path -> why the safe-write guard refused its last write; cleared once written
+    write_refusals:  Annotated[dict[str, str], WRITE_REFUSALS_POLICY.merge] = Field(default_factory=dict)
 
     ## human in the loop
     hitl: Optional[HITLRequest]=None
@@ -786,6 +805,11 @@ class ProjectState(BaseModel):
         """Record a Coding agent's written file: its code in the agent's bucket, its File Manifest Written."""
         getattr(self.generated_code, agent)[filepath] = code
         self.code_manifest.mark_written(filepath, classes, functions)
+        self.write_refusals.pop(filepath, None)
+
+    def record_refusal(self, filepath: str, reason: str) -> None:
+        """Record why the safe-write guard refused *filepath*'s write; a later write clears it."""
+        self.write_refusals[filepath] = reason or "write refused by the safe-write guard"
 
     def mark_agent_start(self, agent: str) -> None:
         self.current_agent = agent

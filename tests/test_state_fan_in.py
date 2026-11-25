@@ -98,6 +98,26 @@ def assert_every_file_written_and_present(final: ProjectState) -> None:
             assert getattr(final.generated_code, agent)[path] == code_for(path)
 
 
+def test_write_refusals_from_parallel_agents_merge_and_clear_once_written():
+    start = planner_era_state()
+    db_path, fe_path = PLANNED_FILES["database"][0], PLANNED_FILES["frontend"][0]
+    db = start.model_copy(deep=True)
+    db.record_refusal(db_path, "truncated")
+    fe = start.model_copy(deep=True)
+    fe.record_refusal(fe_path, "unbalanced")
+
+    state = start.model_dump(mode="python")
+    for after in (db, fe):
+        state = fold(state, diff_state(start, after))
+    assert state["write_refusals"] == {db_path: "truncated", fe_path: "unbalanced"}
+
+    refused = ProjectState(**state)
+    healed = refused.model_copy(deep=True)
+    healed.record_written("database", db_path, code_for(db_path))
+    state = fold(state, diff_state(refused, healed))
+    assert state["write_refusals"] == {fe_path: "unbalanced"}
+
+
 @pytest.mark.parametrize("order", list(itertools.permutations(CODING_AGENTS)))
 def test_folding_coding_agent_changes_in_any_order_keeps_every_file_written(order):
     start, changes = coding_agent_changes()
