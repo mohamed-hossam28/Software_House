@@ -7,11 +7,13 @@ against, so a field's type (above all a primary key's) is decided once.
 
 The field-type vocabulary is closed (`FIELD_TYPES`) and each type maps, in
 code, to its SQLAlchemy column type, Pydantic annotation and route-parameter
-annotation (`TYPE_MAPPINGS`). This module is the one place both live.
+annotation (`TYPE_MAPPINGS`). This module is the one place both live, along
+with how a name is matched to an entity (`match_entity`).
 """
 from __future__ import annotations
 
-from typing import Literal, Optional, get_args
+import re
+from typing import Iterable, Literal, Optional, get_args
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +58,76 @@ class Entity(BaseModel):
     name: str
     table: str
     fields: list[EntityField] = Field(default_factory=list)
+
+
+# ── entity name matching ─────────────────────────────────────────────────────
+#
+# How a class, export, table, resource or parameter name is matched to an
+# entity: shared by the planner (field contracts) and the entity-contract check.
+
+#: Class-name suffixes stripped when matching a name to an entity, table or API
+#: resource keyword (e.g. 'TodoItem' → 'todo', 'TodoCreate' → 'todo').
+ENTITY_SUFFIXES: tuple[str, ...] = (
+    "create", "new", "insert", "in", "update", "put", "patch", "request",
+    "payload", "form", "response", "out", "read", "view", "item", "record",
+    "entity", "model", "table", "orm", "dto", "schema", "detail", "result",
+)
+
+#: Suffixes of a request schema (the body a route accepts).
+REQUEST_SUFFIXES: tuple[str, ...] = (
+    "create", "new", "insert", "in", "update", "put", "patch", "request", "payload", "form",
+)
+
+#: Suffixes of a response schema (the body a route returns).
+RESPONSE_SUFFIXES: tuple[str, ...] = (
+    "response", "out", "read", "view", "item", "detail", "result",
+)
+
+
+def norm_keyword(name: str) -> str:
+    """'TodoItem' → 'todoitem' (lowercase, alphanumerics only)."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def entity_forms(name: str) -> set[str]:
+    """
+    Normalized matching forms of a name: itself, its singular, and its
+    suffix-stripped stem (e.g. 'TodoItem' → {'todoitem', 'todo'},
+    'users' → {'users', 'user'}). Empty forms are dropped.
+    """
+    kw = norm_keyword(name)
+    forms = {kw}
+    if kw.endswith("s"):
+        forms.add(kw[:-1])
+    stripped = kw
+    for suf in ENTITY_SUFFIXES:
+        if stripped.endswith(suf):
+            stripped = stripped[: -len(suf)]
+            break
+    forms.add(stripped)
+    if stripped.endswith("s"):
+        forms.add(stripped[:-1])
+    return {f for f in forms if f}
+
+
+def match_entity(name: str, candidates: Iterable[str]) -> str | None:
+    """
+    Match a name to EXACTLY ONE candidate key (entity, table or API resource).
+    Deterministic only-match rule: no match, or >1 candidate → None (never guess).
+    """
+    forms = entity_forms(name)
+    matched = [k for k in candidates if entity_forms(k) & forms]
+    return matched[0] if len(matched) == 1 else None
+
+
+def is_request_schema(name: str) -> bool:
+    kw = norm_keyword(name)
+    return any(kw.endswith(s) for s in REQUEST_SUFFIXES)
+
+
+def is_response_schema(name: str) -> bool:
+    kw = norm_keyword(name)
+    return any(kw.endswith(s) for s in RESPONSE_SUFFIXES)
 
 
 def _render_field(field: EntityField) -> str:

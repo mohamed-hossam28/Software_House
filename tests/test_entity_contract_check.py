@@ -112,6 +112,41 @@ def test_schema_fields_matching_the_contract_are_clean():
     assert _findings({SCHEMA: _schema("Optional[int]")}, _arch("int")) == []
 
 
+def test_request_schema_is_not_judged_against_the_contract():
+    source = (
+        "from pydantic import BaseModel\n"
+        "class TodoFilter(BaseModel):\n"
+        "    id: int\n"
+    )
+    assert _findings({SCHEMA: source}, _arch("uuid")) == []
+
+
+def test_class_used_as_a_route_response_model_is_checked():
+    schema = (
+        "from pydantic import BaseModel\n"
+        "class TodoRecord(BaseModel):\n"
+        "    id: int\n"
+    )
+    router = (
+        "import uuid\n"
+        "from fastapi import APIRouter\n"
+        "from app.schemas.todo import TodoRecord\n"
+        "router = APIRouter(prefix='/todos')\n"
+        "@router.get('/', response_model=list[TodoRecord])\n"
+        "def list_todos():\n"
+        "    return []\n"
+    )
+    findings = _findings({SCHEMA: schema, ROUTER: router}, _arch("uuid"))
+    assert [(f.file, f.line) for f in findings] == [(SCHEMA, 3)]
+
+
+def test_route_param_is_matched_to_the_entity_by_its_name_forms():
+    arch = _arch("uuid")
+    arch.entities[0].name, arch.entities[0].table = "TodoItem", "todo_items"
+    findings = _findings({ROUTER: _router("int")}, arch)
+    assert [(f.file, f.line) for f in findings] == [(ROUTER, 5)]
+
+
 def test_matching_model_schema_and_router_together_are_clean():
     files = {
         MODEL: _model("id = Column(Uuid, primary_key=True, default=uuid.uuid4)"),

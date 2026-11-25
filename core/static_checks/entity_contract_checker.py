@@ -7,10 +7,15 @@ Checked (v1: SQLAlchemy + Pydantic + FastAPI only; any other backend stack is
 skipped with no findings):
 - ORM column types of a SQLAlchemy model (matched by `__tablename__`), from the
   column type argument or, when absent, the `Mapped[...]` annotation;
-- Pydantic schema field annotations (a BaseModel subclass whose class name
-  starts with the entity name, e.g. `TodoRead`, `TodoCreate`);
+- Pydantic response schema field annotations: a BaseModel subclass a route
+  returns (`response_model=`, in any file) or named as a response schema
+  (`TodoRead`, `TodoOut`, ...), matched to its entity by name. Request schemas
+  are not judged;
 - a FastAPI by-id route's path parameter annotation against the primary key's
-  route-parameter type.
+  route-parameter type (`todo_id`, or `id` after `/todos/`).
+
+Names are matched to entities with `core.entity_contract.match_entity`, the
+same matching the planner uses for field contracts.
 
 Types are compared through `core.entity_contract.TYPE_MAPPINGS`, by the last
 dotted component of an annotation (`uuid.UUID` and `UUID` are the same type).
@@ -23,7 +28,7 @@ import ast
 import re
 from typing import Any, Optional
 
-from core.entity_contract import TYPE_MAPPINGS, Entity
+from core.entity_contract import TYPE_MAPPINGS, Entity, is_response_schema, match_entity
 from core.state import FindingSeverity, StaticFinding
 
 CHECK = "entity_contract"
@@ -39,16 +44,19 @@ def check_entity_contract(
     entities: list[Entity] = list(getattr(architecture, "entities", None) or [])
     if not entities or not _is_fastapi(architecture):
         return []
-    findings: list[StaticFinding] = []
+    trees: dict[str, ast.Module] = {}
     for path, source in files.items():
         if not path.endswith(".py"):
             continue
         try:
-            tree = ast.parse(source)
+            trees[path] = ast.parse(source)
         except SyntaxError:
             continue
+    response_models = _response_models(trees)
+    findings: list[StaticFinding] = []
+    for path, tree in trees.items():
         findings.extend(_check_orm(path, tree, entities))
-        findings.extend(_check_schemas(path, tree, entities))
+        findings.extend(_check_schemas(path, tree, entities, response_models))
         findings.extend(_check_routes(path, tree, entities))
     return findings
 
@@ -103,9 +111,10 @@ def _name(node: ast.expr) -> Optional[str]:
     return None
 
 
-def _disagrees(found: Optional[str], expected: set[str], judged: set[str]) -> bool:
-    """True when `found` names a contract type that is not an expected one."""
-    return found is not None and found in judged and found not in expected
+def _disagrees(found: Optional[str], expected: set[str], vocabulary: set[str]) -> bool:
+    """True when `found` is one of the contract's code types (*vocabulary*) but not an
+    expected one. A type outside the vocabulary (e.g. `EmailStr`) is never judged."""
+    return found is not None and found in vocabulary and found not in expected
 
 
 _ROUTE_TOKENS = {_token(m.route_param) for m in TYPE_MAPPINGS.values() if m.route_param}
@@ -203,7 +212,7 @@ def _check_orm(path: str, tree: ast.Module, entities: list[Entity]) -> list[Stat
     return findings
 
 
-# ── Pydantic schemas ─────────────────────────────────────────────────────────
+# ── Pydantic response schemas ────────────────────────────────────────────────
 
 def _schema_classes(tree: ast.Module) -> list[ast.ClassDef]:
     """Pydantic model classes: subclasses of BaseModel, directly or via a schema in the same file."""
@@ -221,16 +230,40 @@ def _schema_classes(tree: ast.Module) -> list[ast.ClassDef]:
     return [c for c in classes if c.name in schema_names]
 
 
-def _schema_entity(cls: ast.ClassDef, entities: list[Entity]) -> Optional[Entity]:
-    """The entity a schema describes: the longest entity name its class name starts with."""
-    matches = [e for e in entities if cls.name.startswith(e.name)]
-    return max(matches, key=lambda e: len(e.name)) if matches else None
+def _response_models(trees: dict[str, ast.Module]) -> set[str]:
+    """Class names any route returns: its `response_model=` (unwrapping `list[X]` etc.)."""
+    names: set[str] = set()
+    for tree in trees.values():
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in func.decorator_list:
+                if _route_path(decorator) is None:
+                    continue
+                for kw in decorator.keywords:
+                    if kw.arg == "response_model":
+                        names.update(_name(n) for n in ast.walk(kw.value) if _name(n))
+    return names
 
 
-def _check_schemas(path: str, tree: ast.Module, entities: list[Entity]) -> list[StaticFinding]:
+def _response_entity(
+    cls: ast.ClassDef, response_models: set[str], entities: dict[str, Entity]
+) -> Optional[Entity]:
+    """The entity a response schema returns; None for a class no route returns that is not
+    named as a response schema (`TodoRead`, `TodoOut`, ...), or that matches no one entity."""
+    if cls.name not in response_models and not is_response_schema(cls.name):
+        return None
+    name = match_entity(cls.name, entities)
+    return entities[name] if name else None
+
+
+def _check_schemas(
+    path: str, tree: ast.Module, entities: list[Entity], response_models: set[str]
+) -> list[StaticFinding]:
     findings: list[StaticFinding] = []
+    by_name = {e.name: e for e in entities}
     for cls in _schema_classes(tree):
-        entity = _schema_entity(cls, entities)
+        entity = _response_entity(cls, response_models, by_name)
         if entity is None:
             continue
         fields = {f.name: f for f in entity.fields}
@@ -253,27 +286,29 @@ def _check_schemas(path: str, tree: ast.Module, entities: list[Entity]) -> list[
 
 # ── route parameters ─────────────────────────────────────────────────────────
 
-def _snake(name: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
-
-
 def _primary_key(entity: Entity):
     return next((f for f in entity.fields if f.primary_key), None)
 
 
+def _entity_named(name: str, entities: list[Entity]) -> Optional[Entity]:
+    """The one entity *name* matches by entity name, else by table name."""
+    for key in ("name", "table"):
+        by_key = {getattr(e, key): e for e in entities}
+        match = match_entity(name, by_key)
+        if match is not None:
+            return by_key[match]
+    return None
+
+
 def _entity_for_param(param: str, path: str, entities: list[Entity]) -> Optional[Entity]:
     """The entity whose primary key a path parameter names: `todo_id`, or `id` after `/todos/`."""
-    for entity in entities:
-        if param == f"{_snake(entity.name)}_id":
-            return entity
+    if param.endswith("_id"):
+        return _entity_named(param[: -len("_id")], entities)
     if param in ("id", "pk"):
         segments = [s for s in path.split("/") if s]
         index = segments.index("{" + param + "}") if "{" + param + "}" in segments else -1
         previous = segments[index - 1] if index > 0 else ""
-        for entity in entities:
-            snake = _snake(entity.name)
-            if previous in (entity.table, snake, snake + "s"):
-                return entity
+        return _entity_named(previous, entities) if previous else None
     return None
 
 
