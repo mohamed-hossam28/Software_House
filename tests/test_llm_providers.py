@@ -20,7 +20,7 @@ class TestFactoryRegistry:
         assert set(LLMFactory.available()) == {
             "anthropic", "gemini",
             "open_router", "orca_router", "token_router", "nara", "apinex",
-            "agent_router",
+            "agent_router", "claude_code",
         }
 
     def test_unknown_name_raises(self):
@@ -94,3 +94,47 @@ class TestConfigIntegration:
     def test_no_nvidia_endpoint_registered(self):
         assert "glm" not in PROVIDER_SPECS
         assert "glm" not in LLMFactory.available()
+
+
+class TestClaudeCodeProvider:
+    def _fake_run(self, monkeypatch, stdout, returncode=0, stderr=""):
+        import subprocess
+        calls = {}
+
+        def run(cmd, **kwargs):
+            calls["cmd"], calls["kwargs"] = cmd, kwargs
+            with open(cmd[cmd.index("--system-prompt-file") + 1], encoding="utf-8") as f:
+                calls["system_prompt"] = f.read()
+            return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+        monkeypatch.setattr("providers.llm.claude_code.subprocess.run", run)
+        monkeypatch.setenv("CLAUDE_CODE_BIN", "claude")
+        return calls
+
+    def test_maps_result_and_usage(self, monkeypatch):
+        import json
+        calls = self._fake_run(monkeypatch, json.dumps({
+            "is_error": False, "subtype": "success", "result": "hello",
+            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 10,
+                      "cache_read_input_tokens": 5, "output_tokens": 3},
+            "modelUsage": {"claude-sonnet-5-5": {}},
+        }))
+        resp = LLMFactory.get("claude_code").complete("sys", "user msg", model="sonnet")
+        assert (resp.text, resp.input_tokens, resp.output_tokens) == ("hello", 17, 3)
+        assert resp.model == "claude-sonnet-5-5" and resp.provider == "claude_code"
+        assert calls["kwargs"]["input"] == "user msg"
+        assert calls["system_prompt"] == "sys"
+        assert calls["cmd"][calls["cmd"].index("--tools") + 1] == ""
+
+    def test_error_result_raises(self, monkeypatch):
+        import json
+        from providers.llm.claude_code import ClaudeCodeError
+        self._fake_run(monkeypatch, json.dumps({"is_error": True, "subtype": "error", "result": "limit"}), 1)
+        with pytest.raises(ClaudeCodeError, match="limit"):
+            LLMFactory.get("claude_code").complete("s", "u", model="sonnet")
+
+    def test_non_json_output_raises(self, monkeypatch):
+        from providers.llm.claude_code import ClaudeCodeError
+        self._fake_run(monkeypatch, "", 1, "not logged in")
+        with pytest.raises(ClaudeCodeError, match="not logged in"):
+            LLMFactory.get("claude_code").complete("s", "u", model="sonnet")

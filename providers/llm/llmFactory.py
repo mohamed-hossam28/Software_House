@@ -8,6 +8,7 @@ from providers.llm.openai_compatible import PROVIDER_SPECS, build_provider
 _SDK_PROVIDERS: dict[str, str] = {
     "anthropic": "providers.llm.anthropic.AnthropicProvider",
     "gemini":    "providers.llm.gemini.GeminiProvider",
+    "claude_code": "providers.llm.claude_code.ClaudeCodeProvider",
 }
 
 

@@ -83,6 +83,8 @@ class Settings(BaseSettings):
             return "gemini-2.0-flash"
         elif provider == "anthropic":
             return "claude-sonnet-4-6"
+        elif provider == "claude_code":
+            return "sonnet"
         elif provider in ("open_router", "openrouter"):
             return "openai/gpt-oss-120b:free"
         elif provider == "orca_router":
