@@ -6,8 +6,10 @@ Planned Content, absent from generated_code) is regenerated with its owning
 agent's coding prompt through the coding loop's single-file path — at most
 MAX_REGENERATE_ATTEMPTS attempts per file, each counted in `rounds`, the retry
 carrying the last write-refusal reason. A file still missing afterwards is a
-`missing_file` error naming the file and its owner, and neither it nor its
-importers are sent to repair (repair must never drop the dependency).
+`missing_file` error naming the file and its owner (or saying no coding
+profile exists for the owner). It is never sent to repair, and neither is any
+import finding naming it, so repair never drops the dependency; its importers'
+other errors are repaired as usual.
 
 Then it collects every file the coding agents wrote (generated_code buckets), runs the
 checker seam (core.static_checks.run_all_checks) over them, and repairs:
@@ -41,7 +43,7 @@ returns only the changed fields as a diff dict.
 """
 import logging
 import os
-from typing import Any
+from typing import Any, Callable
 
 from agents.base import BaseAgent
 from agents.coding_loop import (
@@ -61,7 +63,7 @@ from core.state import (
 )
 from core.static_checks import run_all_checks
 from core.static_checks.persistence_checker import PERSISTENCE_CHECKS
-from core.workspace import workspace_path
+from core.workspace import dotted_import
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,16 @@ def _owner_profiles() -> dict[str, CodingProfile]:
         "frontend": FRONTEND_PROFILE,
         "database": DATABASE_PROFILE,
     }
+
+
+def _imports_missing_module(finding: StaticFinding, missing_modules: set[str]) -> bool:
+    """True for an import finding whose target is (inside) a still-missing module."""
+    if finding.check != "python_imports" or not missing_modules:
+        return False
+    return any(
+        f"'{module}'" in finding.message or f"'{module}." in finding.message
+        for module in missing_modules
+    )
 
 
 def _log_refused_write(filepath: str, conflict: dict) -> None:
@@ -116,21 +128,16 @@ class IntegrationAgent(BaseAgent):
         rounds, regenerated, still_missing = self._regenerate_missing(ps)
         files = self._collect_files(ps)
         missing_findings = [
-            StaticFinding(
-                file=filepath,
-                check="missing_file",
-                severity=FindingSeverity.ERROR,
-                message=(
-                    f"Planned file '{filepath}' (owner: {owner}) was never written after "
-                    f"{MAX_REGENERATE_ATTEMPTS} attempt(s)"
-                    + (f" — last refusal: {ps.write_refusals[filepath]}" if filepath in ps.write_refusals else "")
-                ),
-            )
+            self._missing_finding(ps, filepath, owner)
             for filepath, owner in still_missing.items()
         ]
-        # Never repair a missing file's importers around it: the repair could
-        # drop the dependency instead of the file being written.
-        protected = set(still_missing) | self._importers_of(ps, set(still_missing))
+        # Never send a missing file's import finding to repair: the repair could
+        # drop the dependency instead of the file being written. Its importers'
+        # other errors are still repaired.
+        missing_modules = {dotted_import(p) for p in still_missing if p.endswith(".py")}
+
+        def unrepairable(f: StaticFinding) -> bool:
+            return f.file in still_missing or _imports_missing_module(f, missing_modules)
 
         try:
             findings = run_all_checks(files, ps.code_manifest, ps.architecture)
@@ -144,7 +151,7 @@ class IntegrationAgent(BaseAgent):
 
         errors = [
             f for f in findings
-            if f.severity == FindingSeverity.ERROR and f.file not in protected
+            if f.severity == FindingSeverity.ERROR and not unrepairable(f)
         ]
         verdict = StaticVerdict.REPAIRED if regenerated else StaticVerdict.PASS
         repaired_files: list[str] = list(regenerated)
@@ -156,7 +163,7 @@ class IntegrationAgent(BaseAgent):
                 len(errors),
             )
             _, repair_rounds, repaired, survivors_by_file = self._repair_loop(
-                ps, files, errors
+                ps, files, errors, unrepairable
             )
             rounds += repair_rounds
             repaired_files += repaired
@@ -299,15 +306,23 @@ class IntegrationAgent(BaseAgent):
         )
 
     @staticmethod
-    def _importers_of(ps: ProjectState, targets: set[str]) -> set[str]:
-        """Planned files whose manifest import graph names any of *targets*."""
-        if not targets:
-            return set()
-        return {
-            path
-            for path, fm in (getattr(ps.code_manifest, "files", {}) or {}).items()
-            if any(workspace_path(src) in targets for src in (fm.imports_from or {}))
-        }
+    def _missing_finding(ps: ProjectState, filepath: str, owner: str) -> StaticFinding:
+        """The `missing_file` error for a planned file still unwritten after recovery."""
+        if _owner_profiles().get(owner.lower()) is None:
+            message = (
+                f"Planned file '{filepath}' (owner: {owner}) was never written, and no "
+                f"coding profile exists for owner '{owner}' to regenerate it"
+            )
+        else:
+            message = (
+                f"Planned file '{filepath}' (owner: {owner}) was never written after "
+                f"{MAX_REGENERATE_ATTEMPTS} attempt(s)"
+            )
+        if filepath in ps.write_refusals:
+            message += f" — last refusal: {ps.write_refusals[filepath]}"
+        return StaticFinding(
+            file=filepath, check="missing_file", severity=FindingSeverity.ERROR, message=message,
+        )
 
     # ── Repair loop ────────────────────────────────────────────────────
 
@@ -316,6 +331,7 @@ class IntegrationAgent(BaseAgent):
         ps: ProjectState,
         files: dict[str, str],
         errors: list[StaticFinding],
+        unrepairable: Callable[[StaticFinding], bool] = lambda f: False,
     ) -> tuple[StaticVerdict, int, list[str], dict[str, list[StaticFinding]]]:
         """Repair error findings file by file, bounded rounds per file.
 
@@ -350,9 +366,10 @@ class IntegrationAgent(BaseAgent):
             for filepath, file_errors in owned_files.items():
                 for _ in range(MAX_REPAIR_ROUNDS):
                     rounds += 1
-                    file_errors = self._repair_round(
-                        ps, files, filepath, file_errors, refuse
-                    )
+                    file_errors = [
+                        f for f in self._repair_round(ps, files, filepath, file_errors, refuse)
+                        if not unrepairable(f)
+                    ]
                     if not file_errors:
                         repaired.append(filepath)
                         break
