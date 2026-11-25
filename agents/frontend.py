@@ -40,6 +40,8 @@ Generate the COMPLETE source code for a single frontend file plus its manifest m
    If it is a component, embed a <style> block or import the stylesheet — never leave styles empty.
 7. Use {frontend_tech} idioms and best practices throughout.
 8. Do not hardcode secrets; read from environment variables or config files.
+9. The backend serves the frontend directory at `/`. HTML links its local assets with relative
+   paths to the files in the manifest (href="style.css", src="app.js") — never `/static/...`.
 
 Return JSON: {{"code":"<full source>","classes":[{{"name":"<class name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"docstring":"<desc>"}}],"functions":[{{"name":"<func name>","arguments":[{{"name":"<param>","type":"<type>","default":""}}],"return_type":"<type>","docstring":"<desc>"}}]}}
 """

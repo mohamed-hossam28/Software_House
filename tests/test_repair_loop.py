@@ -257,6 +257,22 @@ class TestRepairLoop:
         assert path not in ps.generated_code.backend
         assert ps.generated_code.database[path] == FIXED_PY
 
+    def test_broken_html_asset_link_is_repaired_into_the_frontend_owner(self, workspace):
+        index = "output/frontend/index.html"
+        broken = '<html><head><link rel="stylesheet" href="/static/style.css"></head></html>'
+        fixed = '<html><head><link rel="stylesheet" href="style.css"></head></html>'
+        ps = make_state(files={index: broken, "output/frontend/style.css": "body { margin: 0; }"})
+        add_manifest(ps, index, exports=[], agent="frontend")
+        provider = FakeRepairProvider([repair_reply(index, fixed)])
+
+        diff = IntegrationAgent(provider=provider, retries=1, workspace=workspace).run(ps)
+
+        checks = diff["static_checks"]
+        assert checks["verdict"] == StaticVerdict.REPAIRED.value
+        assert checks["repaired_files"] == [index]
+        assert "/static/style.css" in provider.prompts[0][1]
+        assert ps.generated_code.frontend[index] == fixed
+
     def test_final_check_crash_is_always_reported(self, monkeypatch, workspace):
         calls = 0
 

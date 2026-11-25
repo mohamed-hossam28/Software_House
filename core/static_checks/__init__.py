@@ -18,8 +18,16 @@ from core.static_checks.js_checker import check_javascript
 from core.static_checks.route_checker import check_backend_routes
 from core.static_checks.sql_checker import check_sql
 from core.static_checks.persistence_checker import check_persistence
+from core.static_checks.html_checker import check_html_asset_links
 
-ALL_CHECKS = [check_python, check_javascript, check_backend_routes, check_sql, check_persistence]
+ALL_CHECKS = [
+    check_python,
+    check_javascript,
+    check_backend_routes,
+    check_sql,
+    check_persistence,
+    check_html_asset_links,
+]
 
 
 def run_all_checks(
