@@ -19,6 +19,7 @@ from core.static_checks.route_checker import check_backend_routes
 from core.static_checks.sql_checker import check_sql
 from core.static_checks.persistence_checker import check_persistence
 from core.static_checks.html_checker import check_html_asset_links
+from core.static_checks.entity_contract_checker import check_entity_contract
 
 ALL_CHECKS = [
     check_python,
@@ -27,6 +28,7 @@ ALL_CHECKS = [
     check_sql,
     check_persistence,
     check_html_asset_links,
+    check_entity_contract,
 ]
 
 
