@@ -1,6 +1,8 @@
 """
 HTML asset-link check: every local href/src in a written HTML file must resolve
-to a written frontend file.
+to a written file under the frontend root (the served root). A link that
+escapes it (`../backend/main.py` from `frontend/index.html`) is an error even
+when the target file exists, because the server never serves it.
 
 The backend serves the frontend directory (the frontend Layer root) at `/`, so
 the served root is `output/frontend/`: a root-absolute link (`/app.js`) resolves
@@ -80,7 +82,8 @@ def check_html_asset_links(
             if not _is_local(link):
                 continue
             target = _resolve(html_path, link)
-            if target in written or target.rstrip("/") + "/index.html" in written:
+            served = (target + "/").startswith(FRONTEND_ROOT)
+            if served and (target in written or target.rstrip("/") + "/index.html" in written):
                 continue
             findings.append(StaticFinding(
                 file=filepath,

@@ -75,3 +75,14 @@ def test_query_and_fragment_are_stripped_before_resolving():
         "output/frontend/app.js": "console.log(1);",
     }
     assert _link_findings(files) == []
+
+
+def test_relative_link_escaping_the_served_root_is_an_error():
+    files = {
+        INDEX: _html('<script src="../backend/main.py"></script>'),
+        "output/backend/main.py": "app = None",
+    }
+    findings = _link_findings(files)
+    assert len(findings) == 1
+    assert findings[0].severity == FindingSeverity.ERROR
+    assert "../backend/main.py" in findings[0].message
